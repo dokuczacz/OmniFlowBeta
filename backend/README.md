@@ -1,0 +1,1 @@
+Backend (Azure Functions) lives here. Functions sit directly under this folder (each with `function.json`), shared utilities in `shared/`, and tests in `tests/`. Use `local.settings.template.json` as the base for local configuration.

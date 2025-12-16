@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.python_packages/
+.env
+.env.*
+local.settings.json
+# Logs
+*.log
+logs/
+# Tests
+.pytest_cache/
+.coverage*
+htmlcov/
+# Tools
+.ruff_cache/
+.mypy_cache/
+# OS
+.DS_Store
+Thumbs.db
+# Node/Frontend
+node_modules/
+.cache/
+
+# Streamlit secrets
+frontend/.streamlit/secrets.toml
+
