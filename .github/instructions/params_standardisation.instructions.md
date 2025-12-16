@@ -124,3 +124,7 @@ final reporting format (mandatory):
 - EXECUTION LOG (changes + commands + results)
 - RESULTS (what works, what changed, latency measurements)
 - NEXT (1–3 small follow-up steps)
+
+
+follow these instructions strictly when working on any file in this repository.
+follow implementation steps as described in the approved plan.

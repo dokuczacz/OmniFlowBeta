@@ -10,3 +10,5 @@ you develop testing code for both backend and frontend parts of the project. Ens
 When writing tests, consider edge cases and potential failure points. Ensure that the tests validate not only expected outcomes but also handle unexpected inputs gracefully. Use mock data and services where necessary to isolate components during testing.
 After implementing tests, run them to verify that all functionalities work as intended. If any tests fail, debug the issues and make necessary code adjustments until all tests pass successfully.
 In case of bigger issues consult with users or team members to get insights and solutions.
+always save scripts in appropriate test files in backend/tests/ or frontend/tests/ directories.
+if u see any test file out of right directory move them to correct place.

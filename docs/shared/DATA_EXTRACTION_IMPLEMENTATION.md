@@ -44,9 +44,6 @@ The `tool_call_handler` function automatically logs all interactions, with the f
 - Thread ID (for conversation tracking)
 - All tool calls made:
   - Tool name
-  - Arguments passed
-  - Result returned
-  - Success/failure status
 - Metadata (assistant_id, source)
 - Timestamp (ISO 8601 format)
 

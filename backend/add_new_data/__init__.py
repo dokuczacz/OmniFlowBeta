@@ -30,31 +30,58 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json"
         )
     
-    # Extract user_id in priority order: header -> query -> body -> default
+    import time
+    start_time = time.time()
+
+    # Extract and validate user_id
     user_id = (
         req.headers.get("x-user-id")
         or req.params.get("user_id")
         or req_body.get("user_id")
-        or "default"
     )
-    user_id = str(user_id).strip()
-    
-    # Extract required parameters
+    if not user_id or not isinstance(user_id, str) or not user_id.strip():
+        return func.HttpResponse(
+            json.dumps({"error": "Missing or invalid 'user_id'"}),
+            status_code=400,
+            mimetype="application/json"
+        )
+    user_id = user_id.strip()
+    if "/" in user_id or ".." in user_id:
+        return func.HttpResponse(
+            json.dumps({"error": "Invalid user_id: path traversal detected"}),
+            status_code=400,
+            mimetype="application/json"
+        )
+
+    # Extract and validate target_blob_name
     target_blob_name = req_body.get('target_blob_name')
+    if not target_blob_name or not isinstance(target_blob_name, str) or not target_blob_name.strip():
+        return func.HttpResponse(
+            json.dumps({"error": "Missing or invalid 'target_blob_name'", "user_id": user_id}),
+            status_code=400,
+            mimetype="application/json"
+        )
+    target_blob_name = target_blob_name.strip()
+    if "/" in target_blob_name or ".." in target_blob_name:
+        return func.HttpResponse(
+            json.dumps({"error": "Invalid target_blob_name: path traversal detected", "user_id": user_id}),
+            status_code=400,
+            mimetype="application/json"
+        )
+
+    # Extract and validate new_entry
     new_entry = req_body.get('new_entry')
+    if new_entry is None:
+        return func.HttpResponse(
+            json.dumps({"error": "Missing required field: 'new_entry'", "user_id": user_id}),
+            status_code=400,
+            mimetype="application/json"
+        )
     if isinstance(new_entry, str):
         try:
             new_entry = json.loads(new_entry)
         except Exception:
-            # leave as string if not valid JSON
             pass
-    
-    if not target_blob_name or not new_entry:
-        return func.HttpResponse(
-            json.dumps({"error": "Missing required fields: 'target_blob_name' or 'new_entry'", "user_id": user_id}),
-            status_code=400,
-            mimetype="application/json"
-        )
 
     logging.info(f"add_new_data: user_id={user_id}, file_name={target_blob_name}")
     
@@ -62,21 +89,31 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         # Storage configuration
         connect_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
         container_name = os.environ.get("AZURE_BLOB_CONTAINER_NAME")
-        
+        function_name = "add_new_data"
+        status = "error"
+        entry_count = None
         if not connect_str or not container_name:
+            duration_ms = int((time.time() - start_time) * 1000)
+            logging.info(json.dumps({
+                "user_id": user_id,
+                "function_name": function_name,
+                "target_blob_name": target_blob_name,
+                "status": "error",
+                "duration_ms": duration_ms
+            }))
             return func.HttpResponse(
                 json.dumps({"error": "Missing Azure Storage configuration", "user_id": user_id}),
                 status_code=500,
                 mimetype="application/json"
             )
-        
+
         # Namespace the blob path
         namespaced_blob_name = f"users/{user_id}/{target_blob_name}"
-        
+
         blob_service_client = BlobServiceClient.from_connection_string(connect_str)
         container_client = blob_service_client.get_container_client(container_name)
         blob_client = container_client.get_blob_client(namespaced_blob_name)
-        
+
         # 1. Read existing data or create empty list
         try:
             blob_data = blob_client.download_blob()
@@ -84,25 +121,36 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             data = json.loads(data_str)
         except ResourceNotFoundError:
             data = []
-        
+
         # 2. Ensure data is a list
         if not isinstance(data, list):
             data = [data]
-        
+
         # 3. Append new entry
         data.append(new_entry)
-        
+
         # 4. Write updated data back
         upload_data = json.dumps(data, indent=2, ensure_ascii=False)
         blob_client.upload_blob(upload_data.encode('utf-8'), overwrite=True)
-        
+
+        entry_count = len(data)
+        status = "success"
+        duration_ms = int((time.time() - start_time) * 1000)
+        logging.info(json.dumps({
+            "user_id": user_id,
+            "function_name": function_name,
+            "target_blob_name": target_blob_name,
+            "status": status,
+            "duration_ms": duration_ms
+        }))
+
         response_data = {
-            "status": "success",
+            "status": status,
             "message": f"Entry successfully added to '{target_blob_name}'",
-            "entry_count": len(data),
+            "entry_count": entry_count,
             "user_id": user_id
         }
-        
+
         return func.HttpResponse(
             json.dumps(response_data, ensure_ascii=False),
             mimetype="application/json",
@@ -110,14 +158,30 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except AzureError as e:
+        duration_ms = int((time.time() - start_time) * 1000)
         logging.error(f"Azure error in add_new_data: {str(e)}")
+        logging.info(json.dumps({
+            "user_id": user_id,
+            "function_name": "add_new_data",
+            "target_blob_name": target_blob_name,
+            "status": "error",
+            "duration_ms": duration_ms
+        }))
         return func.HttpResponse(
             json.dumps({"error": f"Azure storage error: {str(e)}", "user_id": user_id}),
             status_code=500,
             mimetype="application/json"
         )
     except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
         logging.error(f"Unexpected error in add_new_data: {str(e)}")
+        logging.info(json.dumps({
+            "user_id": user_id,
+            "function_name": "add_new_data",
+            "target_blob_name": target_blob_name,
+            "status": "error",
+            "duration_ms": duration_ms
+        }))
         return func.HttpResponse(
             json.dumps({"error": f"Server error: {str(e)}", "user_id": user_id}),
             status_code=500,
