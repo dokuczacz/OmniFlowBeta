@@ -1,0 +1,2 @@
+# Ignore environment config for test scripts
+/test_env.ps1

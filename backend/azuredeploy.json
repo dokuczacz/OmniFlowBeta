@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "functionAppName": {
+      "type": "string",
+      "defaultValue": "AgentBackendService",
+      "metadata": {
+        "description": "Name of the Azure Function App."
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Web/sites",
+      "apiVersion": "2022-03-01",
+      "name": "[parameters('functionAppName')]",
+      "location": "[resourceGroup().location]",
+      "kind": "functionapp",
+      "properties": {
+        "siteConfig": {
+          "appSettings": [
+            { "name": "FUNCTIONS_WORKER_RUNTIME", "value": "python" },
+            { "name": "WEBSITE_RUN_FROM_PACKAGE", "value": "1" }
+          ]
+        },
+        "httpsOnly": true
+      }
+    }
+  ]
+}

@@ -16,7 +16,7 @@
 
 
 ## Pakiet 0 — „Wytnij zbędne hamulce w handlerze”  
-**Status:** ✅ Zrealizowane (grudzień 2025)
+**Status:** ✅ Zrealizowane (grudzień 2025, potwierdzone w kodzie i historii czatu)
 **Trudność:** łatwe  
 **Priorytet:** najwyższy
 
@@ -26,7 +26,8 @@
 - Brak statycznych sleep/backoff w polling loop.
 - `submit_tool_outputs` natychmiast po tool call.
 - `messages.list` tylko raz na końcu.
-- Potwierdzono: liczba GET /runs spadła, zniknęły puste przerwy, wall-time skrócony o 5–7s na request.
+   - Potwierdzono: liczba GET /runs spadła, zniknęły puste przerwy, wall-time skrócony o 5–7s na request.
+   - Zmiany potwierdzone w kodzie i testach (grudzień 2025).
 
 ---
 
@@ -34,10 +35,24 @@
 ---
 
 ## Pakiet 1 — „Napraw RAG: `tool_resources` musi działać”
+**Status:** ⏳ W trakcie (logi pokazują fallback, vector store nie podpięty)
 **Trudność:** łatwe–średnie  
-**Priorytet:** wysoki (bo inaczej testujesz coś, czego nie ma)
+**Priorytet:** wysoki
 
 ### Cel
+   - Upewnić się, że vector store (`tool_resources`) jest poprawnie podpinany do runa.
+   - Sprawdzić i naprawić konfigurację, aby nie było komunikatu „client does not support `tool_resources`… falling back”.
+
+---
+
+## Pakiet 2 — „Zoptymalizuj ścieżkę tool execution”
+**Status:** ⏳ Do zrobienia
+**Trudność:** średnie  
+**Priorytet:** średni
+
+### Cel
+   - Zredukować narzut ~2s na każde wywołanie narzędzia przez proxy_router.
+   - Rozważyć batchowanie, bezpośrednie wywołania funkcji lub optymalizację proxy.
 Prawdziwe testy pamięci/wektorów (obecnie są fałszywe, jeśli jest fallback).
 
 ### Kroki

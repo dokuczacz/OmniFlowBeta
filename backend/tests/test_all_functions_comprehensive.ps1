@@ -1,9 +1,11 @@
 # Comprehensive Test for ALL 13 Azure Functions with User Isolation
 # Tests all functions to ensure they're working correctly with user isolation
 
+
 Write-Host "=== COMPREHENSIVE TEST: ALL 13 FUNCTIONS ===" -ForegroundColor Cyan
 Write-Host "Testing user isolation across entire backend..." -ForegroundColor Cyan
 
+. "$PSScriptRoot/test_env.ps1"
 $testResults = @()
 $aliceUserId = "alice_test_comprehensive"
 $bobUserId = "bob_test_comprehensive"
@@ -25,11 +27,27 @@ function Record-Test {
 }
 
 # ==================================================
+
+# Helper to build URL
+function Get-ApiUrl($endpoint, $queryParams = "") {
+    $url = "$BaseUrl$endpoint"
+    if ($queryParams) { $url += "?$queryParams" }
+    return $url
+}
+
+# Helper to merge headers
+function Merge-Headers($extra) {
+    $h = @{}
+    if ($DefaultHeaders) { $h += $DefaultHeaders }
+    if ($extra) { $h += $extra }
+    return $h
+}
+
 # TEST 1: get_current_time (stateless, no user isolation needed)
 # ==================================================
 Write-Host "`n[1/13] Testing get_current_time..." -ForegroundColor Yellow
 try {
-    $time = Invoke-RestMethod -Uri "http://localhost:7071/api/get_current_time" -Method Get
+    $time = Invoke-RestMethod -Uri (Get-ApiUrl "/get_current_time") -Method Get -Headers (Merge-Headers $null)
     $passed = $time.current_time_utc -and $time.current_time_utc.Length -gt 0
     Record-Test "get_current_time" "Returns UTC time" $passed
 } catch {
@@ -46,9 +64,9 @@ try {
         file_content = @(@{id="A1"; data="Alice data"})
     } | ConvertTo-Json -Depth 5
     
-    $result = Invoke-RestMethod -Uri "http://localhost:7071/api/upload_data_or_file" `
+    $result = Invoke-RestMethod -Uri (Get-ApiUrl "/upload_data_or_file") `
         -Method Post -Body $aliceUpload -ContentType "application/json" `
-        -Headers @{"x-user-id"=$aliceUserId}
+        -Headers (Merge-Headers @{"x-user-id"=$aliceUserId})
     
     $passed = $result.storage_location -like "*$aliceUserId*"
     Record-Test "upload_data_or_file" "User isolation in path" $passed
@@ -61,8 +79,8 @@ try {
 # ==================================================
 Write-Host "`n[3/13] Testing read_blob_file..." -ForegroundColor Yellow
 try {
-    $result = Invoke-RestMethod -Uri "http://localhost:7071/api/read_blob_file?file_name=test_data.json" `
-        -Method Get -Headers @{"x-user-id"=$aliceUserId}
+    $result = Invoke-RestMethod -Uri (Get-ApiUrl "/read_blob_file" "file_name=test_data.json") `
+        -Method Get -Headers (Merge-Headers @{"x-user-id"=$aliceUserId})
     
     $passed = $result.user_id -eq $aliceUserId -and $result.data[0].id -eq "A1"
     Record-Test "read_blob_file" "Reads user-namespaced file" $passed
@@ -80,9 +98,9 @@ try {
         new_entry = @{id="A2"; data="Alice new entry"}
     } | ConvertTo-Json -Depth 5
     
-    $result = Invoke-RestMethod -Uri "http://localhost:7071/api/add_new_data" `
+    $result = Invoke-RestMethod -Uri (Get-ApiUrl "/add_new_data") `
         -Method Post -Body $addBody -ContentType "application/json" `
-        -Headers @{"x-user-id"=$aliceUserId}
+        -Headers (Merge-Headers @{"x-user-id"=$aliceUserId})
     
     $passed = $result.user_id -eq $aliceUserId -and $result.entry_count -eq 2
     Record-Test "add_new_data" "Appends to user file" $passed
@@ -101,9 +119,9 @@ try {
         filter_value = "A1"
     } | ConvertTo-Json -Depth 5
     
-    $result = Invoke-RestMethod -Uri "http://localhost:7071/api/get_filtered_data" `
+    $result = Invoke-RestMethod -Uri (Get-ApiUrl "/get_filtered_data") `
         -Method Post -Body $filterBody -ContentType "application/json" `
-        -Headers @{"x-user-id"=$aliceUserId}
+        -Headers (Merge-Headers @{"x-user-id"=$aliceUserId})
     
     $passed = $result.user_id -eq $aliceUserId -and $result.filtered_count -eq 1
     Record-Test "get_filtered_data" "Filters user data" $passed
@@ -124,9 +142,9 @@ try {
         update_value = "updated"
     } | ConvertTo-Json -Depth 5
     
-    $result = Invoke-RestMethod -Uri "http://localhost:7071/api/update_data_entry" `
+    $result = Invoke-RestMethod -Uri (Get-ApiUrl "/update_data_entry") `
         -Method Post -Body $updateBody -ContentType "application/json" `
-        -Headers @{"x-user-id"=$aliceUserId}
+        -Headers (Merge-Headers @{"x-user-id"=$aliceUserId})
     
     $passed = $result.user_id -eq $aliceUserId -and $result.updated_value -eq "updated"
     Record-Test "update_data_entry" "Updates user entry" $passed
@@ -145,9 +163,9 @@ try {
         value_to_find = "A2"
     } | ConvertTo-Json -Depth 5
     
-    $result = Invoke-RestMethod -Uri "http://localhost:7071/api/remove_data_entry" `
+    $result = Invoke-RestMethod -Uri (Get-ApiUrl "/remove_data_entry") `
         -Method Post -Body $removeBody -ContentType "application/json" `
-        -Headers @{"x-user-id"=$aliceUserId}
+        -Headers (Merge-Headers @{"x-user-id"=$aliceUserId})
     
     $passed = $result.user_id -eq $aliceUserId -and $result.deleted_count -eq 1
     Record-Test "remove_data_entry" "Removes user entry" $passed
@@ -160,8 +178,8 @@ try {
 # ==================================================
 Write-Host "`n[8/13] Testing list_blobs..." -ForegroundColor Yellow
 try {
-    $result = Invoke-RestMethod -Uri "http://localhost:7071/api/list_blobs" `
-        -Method Get -Headers @{"x-user-id"=$aliceUserId}
+    $result = Invoke-RestMethod -Uri (Get-ApiUrl "/list_blobs") `
+        -Method Get -Headers (Merge-Headers @{"x-user-id"=$aliceUserId})
     
     $passed = $result.user_id -eq $aliceUserId -and $result.blobs -contains "test_data.json"
     Record-Test "list_blobs" "Lists user blobs only" $passed
@@ -176,9 +194,9 @@ Write-Host "`n[9/13] Testing manage_files (list)..." -ForegroundColor Yellow
 try {
     $listBody = @{operation = "list"} | ConvertTo-Json
     
-    $result = Invoke-RestMethod -Uri "http://localhost:7071/api/manage_files" `
+    $result = Invoke-RestMethod -Uri (Get-ApiUrl "/manage_files") `
         -Method Post -Body $listBody -ContentType "application/json" `
-        -Headers @{"x-user-id"=$aliceUserId}
+        -Headers (Merge-Headers @{"x-user-id"=$aliceUserId})
     
     $passed = $result.user_id -eq $aliceUserId -and $result.files -contains "test_data.json"
     Record-Test "manage_files" "Lists user files" $passed
@@ -197,9 +215,9 @@ try {
         target_name = "renamed_data.json"
     } | ConvertTo-Json
     
-    $result = Invoke-RestMethod -Uri "http://localhost:7071/api/manage_files" `
+    $result = Invoke-RestMethod -Uri (Get-ApiUrl "/manage_files") `
         -Method Post -Body $renameBody -ContentType "application/json" `
-        -Headers @{"x-user-id"=$aliceUserId}
+        -Headers (Merge-Headers @{"x-user-id"=$aliceUserId})
     
     $passed = $result.user_id -eq $aliceUserId -and $result.operation -eq "rename"
     Record-Test "manage_files" "Renames user file" $passed
@@ -220,9 +238,9 @@ try {
         metadata = @{source = "comprehensive_test"}
     } | ConvertTo-Json -Depth 5
     
-    $result = Invoke-RestMethod -Uri "http://localhost:7071/api/save_interaction" `
+    $result = Invoke-RestMethod -Uri (Get-ApiUrl "/save_interaction") `
         -Method Post -Body $interactionBody -ContentType "application/json" `
-        -Headers @{"x-user-id"=$aliceUserId}
+        -Headers (Merge-Headers @{"x-user-id"=$aliceUserId})
     
     $passed = $result.user_id -eq $aliceUserId -and $result.interaction_id
     Record-Test "save_interaction" "Saves user interaction" $passed
@@ -235,8 +253,8 @@ try {
 # ==================================================
 Write-Host "`n[12/13] Testing get_interaction_history..." -ForegroundColor Yellow
 try {
-    $result = Invoke-RestMethod -Uri "http://localhost:7071/api/get_interaction_history?limit=10" `
-        -Method Get -Headers @{"x-user-id"=$aliceUserId}
+    $result = Invoke-RestMethod -Uri (Get-ApiUrl "/get_interaction_history" "limit=10") `
+        -Method Get -Headers (Merge-Headers @{"x-user-id"=$aliceUserId})
     
     $passed = $result.user_id -eq $aliceUserId -and $result.total_count -ge 1
     Record-Test "get_interaction_history" "Retrieves user history" $passed
@@ -250,8 +268,8 @@ try {
 Write-Host "`n[13/13] Testing cross-user isolation (Bob vs Alice)..." -ForegroundColor Yellow
 try {
     # Bob tries to list blobs
-    $bobResult = Invoke-RestMethod -Uri "http://localhost:7071/api/list_blobs" `
-        -Method Get -Headers @{"x-user-id"=$bobUserId}
+    $bobResult = Invoke-RestMethod -Uri (Get-ApiUrl "/list_blobs") `
+        -Method Get -Headers (Merge-Headers @{"x-user-id"=$bobUserId})
     
     # Bob should not see Alice's renamed_data.json
     $bobSeesAliceFile = $bobResult.blobs -contains "renamed_data.json"
