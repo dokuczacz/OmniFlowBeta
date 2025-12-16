@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "OmniFlow Beta"
+version: 0.1.0
+authors:
+  - family-names: Dokuczacz
+    given-names: Mariusz
+date-released: 2025-12-16
+repository-code: "https://github.com/dokuczacz/OmniFlowBeta"
+license: Apache-2.0
