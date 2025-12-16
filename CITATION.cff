@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+title: OmniFlow Beta
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Mariusz
+    family-names: Dokuczacz
+    email: dokuczacz@example.com
+repository-code: 'https://github.com/dokuczacz/OmniFlowBeta'
+url: 'https://github.com/dokuczacz/OmniFlowBeta'
+abstract: >-
+  OmniFlow Beta is a multi-user AI agent backend platform
+  built with Azure Functions and Python. It provides secure
+  user isolation, blob storage management, audit logging,
+  and RESTful endpoints for AI-powered applications.
+keywords:
+  - azure-functions
+  - python
+  - ai-agents
+  - multi-user
+  - backend
+  - blob-storage
+  - restful-api
+license: Apache-2.0
+version: 0.1.0
+date-released: '2025-12-16'
