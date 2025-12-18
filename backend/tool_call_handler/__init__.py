@@ -5,17 +5,24 @@ import os
 import time
 from typing import Dict, Any, Tuple
 
-import azure.functions as func
+try:
+    import azure.functions as func
+    AZURE_FUNCTIONS_AVAILABLE = True
+except ImportError:
+    import types
+    func = types.SimpleNamespace(HttpResponse=lambda *a, **kw: None)
+    AZURE_FUNCTIONS_AVAILABLE = False
 import requests
-from openai import OpenAI, BadRequestError
+from openai import OpenAI
 
 # Config
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 ASSISTANT_ID = os.environ.get("OPENAI_ASSISTANT_ID", "")
 PROXY_URL = os.environ.get("AZURE_PROXY_URL", "")
 PROXY_FUNCTION_KEY = os.environ.get("FUNCTION_CODE_PROXY_ROUTER", "")
-ENABLE_SAVE_INTERACTION = os.environ.get("ENABLE_SAVE_INTERACTION", "false").lower() == "true"
+ENABLE_SAVE_INTERACTION = True  # Hardcoded to always enable saving for now
 VECTOR_STORE_ID = os.environ.get("OPENAI_VECTOR_STORE_ID", "")
+DEBUG_TOOL_CALL_HANDLER = os.environ.get("DEBUG_TOOL_CALL_HANDLER", "").lower() in ("1", "true", "yes")
 
 logging.info("=== tool_call_handler CONFIG ===")
 logging.info(f"OPENAI_API_KEY set: {bool(OPENAI_API_KEY)}")
@@ -55,27 +62,6 @@ def normalize_tool_arguments(tool_name: str, tool_arguments: Dict[str, Any]) -> 
             args["file_name"] = file_name
 
     elif tool_name == "get_filtered_data":
-        target_blob_name = pop_first("target_blob_name", "file_name", "blob_name", "name")
-        if target_blob_name:
-            args["target_blob_name"] = target_blob_name
-        key = pop_first("key_to_find", "key", "find_key", "filter_key")
-        if key:
-            args["key_to_find"] = key
-            args["filter_key"] = key
-        value = pop_first("value_to_find", "value", "find_value", "filter_value")
-        if value is not None:
-            args["value_to_find"] = value
-            args["filter_value"] = value
-
-    elif tool_name == "add_new_data":
-        target_blob_name = pop_first("target_blob_name", "file_name", "blob_name", "name")
-        if target_blob_name:
-            args["target_blob_name"] = target_blob_name
-        new_entry = pop_first("new_entry", "entry", "data", "payload")
-        if new_entry is not None:
-            args["new_entry"] = _parse_json_if_str(new_entry)
-
-    elif tool_name == "update_data_entry":
         target_blob_name = pop_first("target_blob_name", "file_name", "blob_name", "name")
         if target_blob_name:
             args["target_blob_name"] = target_blob_name
@@ -132,7 +118,10 @@ def normalize_tool_arguments(tool_name: str, tool_arguments: Dict[str, Any]) -> 
     elif tool_name == "save_interaction":
         user_message = pop_first("user_message", "message")
         if user_message:
-            args["user_message"] = user_message
+            # Add timestamp prefix
+            from datetime import datetime
+            timestamp = datetime.utcnow().isoformat()
+            args["user_message"] = f"{timestamp};\n user: {user_message}"
         assistant_response = pop_first("assistant_response", "response")
         if assistant_response:
             args["assistant_response"] = assistant_response
@@ -161,6 +150,43 @@ def _safe_load_json(text: str) -> Dict[str, Any]:
     return {}
 
 
+def _redact_sensitive(obj: Any) -> Any:
+    """Redact common sensitive keys in dict-like objects for safe logging."""
+    if not isinstance(obj, dict):
+        return obj
+    redacted = {}
+    sensitive_keys = {"openai_api_key", "authorization", "api_key", "access_token", "x-functions-key", "code", "password"}
+    for k, v in obj.items():
+        if k and k.lower() in sensitive_keys:
+            redacted[k] = "REDACTED"
+        else:
+            # avoid logging very large blobs
+            try:
+                if isinstance(v, (str, bytes)) and len(str(v)) > 1000:
+                    redacted[k] = str(v)[:1000] + "...[truncated]"
+                else:
+                    redacted[k] = v
+            except Exception:
+                redacted[k] = "<unserializable>"
+    return redacted
+
+
+def _make_response(body: Any, status_code: int = 200):
+    """Return a tuple (body, status, headers) which the Functions worker accepts for HTTP output."""
+    if isinstance(body, (dict, list)):
+        body_text = json.dumps(body, ensure_ascii=False)
+    else:
+        body_text = str(body)
+    # When running under the Functions worker, return a proper HttpResponse
+    if AZURE_FUNCTIONS_AVAILABLE:
+        try:
+            return func.HttpResponse(body_text, status_code=status_code, mimetype="application/json")
+        except Exception:
+            # Fallback to tuple if HttpResponse construction fails for some reason
+            return body_text, status_code, {"Content-Type": "application/json"}
+    return body_text, status_code, {"Content-Type": "application/json"}
+
+
 def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: str) -> Tuple[str, Dict[str, Any]]:
     """Call proxy_router for a given tool."""
     start_time = time.time()
@@ -180,8 +206,34 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
         logging.warning(f"tools module not available for in-process dispatch: {e}")
     except Exception as e:
         logging.warning(f"In-process dispatch failed for {tool_name}: {e}. Falling back to proxy_router.")
+        # Only include required fields for each function (per DATA_EXTRACTION_FUNCTIONS_REFERENCE.md)
+        DATA_EXTRACTION_REQUIRED = {
+            "add_new_data": ["target_blob_name", "new_entry"],
+            "get_filtered_data": ["target_blob_name", "filter_key", "filter_value"],
+            "get_interaction_history": ["thread_id", "limit", "offset"],
+            "list_blobs": ["prefix"],
+            "manage_files": ["operation", "source_name", "target_name", "prefix"],
+            "proxy_router": ["action", "params"],
+            "read_blob_file": ["file_name"],
+            "remove_data_entry": ["target_blob_name", "key_to_find", "value_to_find"],
+            "save_interaction": ["user_message", "assistant_response", "thread_id", "tool_calls", "metadata"],
+            "update_data_entry": ["target_blob_name", "find_key", "find_value", "update_key", "update_value"],
+            "upload_data_or_file": ["target_blob_name", "file_content"],
+        }
 
-    # Fallback: HTTP proxy_router
+        # Only include user_id for tool_call_handler (if enforced)
+        include_user_id = tool_name == "tool_call_handler"
+
+        # Filter out user_id for all other functions
+        if tool_name in DATA_EXTRACTION_REQUIRED:
+            required_fields = DATA_EXTRACTION_REQUIRED[tool_name]
+            filtered_args = {k: v for k, v in (normalized_args or {}).items() if k in required_fields and v is not None}
+        else:
+            filtered_args = dict(normalized_args or {})
+        if include_user_id:
+            filtered_args["user_id"] = user_id
+
+        logging.debug(f"Dispatching tool={tool_name} with params={filtered_args}")
     headers = {"X-User-Id": user_id, "Content-Type": "application/json"}
     if PROXY_FUNCTION_KEY:
         headers["x-functions-key"] = PROXY_FUNCTION_KEY
@@ -209,22 +261,78 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
             return json.dumps({"error": err}), info
 
     try:
-        resp = requests.post(PROXY_URL, json={"action": tool_name, "params": params_with_user}, headers=headers, timeout=45)
-        resp.raise_for_status()
-        try:
-            result = resp.json()
-        except ValueError:
-            result = {"raw_response": resp.text}
+        # Some backend functions expect GET (e.g. get_interaction_history).
+        # When calling via proxy_router we POST to the proxy, which may in turn POST
+        # to the target function and cause a method mismatch. For known GET-style
+        # endpoints, call the function URL directly with GET to preserve method.
+        # Validate proxy configuration for POST-style dispatch
+        if tool_name == "get_interaction_history":
+            function_base = os.getenv("FUNCTION_URL_BASE", "http://localhost:7071").rstrip("/")
+            func_url = f"{function_base}/api/{tool_name}"
+            if DEBUG_TOOL_CALL_HANDLER:
+                logging.info(f"[DEBUG] GET {func_url} params={_redact_sensitive(dict(params_with_user))} headers={_redact_sensitive(dict(headers))}")
+            try:
+                resp = requests.get(func_url, params=params_with_user, headers=headers, timeout=45)
+                resp.raise_for_status()
+                try:
+                    result = resp.json()
+                except ValueError:
+                    result = {"raw_response": resp.text}
+            except requests.RequestException as e:
+                duration_ms = (time.time() - start_time) * 1000
+                logging.warning(f"GET {func_url} failed: {e}")
+                info = {"tool_name": tool_name, "arguments": normalized_args, "error": str(e), "status": "failed", "duration_ms": duration_ms}
+                return json.dumps({"error": str(e)}), info
+        else:
+            if not PROXY_URL:
+                err = "AZURE_PROXY_URL not configured"
+                duration_ms = (time.time() - start_time) * 1000
+                info = {"tool_name": tool_name, "arguments": normalized_args, "error": err, "status": "failed", "duration_ms": duration_ms}
+                logging.error(err)
+                return json.dumps({"error": err}), info
+            payload = {"action": tool_name, "params": params_with_user}
+            if DEBUG_TOOL_CALL_HANDLER:
+                logging.info(f"[DEBUG] POST {PROXY_URL} json={_redact_sensitive(payload)} headers={_redact_sensitive(dict(headers))}")
+            try:
+                resp = requests.post(PROXY_URL, json=payload, headers=headers, timeout=45)
+                resp.raise_for_status()
+            except requests.RequestException as e:
+                duration_ms = (time.time() - start_time) * 1000
+                logging.warning(f"POST to proxy failed: {e}")
+                info = {"tool_name": tool_name, "arguments": normalized_args, "error": str(e), "status": "failed", "duration_ms": duration_ms}
+                # Include response body if available
+                body_text = None
+                try:
+                    body_text = resp.text
+                except Exception:
+                    pass
+                return json.dumps({"error": str(e), "proxy_body": (body_text or "")}), info
+            try:
+                parsed = resp.json()
+            except ValueError:
+                parsed = {"raw_response": resp.text}
+            # Normalize non-dict responses
+            if not isinstance(parsed, (dict, list)):
+                parsed = {"raw": parsed}
+            result = parsed
+        if DEBUG_TOOL_CALL_HANDLER:
+            try:
+                body_snippet = result if isinstance(result, (dict, list)) else (resp.text[:2000] + "...[truncated]" if len(resp.text) > 2000 else resp.text)
+            except Exception:
+                body_snippet = "<unserializable>"
+            logging.info(f"[DEBUG] Response status={getattr(resp, 'status_code', 'n/a')} body={_redact_sensitive(body_snippet if isinstance(body_snippet, dict) else {'raw': body_snippet})}")
         duration_ms = (time.time() - start_time) * 1000
         info = {"tool_name": tool_name, "arguments": normalized_args, "result": result, "status": "success", "duration_ms": duration_ms}
         logging.info(f"Tool {tool_name} OK via proxy_router in {duration_ms:.1f}ms")
         return json.dumps(result), info
     except Exception as e:
         duration_ms = (time.time() - start_time) * 1000
-        logging.error(f"Tool {tool_name} failed in {duration_ms:.1f}ms: {e}")
+        if DEBUG_TOOL_CALL_HANDLER:
+            logging.exception(f"Tool {tool_name} failed in {duration_ms:.1f}ms: {e}")
+        else:
+            logging.error(f"Tool {tool_name} failed in {duration_ms:.1f}ms: {e}")
         info = {"tool_name": tool_name, "arguments": normalized_args, "error": str(e), "status": "failed", "duration_ms": duration_ms}
         return json.dumps({"error": str(e)}), info
-
 
 def save_interaction_log(user_id: str, user_message: str, assistant_response: str, thread_id: str, tool_calls_info: list):
     if not ENABLE_SAVE_INTERACTION:
@@ -254,26 +362,16 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     try:
         body = req.get_json()
     except Exception:
-        return func.HttpResponse(json.dumps({"error": "Invalid JSON payload"}), status_code=400, mimetype="application/json")
+        return _make_response({"error": "Invalid JSON payload"}, status_code=400)
 
     user_message = body.get("message", "")
-    user_id = body.get("user_id", "default")
+    user_id = body.get("user_id")  # Do not default to 'default' for save/get actions
     thread_id = body.get("thread_id")
     time_only = bool(body.get("time_only", False))
+    action = body.get("action")
+    params = body.get("params", {})
 
-    if not user_message:
-        return func.HttpResponse(json.dumps({"error": "Missing 'message' field"}), status_code=400, mimetype="application/json")
-
-    # Fast path: local time only
-    if time_only:
-        current_time = datetime.datetime.utcnow().isoformat() + "Z"
-        return func.HttpResponse(
-            json.dumps({"status": "success", "response": current_time, "thread_id": thread_id, "user_id": user_id, "tool_calls_count": 0}),
-            status_code=200,
-            mimetype="application/json",
-        )
-
-    # Config check
+    # Config check (move here so it's always checked before main logic)
     if not (OPENAI_API_KEY and ASSISTANT_ID and PROXY_URL):
         missing = []
         if not OPENAI_API_KEY:
@@ -282,70 +380,63 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             missing.append("OPENAI_ASSISTANT_ID")
         if not PROXY_URL:
             missing.append("AZURE_PROXY_URL")
-        return func.HttpResponse(
-            json.dumps({"error": f"Missing env vars: {', '.join(missing)}", "status": "not_configured"}),
-            status_code=503,
-            mimetype="application/json",
-        )
+        return _make_response({"error": f"Missing env vars: {', '.join(missing)}", "status": "not_configured"}, status_code=503)
 
-    # OpenAI client
-    try:
-        openai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=60.0, max_retries=2)
-    except Exception as e:
-        return func.HttpResponse(json.dumps({"error": f"Failed to init OpenAI: {e}"}), status_code=503, mimetype="application/json")
-
-    try:
-        request_start = time.time()
-        all_tool_calls = []
-
-
-        # Feature flag: only wait for open runs if DEBUG_WAIT_FOR_OPEN_RUNS is set
-        DEBUG_WAIT_FOR_OPEN_RUNS = os.environ.get("DEBUG_WAIT_FOR_OPEN_RUNS", "false").lower() == "true"
-
-        def wait_for_open_runs(th_id: str, max_wait_s: float = 6.0, interval_s: float = 0.5) -> bool:
-            """Return True if thread is clear for new message, False if still blocked."""
-            deadline = time.time() + max_wait_s
-            while time.time() < deadline:
-                runs = openai_client.beta.threads.runs.list(thread_id=th_id, limit=1)
-                if not runs.data:
-                    return True
-                status = runs.data[0].status
-                if status in ["in_progress", "queued", "requires_action"]:
-                    time.sleep(interval_s)
-                    continue
-                return True
-            return False
-
-        # Thread
-        if not thread_id:
-            thread = openai_client.beta.threads.create()
-            thread_id = thread.id
-        else:
-            if DEBUG_WAIT_FOR_OPEN_RUNS:
-                # If previous run still active, wait briefly; if still blocked, start new thread
-                if not wait_for_open_runs(thread_id):
-                    logging.warning(f"Thread {thread_id} still has active run; starting new thread.")
-                    thread = openai_client.beta.threads.create()
-                    thread_id = thread.id
-            # In normal flow, skip waiting and always try to add message
-
-        # Add user message (retry once if blocked by active run)
+    # Direct save/get actions bypass agent
+    if action in ["save_interaction", "get_interaction_history"]:
+        # Enforce user_id presence
+        user_message = body.get("message", "")
+        user_id = body.get("user_id")  # Do not default to 'default' for save/get actions
+        thread_id = body.get("thread_id")
+        time_only = bool(body.get("time_only", False))
+        action = body.get("action")
+        params = body.get("params", {})
+        if not user_id:
+            return _make_response({"error": "user_id is required for save/get actions"}, status_code=400)
+        headers = {"X-User-Id": str(user_id), "Content-Type": "application/json"}
+        params = params if params is not None else {}
+        # Build target function URL
+        base = os.getenv("FUNCTION_URL_BASE", "http://localhost:7071").rstrip("/")
+        url = f"{base}/api/{action}"
+        # Pass through function key if present
+        function_code_env = f"FUNCTION_CODE_{action.upper()}"
+        function_code = os.getenv(function_code_env)
+        if function_code:
+            url = f"{url}?code={function_code}"
+        resp = None
         try:
-            openai_client.beta.threads.messages.create(thread_id=thread_id, role="user", content=user_message)
-        except BadRequestError as e:
-            if "run" in str(e) and "is active" in str(e):
-                if wait_for_open_runs(thread_id):
-                    openai_client.beta.threads.messages.create(thread_id=thread_id, role="user", content=user_message)
-                else:
-                    logging.warning(f"Still blocked on thread {thread_id}, creating new thread for message.")
-                    thread = openai_client.beta.threads.create()
-                    thread_id = thread.id
-                    openai_client.beta.threads.messages.create(thread_id=thread_id, role="user", content=user_message)
+            if DEBUG_TOOL_CALL_HANDLER:
+                logging.info(f"[DEBUG] Direct call {action} URL={url} params={_redact_sensitive(dict(params))} headers={_redact_sensitive(dict(headers))}")
+            # Use GET for get_interaction_history, POST for save_interaction
+            if action == "get_interaction_history":
+                resp = requests.get(url, params=params, headers=headers, timeout=45)
             else:
-                raise
+                resp = requests.post(url, json=params, headers=headers, timeout=45)
+            resp.raise_for_status()
+            try:
+                result = resp.json()
+            except ValueError:
+                result = {"raw_response": resp.text}
+            if DEBUG_TOOL_CALL_HANDLER:
+                try:
+                    snippet = result if isinstance(result, (dict, list)) else (resp.text[:1000] + "...[truncated]" if len(resp.text) > 1000 else resp.text)
+                except Exception:
+                    snippet = "<unserializable>"
+                logging.info(f"[DEBUG] Direct response status={resp.status_code} body={_redact_sensitive(snippet if isinstance(snippet, dict) else {'raw': snippet})}")
+            return _make_response({"status": "success", "result": result}, status_code=resp.status_code)
+        except requests.HTTPError as exc:
+            if resp is not None:
+                return _make_response(resp.text, status_code=resp.status_code)
+            else:
+                if DEBUG_TOOL_CALL_HANDLER:
+                    logging.exception(f"Direct {action} call failed: {exc}")
+                return _make_response({"error": str(exc)}, status_code=500)
 
         # Run
         run = None
+        all_tool_calls = []
+        request_start = time.time()
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
         if VECTOR_STORE_ID:
             try:
                 run = openai_client.beta.threads.runs.create(
@@ -358,7 +449,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 logging.warning("OpenAI client does not support tool_resources in runs.create; falling back without vector store.")
         if run is None:
             run = openai_client.beta.threads.runs.create(thread_id=thread_id, assistant_id=ASSISTANT_ID)
-
+    
         # Remove static sleeps/backoff: poll as fast as possible until run is no longer actionable
         poll_start = time.time()
         max_poll_s = 30  # hard timeout for polling
@@ -367,7 +458,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             if run.status == "completed":
                 break
             if run.status == "failed":
-                return func.HttpResponse(json.dumps({"error": str(run.last_error)}), status_code=500, mimetype="application/json")
+                return _make_response({"error": str(run.last_error)}, status_code=500)
             if run.status == "requires_action":
                 tool_calls = run.required_action.submit_tool_outputs.tool_calls
                 outputs = []
@@ -387,15 +478,15 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 if run.status == "completed":
                     break
                 if run.status == "failed":
-                    return func.HttpResponse(json.dumps({"error": str(run.last_error)}), status_code=500, mimetype="application/json")
+                    return _make_response({"error": str(run.last_error)}, status_code=500)
                 # If still requires_action, continue loop (should be rare)
                 continue
             # break if polling takes too long (fail fast)
             if (time.time() - poll_start) > max_poll_s:
-                return func.HttpResponse(json.dumps({"error": "Polling timed out"}), status_code=504, mimetype="application/json")
+                return _make_response({"error": "Polling timed out"}, status_code=504)
             # minimal delay to avoid hammering API (e.g., 50ms)
             time.sleep(0.05)
-
+    
         # Response
         messages = openai_client.beta.threads.messages.list(thread_id=thread_id)
         assistant_response = "No response from assistant."
@@ -407,30 +498,33 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         break
                 if assistant_response:
                     break
-
-        save_interaction_log(user_id, user_message, assistant_response, thread_id, all_tool_calls)
-
+    
+        # Always save interaction history at the end, with all required fields
+        save_interaction_log(
+            user_id=user_id,
+            user_message=user_message,
+            assistant_response=assistant_response,
+            thread_id=thread_id,
+            tool_calls_info=all_tool_calls
+        )
+    
         total_ms = (time.time() - request_start) * 1000
         tools_ms = sum(call.get("duration_ms", 0) for call in all_tool_calls)
-
-        return func.HttpResponse(
-            json.dumps(
-                {
-                    "status": "success",
-                    "response": assistant_response,
-                    "thread_id": thread_id,
-                    "user_id": user_id,
-                    "tool_calls_count": len(all_tool_calls),
-                    "timings": {
-                        "total_ms": total_ms,
-                        "tools_ms": tools_ms,
-                    },
+    
+        return _make_response(
+            {
+                "status": "success",
+                "response": assistant_response,
+                "thread_id": thread_id,
+                "user_id": user_id,
+                "tool_calls_count": len(all_tool_calls),
+                "timings": {
+                    "total_ms": total_ms,
+                    "tools_ms": tools_ms,
                 },
-                ensure_ascii=False,
-            ),
+            },
             status_code=200,
-            mimetype="application/json",
         )
-    except Exception as e:
-        logging.error(f"Critical error: {e}", exc_info=True)
-        return func.HttpResponse(json.dumps({"error": str(e)}), status_code=500, mimetype="application/json")
+    # Note: exceptions will propagate for local debugging; the Functions worker
+    # will catch and log them when running under the runtime.
+

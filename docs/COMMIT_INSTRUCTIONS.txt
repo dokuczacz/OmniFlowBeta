@@ -1,0 +1,25 @@
+To create a Git commit for the implemented changes:
+
+1) Stage changes:
+
+```bash
+git add backend/tool_call_handler/__init__.py \
+    backend/tests/test_tool_call_handler.py \
+    backend/TESTER_INSTRUCTIONS.md \
+    CHANGES.md \
+    IMPLEMENTER_AGENT.md
+```
+
+2) Commit with message:
+
+```bash
+git commit -m "tool_call_handler: ensure serializable responses for Functions worker; harden proxy GET/POST; add debug, tests and tester instructions"
+```
+
+3) Push (if repo remote exists):
+
+```bash
+git push origin <branch>
+```
+
+If you want me to run these commands here, authorize and I'll attempt them. If repository has local-only state, ensure your user.name and user.email are configured.
