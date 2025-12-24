@@ -2,6 +2,7 @@ import datetime
 import json
 import logging
 import os
+import sys
 import time
 from typing import Dict, Any, Tuple
 
@@ -9,11 +10,35 @@ try:
     import azure.functions as func
     AZURE_FUNCTIONS_AVAILABLE = True
 except ImportError:
-    import types
-    func = types.SimpleNamespace(HttpResponse=lambda *a, **kw: None)
+    import types as _types
+    # Minimal fallback shim so annotations and simple usages don't fail when
+    # `azure.functions` is not available in the local environment.
+    class _DummyHttpRequest:
+        def __init__(self, *a, **kw):
+            self.headers = {}
+            self.params = {}
+        def get_json(self):
+            return {}
+
+    func = _types.SimpleNamespace(HttpResponse=lambda *a, **kw: None, HttpRequest=_DummyHttpRequest)
     AZURE_FUNCTIONS_AVAILABLE = False
 import requests
+import threading
 from openai import OpenAI
+import inspect
+from types import SimpleNamespace
+import types as _types
+import threading
+import random
+
+# Allow importing shared helpers when running as a Functions app or locally
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from shared.file_logger import attach_file_handler, detach_file_handler
+except Exception:
+    # Best-effort import; if it fails, we will continue without file logging
+    attach_file_handler = None
+    detach_file_handler = None
 
 # Config
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -23,6 +48,89 @@ PROXY_FUNCTION_KEY = os.environ.get("FUNCTION_CODE_PROXY_ROUTER", "")
 ENABLE_SAVE_INTERACTION = True  # Hardcoded to always enable saving for now
 VECTOR_STORE_ID = os.environ.get("OPENAI_VECTOR_STORE_ID", "")
 DEBUG_TOOL_CALL_HANDLER = os.environ.get("DEBUG_TOOL_CALL_HANDLER", "").lower() in ("1", "true", "yes")
+OPENAI_MAX_REQUESTS = int(os.environ.get("OPENAI_MAX_REQUESTS", "0") or 0)
+# runtime counter for outbound OpenAI HTTP calls (best-effort)
+_openai_lock = threading.Lock()
+_openai_count = 0
+
+# Optional global (cross-process) limit for tests. If set (>0), this will be
+# enforced by a simple file-based counter in `backend/logs/openai_global_counter.json`.
+OPENAI_GLOBAL_MAX_REQUESTS = int(os.environ.get("OPENAI_GLOBAL_MAX_REQUESTS", "0") or 0)
+BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+GLOBAL_COUNTER_PATH = os.path.join(BACKEND_ROOT, "logs", "openai_global_counter.json")
+GLOBAL_LOCK_PATH = GLOBAL_COUNTER_PATH + ".lock"
+
+def _acquire_file_lock(lock_path, timeout=10.0):
+    start = time.time()
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            try:
+                os.write(fd, str(os.getpid()).encode())
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            if (time.time() - start) > timeout:
+                raise RuntimeError("Timeout acquiring lock")
+            time.sleep(0.05)
+
+def _release_file_lock(lock_path):
+    try:
+        os.remove(lock_path)
+    except Exception:
+        pass
+
+def _global_openai_call(fn, *args, **kwargs):
+    """Enforce a cross-process global request counter for OpenAI calls.
+    This uses a file-based counter with a lock; intended only for local testing.
+    """
+    if OPENAI_GLOBAL_MAX_REQUESTS <= 0:
+        return fn(*args, **kwargs)
+    # ensure logs dir exists
+    try:
+        os.makedirs(os.path.dirname(GLOBAL_COUNTER_PATH), exist_ok=True)
+    except Exception:
+        pass
+    # acquire lock
+    _acquire_file_lock(GLOBAL_LOCK_PATH, timeout=10.0)
+    try:
+        if os.path.exists(GLOBAL_COUNTER_PATH):
+            try:
+                with open(GLOBAL_COUNTER_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {"count": 0}
+        else:
+            data = {"count": 0}
+        if data.get("count", 0) >= OPENAI_GLOBAL_MAX_REQUESTS:
+            raise RuntimeError(f"OPENAI_GLOBAL_MAX_REQUESTS limit reached ({OPENAI_GLOBAL_MAX_REQUESTS})")
+        data["count"] = data.get("count", 0) + 1
+        try:
+            with open(GLOBAL_COUNTER_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+    finally:
+        _release_file_lock(GLOBAL_LOCK_PATH)
+    return fn(*args, **kwargs)
+
+def _openai_call(fn, *args, **kwargs):
+    """Call an OpenAI SDK function but enforce an optional max-requests limit.
+    If `OPENAI_MAX_REQUESTS` is 0, no limit is enforced. After the limit is
+    reached, raise RuntimeError to stop further network calls.
+    """
+    global _openai_count
+    # If a global cross-process limit is configured, use that wrapper.
+    if OPENAI_GLOBAL_MAX_REQUESTS > 0:
+        return _global_openai_call(fn, *args, **kwargs)
+    if OPENAI_MAX_REQUESTS <= 0:
+        return fn(*args, **kwargs)
+    with _openai_lock:
+        if _openai_count >= OPENAI_MAX_REQUESTS:
+            raise RuntimeError(f"OPENAI_MAX_REQUESTS limit reached ({OPENAI_MAX_REQUESTS})")
+        _openai_count += 1
+    return fn(*args, **kwargs)
 
 logging.info("=== tool_call_handler CONFIG ===")
 logging.info(f"OPENAI_API_KEY set: {bool(OPENAI_API_KEY)}")
@@ -67,10 +175,10 @@ def normalize_tool_arguments(tool_name: str, tool_arguments: Dict[str, Any]) -> 
             args["target_blob_name"] = target_blob_name
         find_key = pop_first("find_key", "key_to_find", "key", "match_key")
         if find_key:
-            args["find_key"] = find_key
+            args["filter_key"] = find_key
         find_value = pop_first("find_value", "value_to_find", "value", "match_value")
         if find_value is not None:
-            args["find_value"] = find_value
+            args["filter_value"] = find_value
         update_key = pop_first("update_key", "set_key")
         if update_key:
             args["update_key"] = update_key
@@ -171,6 +279,575 @@ def _redact_sensitive(obj: Any) -> Any:
     return redacted
 
 
+def _supports_tool_resources(openai_client: OpenAI) -> bool:
+    """Return True if the OpenAI client appears to support the `tool_resources` parameter
+    on `beta.threads.runs.create`. Uses introspection to avoid making a network call.
+    Falls back to conservative False on any error.
+    """
+    try:
+        create_fn = getattr(openai_client.beta.threads.runs, "create", None)
+        if create_fn is None:
+            return False
+        sig = inspect.signature(create_fn)
+        # Parameters may include **kwargs; prefer explicit 'tool_resources' if present
+        if "tool_resources" in sig.parameters:
+            return True
+        # If **kwargs present, assume it may accept tool_resources at runtime
+        for p in sig.parameters.values():
+            if p.kind == inspect.Parameter.VAR_KEYWORD:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def resolve_user_id(req, body: Dict[str, Any]) -> Tuple[Any, str]:
+    """Resolve user_id from request headers, then body, then query params.
+    Returns (user_id, source) where source is one of 'header', 'body', 'params', or 'none'.
+    """
+    try:
+        # Header priority
+        if req is not None:
+            try:
+                hdrs = getattr(req, 'headers', None) or {}
+                # Support both capitalized and lowercase keys
+                for hk in ('X-User-Id', 'x-user-id', 'X-User-Id'.lower()):
+                    if isinstance(hdrs, dict) and hk in hdrs and hdrs.get(hk):
+                        return str(hdrs.get(hk)), 'header'
+                    # Some HttpRequest implementations use a case-insensitive mapping
+                # Fallback: try get with case-insensitive search
+                if isinstance(hdrs, dict):
+                    for k, v in hdrs.items():
+                        if k and k.lower() == 'x-user-id' and v:
+                            return str(v), 'header'
+            except Exception:
+                pass
+        # Body
+        if isinstance(body, dict) and body.get('user_id'):
+            return body.get('user_id'), 'body'
+        # Query params on the request object
+        try:
+            params = getattr(req, 'params', None) or {}
+            if isinstance(params, dict) and params.get('user_id'):
+                return params.get('user_id'), 'params'
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return (None, 'none')
+
+
+def restore_or_create_thread(openai_client: OpenAI, user_id: str, thread_id: str) -> str:
+    """Attempt to restore a thread_id for the user from blob storage; if not found,
+    create a new thread via the OpenAI SDK or REST fallback. Returns thread_id.
+    Raises RuntimeError on unrecoverable failure.
+    """
+    # Try restore from blob storage if no thread_id provided
+    if thread_id:
+        return thread_id
+    try:
+        if user_id:
+            logging.info(f"Attempting to restore thread_id for user {user_id} from blob")
+            try:
+                from backend.read_blob_file import main as read_blob_main
+
+                class _Req:
+                    def __init__(self, file_name, user_id):
+                        self.headers = {"x-user-id": str(user_id)}
+                        self.params = {"file_name": file_name}
+
+                    def get_json(self):
+                        return {"user_id": str(user_id), "file_name": file_name}
+
+                req_obj = _Req("current_thread.json", user_id)
+                resp = read_blob_main(req_obj)
+                try:
+                    resp_text = resp.get_body() if hasattr(resp, 'get_body') else getattr(resp, 'body', None)
+                except Exception:
+                    resp_text = getattr(resp, 'body', None)
+                try:
+                    res = json.loads(resp_text) if isinstance(resp_text, (str, bytes)) else resp_text
+                except Exception:
+                    res = resp_text
+            except Exception:
+                # Fall back to the generic execute_tool_call which may proxy
+                res_str, info = execute_tool_call("read_blob_file", {"file_name": "current_thread.json"}, user_id)
+                try:
+                    res = json.loads(res_str) if isinstance(res_str, str) else res_str
+                except Exception:
+                    res = res_str
+            # Normalize and extract thread id
+            tid = None
+            if isinstance(res, dict):
+                data = res.get('data')
+                if isinstance(data, dict) and 'thread_id' in data:
+                    tid = data.get('thread_id')
+            if tid:
+                logging.info(f"Restored thread_id={tid} from blob for user {user_id}")
+                return tid
+            logging.info("No valid thread id found in current_thread.json; attempting fallback to interaction_logs.json")
+            # Fallback: try to recover last thread_id from interaction_logs.json
+            try:
+                res_str, info = execute_tool_call("read_blob_file", {"file_name": "interaction_logs.json"}, user_id)
+                try:
+                    rb = json.loads(res_str) if isinstance(res_str, str) else res_str
+                except Exception:
+                    rb = res_str
+                candidate = None
+                if isinstance(rb, dict) and 'data' in rb:
+                    data_blob = rb.get('data')
+                    try:
+                        candidate = json.loads(data_blob) if isinstance(data_blob, str) else data_blob
+                    except Exception:
+                        candidate = data_blob
+                elif isinstance(rb, (list, dict)):
+                    candidate = rb
+                recovered = None
+                if isinstance(candidate, list) and len(candidate) > 0:
+                    for entry in reversed(candidate):
+                        try:
+                            if isinstance(entry, dict) and 'thread_id' in entry and entry.get('thread_id'):
+                                recovered = entry.get('thread_id')
+                                break
+                        except Exception:
+                            continue
+                elif isinstance(candidate, dict) and candidate.get('thread_id'):
+                    recovered = candidate.get('thread_id')
+                if recovered:
+                    logging.info(f"Recovered thread_id={recovered} from interaction_logs.json for user {user_id}")
+                    return recovered
+                logging.info("No thread_id found in interaction_logs.json; will create new thread")
+            except Exception as fb_ex:
+                logging.info(f"Fallback restore from interaction_logs.json failed: {fb_ex}")
+    except Exception as e:
+        logging.info(f"Restore from blob failed or no file present: {e}")
+
+    logging.info("No thread_id provided; attempting to create a new thread via OpenAI SDK")
+    # Create via SDK (simplified single path)
+    try:
+        created = _openai_call(openai_client.beta.threads.create)
+        thread_id = getattr(created, "id", None) or getattr(created, "thread_id", None)
+        if not thread_id and isinstance(created, dict):
+            thread_id = created.get("id") or created.get("thread_id")
+        if not thread_id:
+            logging.warning(f"SDK thread create returned unexpected payload: {type(created)}")
+            raise RuntimeError("SDK thread creation returned no thread id")
+        logging.info(f"Created new thread_id={thread_id} via SDK")
+        # Persist the new thread id to blob storage for future restores
+        try:
+            if user_id:
+                logging.info(f"Saving new thread_id for user {user_id} to blob")
+                payload = {"thread_id": thread_id}
+                execute_tool_call("upload_data_or_file", {"target_blob_name": "current_thread.json", "file_content": json.dumps(payload)}, user_id)
+        except Exception:
+            logging.warning("Failed to persist new thread id to blob storage")
+        return thread_id
+    except Exception as sdk_exc:
+        logging.warning(f"SDK-based thread creation failed: {sdk_exc}; falling back to REST create")
+        # REST fallback
+        try:
+            openai_api_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com").rstrip("/")
+            create_url = f"{openai_api_base}/v1/beta/threads"
+            headers = _openai_rest_headers()
+            payload = {"assistant_id": ASSISTANT_ID}
+            try:
+                use_rest_tr = os.environ.get("OPENAI_USE_REST_TOOLRESOURCES", "").lower() in ("1", "true", "yes")
+            except Exception:
+                use_rest_tr = False
+            if use_rest_tr and VECTOR_STORE_ID:
+                payload["tool_resources"] = {"vector_store": VECTOR_STORE_ID}
+            resp = requests.post(create_url, json=payload, headers=headers, timeout=15)
+            try:
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                body_snip = (resp.text[:1000] + "...[truncated]") if hasattr(resp, "text") else ""
+                logging.warning(f"Thread creation REST call failed: {exc} status={getattr(resp, 'status_code', 'n/a')} body={body_snip}")
+                raise RuntimeError("failed to create thread")
+            try:
+                thread_json = resp.json()
+            except ValueError:
+                raise RuntimeError("invalid response creating thread")
+            thread_id = thread_json.get("id") or thread_json.get("thread_id")
+            if not thread_id:
+                raise RuntimeError("thread creation returned no id")
+            logging.info(f"Created new thread_id={thread_id} via REST")
+            try:
+                if user_id:
+                    logging.info(f"Saving new thread_id for user {user_id} to blob (REST-created)")
+                    payload = {"thread_id": thread_id}
+                    execute_tool_call("upload_data_or_file", {"target_blob_name": "current_thread.json", "file_content": json.dumps(payload)}, user_id)
+            except Exception:
+                logging.warning("Failed to persist new thread id to blob storage (REST-created)")
+            return thread_id
+        except Exception as e:
+            logging.exception(f"Unexpected error while creating thread via REST: {e}")
+            raise RuntimeError(f"failed to create thread: {e}")
+
+
+def append_user_message(openai_client: OpenAI, thread_id: str, user_message: str):
+    """Append user's message to the given thread. Uses SDK when possible, otherwise REST fallback."""
+    if not user_message:
+        return
+    try:
+        logging.info(f"Posting user message to thread {thread_id} via SDK")
+        _openai_call(
+            openai_client.beta.threads.messages.create,
+            thread_id=thread_id,
+            role="user",
+            content=[{"type": "text", "text": user_message}],
+        )
+    except Exception as msg_sdk_exc:
+        try:
+            logging.info(f"SDK message create failed ({msg_sdk_exc}); falling back to REST POST for thread {thread_id}")
+            openai_api_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com").rstrip("/")
+            candidate_urls = [
+                f"{openai_api_base}/v1/threads/{thread_id}/messages",
+                f"{openai_api_base}/v1/beta/threads/{thread_id}/messages",
+            ]
+            headers = _openai_rest_headers()
+            payload = {"role": "user", "content": [{"type": "text", "text": user_message}]}
+            resp_msg = None
+            success = False
+            for msg_url in candidate_urls:
+                try:
+                    if DEBUG_TOOL_CALL_HANDLER:
+                        logging.info(f"[DEBUG] REST POST {msg_url} headers={_redact_sensitive(dict(headers))} payload={_redact_sensitive(payload)}")
+                    resp_msg = requests.post(msg_url, json=payload, headers=headers, timeout=10)
+                    resp_msg.raise_for_status()
+                    logging.info(f"Posted user message to thread {thread_id} via REST; status={resp_msg.status_code} url={msg_url}")
+                    success = True
+                    break
+                except requests.RequestException as rme:
+                    try:
+                        body_text = resp_msg.text[:1000] if resp_msg is not None and hasattr(resp_msg, 'text') else ''
+                    except Exception:
+                        body_text = '<unserializable>'
+                    logging.warning(
+                        f"Failed to POST message to thread {thread_id} via REST: status={getattr(resp_msg, 'status_code', 'n/a')} url={msg_url} error={rme} body={body_text} headers={_redact_sensitive(dict(headers))} payload_trunc={_redact_sensitive(payload)}"
+                    )
+            if not success:
+                logging.warning(f"REST fallback for posting message failed for all candidate URLs for thread {thread_id}")
+        except Exception as rest_exc:
+            logging.warning(f"REST fallback for posting message failed: {rest_exc}")
+
+
+def handle_direct_actions(req, body: Dict[str, Any], action: str, user_id: str):
+    """Handle direct actions `save_interaction` and `get_interaction_history`.
+    Returns an _make_response(...) tuple if handled, otherwise None.
+    """
+    # Enforce user_id presence
+    user_message = body.get("message", "")
+    user_id_local = user_id
+    thread_id = body.get("thread_id")
+    params = body.get("params", {}) or {}
+    if not user_id_local:
+        return _make_response({"error": "user_id is required for save/get actions"}, status_code=400)
+    headers = {"X-User-Id": str(user_id_local), "Content-Type": "application/json"}
+    base = os.getenv("FUNCTION_URL_BASE", "http://localhost:7071").rstrip("/")
+    url = f"{base}/api/{action}"
+    function_code_env = f"FUNCTION_CODE_{action.upper()}"
+    function_code = os.getenv(function_code_env)
+    if function_code:
+        url = f"{url}?code={function_code}"
+    try:
+        if DEBUG_TOOL_CALL_HANDLER:
+            logging.info(f"[DEBUG] Direct call {action} URL={url} params={_redact_sensitive(dict(params))} headers={_redact_sensitive(dict(headers))}")
+        if action == "get_interaction_history":
+            resp = requests.get(url, params=params, headers=headers, timeout=45)
+        else:
+            resp = requests.post(url, json=params, headers=headers, timeout=45)
+        resp.raise_for_status()
+        try:
+            result = resp.json()
+        except ValueError:
+            result = {"raw_response": resp.text}
+        if DEBUG_TOOL_CALL_HANDLER:
+            try:
+                snippet = result if isinstance(result, (dict, list)) else (resp.text[:1000] + "...[truncated]" if len(resp.text) > 1000 else resp.text)
+            except Exception:
+                snippet = "<unserializable>"
+            logging.info(f"[DEBUG] Direct response status={resp.status_code} body={_redact_sensitive(snippet if isinstance(snippet, dict) else {'raw': snippet})}")
+        return _make_response({"status": "success", "result": result}, status_code=resp.status_code)
+    except requests.HTTPError as exc:
+        if resp is not None:
+            return _make_response(resp.text, status_code=resp.status_code)
+        else:
+            if DEBUG_TOOL_CALL_HANDLER:
+                logging.exception(f"Direct {action} call failed: {exc}")
+            return _make_response({"error": str(exc)}, status_code=500)
+
+
+def create_run_and_poll(openai_client: OpenAI, thread_id: str, user_id: str):
+    """Create a run and poll until completion. Returns (run, all_tool_calls, tool_outputs_struct, run_summary).
+    Raises exceptions on unrecoverable failures.
+    """
+    run = None
+    all_tool_calls = []
+    tool_outputs_struct = []
+    run_summary = {"timestamps": {}, "steps": []}
+
+    # Create a normal run (no tool_resources attachment)
+    try:
+        try:
+            run = _openai_call(openai_client.beta.threads.runs.create, thread_id=thread_id, assistant_id=ASSISTANT_ID)
+        except TypeError:
+            try:
+                run = _openai_call(openai_client.beta.threads.runs.create, thread_id=thread_id, assistant=ASSISTANT_ID)
+            except TypeError:
+                run = _openai_call(openai_client.beta.threads.runs.create, thread_id=thread_id)
+    except Exception as exc:
+        logging.warning(f"SDK runs.create failed: {exc}; attempting REST fallback for run creation")
+        try:
+            openai_api_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com").rstrip("/")
+            runs_url = f"{openai_api_base}/v1/beta/threads/{thread_id}/runs"
+            headers = _openai_rest_headers()
+            payload = {"assistant_id": ASSISTANT_ID}
+            try:
+                use_rest_tr = os.environ.get("OPENAI_USE_REST_TOOLRESOURCES", "").lower() in ("1", "true", "yes")
+            except Exception:
+                use_rest_tr = False
+            if use_rest_tr and VECTOR_STORE_ID:
+                payload["tool_resources"] = {"vector_store": VECTOR_STORE_ID}
+            resp = requests.post(runs_url, json=payload, headers=headers, timeout=15)
+            resp.raise_for_status()
+            try:
+                run_json = resp.json()
+            except ValueError:
+                logging.warning("REST runs.create returned non-JSON response")
+                raise RuntimeError("REST runs.create returned non-JSON response")
+            else:
+                run_id = run_json.get("id") or run_json.get("run_id")
+                if run_id:
+                    run = _types.SimpleNamespace(id=run_id)
+                    logging.info("Created run via REST fallback")
+                else:
+                    logging.warning("REST runs.create returned no run id")
+                    raise RuntimeError("REST runs.create returned no run id")
+        except Exception as e:
+            logging.exception(f"REST fallback for runs.create failed: {e}")
+            raise
+
+    # Polling with progressive backoff+jitter to avoid hammering the API.
+    poll_start = time.time()
+    max_poll_s = 30  # hard timeout for polling
+    poll_delay = 0.15
+    max_delay = 1.0
+    backoff_factor = 1.5
+    prev_status = None
+    while True:
+        run = _openai_call(openai_client.beta.threads.runs.retrieve, thread_id=thread_id, run_id=run.id)
+        run_summary["timestamps"]["last_poll"] = time.time()
+        try:
+            rs = getattr(run, 'status', None)
+            logging.info(f"run_status={rs}")
+        except Exception:
+            logging.debug("Unable to read run.status for logging")
+        if prev_status is None or rs != prev_status:
+            poll_delay = 0.15
+        prev_status = rs
+        if run.status == "completed":
+            run_summary["timestamps"]["completed"] = time.time()
+            break
+        if run.status == "failed":
+            if DEBUG_TOOL_CALL_HANDLER:
+                logging.error(f"Run failed: {getattr(run, 'last_error', None)}")
+            raise RuntimeError(str(getattr(run, 'last_error', 'run failed')))
+        if run.status == "requires_action":
+            # Log required tool calls summary (name + arguments) for quick visibility
+            try:
+                tool_calls_tmp = getattr(getattr(run, 'required_action', _types.SimpleNamespace()), 'submit_tool_outputs', _types.SimpleNamespace())
+                tool_calls_list = getattr(tool_calls_tmp, 'tool_calls', [])
+                brief_calls = []
+                for c in tool_calls_list:
+                    nm = getattr(c.function, 'name', None) or getattr(c.function, 'function_name', None)
+                    raw_args = getattr(c.function, 'arguments', None) or "{}"
+                    args_parsed = _safe_load_json(raw_args or "{}")
+                    brief_calls.append({"name": nm, "args": _redact_sensitive(args_parsed)})
+                logging.info(f"requires_action_tool_calls={brief_calls}")
+            except Exception:
+                logging.debug("Failed to log required action tool calls summary")
+
+            # Execute required tool calls
+            tool_calls = getattr(getattr(run, 'required_action', _types.SimpleNamespace()), 'submit_tool_outputs', _types.SimpleNamespace())
+            tool_calls = getattr(tool_calls, 'tool_calls', [])
+            outputs = []
+            run_summary["timestamps"]["tools_start"] = time.time()
+            for call in tool_calls:
+                try:
+                    name = getattr(call.function, 'name', None) or getattr(call.function, 'function_name', None)
+                    raw_args = getattr(call.function, 'arguments', None) or "{}"
+                    args = _safe_load_json(raw_args or "{}")
+                    if name == "manage_files" and args.get("operation") == "list":
+                        name = "list_blobs"
+                        args = {"prefix": args.get("prefix")}
+                    call_start = time.time()
+                    try:
+                        if not isinstance(args, dict):
+                            args = dict(args or {})
+                    except Exception:
+                        args = args or {}
+                    if args.get("user_id") and args.get("user_id") != user_id:
+                        logging.info(f"Overriding tool arg user_id={args.get('user_id')} -> {user_id}")
+                    args["user_id"] = user_id
+                    if "thread_id" in args and args.get("thread_id") != thread_id:
+                        logging.info(f"Overriding tool arg thread_id={args.get('thread_id')} -> {thread_id}")
+                    if thread_id:
+                        args["thread_id"] = thread_id
+
+                    result_str, info = execute_tool_call(name, args, user_id)
+                    call_end = time.time()
+                    all_tool_calls.append(info)
+                    try:
+                        parsed_output = json.loads(result_str)
+                    except Exception:
+                        parsed_output = result_str
+                    outputs.append({
+                        "tool_call_id": getattr(call, 'id', None),
+                        "name": name,
+                        "arguments": args,
+                        "output": parsed_output,
+                        "info": info,
+                        "duration_ms": (call_end - call_start) * 1000,
+                    })
+                    tool_outputs_struct.append(outputs[-1])
+                except Exception as call_exc:
+                    if DEBUG_TOOL_CALL_HANDLER:
+                        logging.exception(f"Error executing tool call {name}: {call_exc}")
+                    outputs.append({"tool_call_id": getattr(call, 'id', None), "name": name, "error": str(call_exc)})
+            run_summary["timestamps"]["tools_end"] = time.time()
+            run_summary["steps"].append({"step": "tools", "count": len(outputs), "outputs": outputs})
+            try:
+                _openai_call(openai_client.beta.threads.runs.submit_tool_outputs, thread_id=thread_id, run_id=run.id, tool_outputs=[{"tool_call_id": o.get('tool_call_id'), "output": json.dumps(o.get('output')) if not isinstance(o.get('output'), str) else o.get('output')} for o in outputs])
+            except Exception as submit_exc:
+                if DEBUG_TOOL_CALL_HANDLER:
+                    logging.exception(f"Failed to submit tool outputs: {submit_exc}")
+            run = _openai_call(openai_client.beta.threads.runs.retrieve, thread_id=thread_id, run_id=run.id)
+            if run.status == "completed":
+                run_summary["timestamps"]["completed_after_tools"] = time.time()
+                break
+            if run.status == "failed":
+                if DEBUG_TOOL_CALL_HANDLER:
+                    logging.error(f"Run failed after submitting tool outputs: {getattr(run, 'last_error', None)}")
+                raise RuntimeError(str(getattr(run, 'last_error', 'run failed after tools')))
+            continue
+        if (time.time() - poll_start) > max_poll_s:
+            raise RuntimeError("Polling timed out")
+        jitter = random.uniform(0, min(0.1, poll_delay * 0.2))
+        time.sleep(poll_delay + jitter)
+        poll_delay = min(max_delay, poll_delay * backoff_factor)
+
+    return run, all_tool_calls, tool_outputs_struct, run_summary
+
+
+def finalize_response(
+    openai_client: OpenAI,
+    thread_id: str,
+    user_id: str,
+    user_message: str,
+    all_tool_calls: list,
+    vector_store_attached: bool,
+    total_ms: float = 0,
+    log_interaction: bool = True,
+):
+    """Collect assistant response, save interaction, and return final HttpResponse."""
+    # Request a limited number of messages to reduce payload and latency.
+    # Use limit=10 conservatively.
+    try:
+        messages = _openai_call(openai_client.beta.threads.messages.list, thread_id=thread_id, limit=10)
+    except TypeError:
+        # Some SDK versions may not accept 'limit' as a kwarg; fall back to call without it.
+        messages = _openai_call(openai_client.beta.threads.messages.list, thread_id=thread_id)
+
+    def _get_attr(msg: Any, key: str):
+        if isinstance(msg, dict):
+            return msg.get(key)
+        return getattr(msg, key, None)
+
+    def _get_role(msg: Any) -> str:
+        return str(_get_attr(msg, "role") or "")
+
+    def _created_at_int(msg: Any):
+        created_at = _get_attr(msg, "created_at")
+        if created_at is None:
+            return None
+        try:
+            return int(created_at)
+        except Exception:
+            return None
+
+    def _extract_text_from_message(msg: Any):
+        contents = _get_attr(msg, "content") or []
+        for item in contents:
+            # SDK object shape: item.text.value
+            try:
+                if hasattr(item, "text") and getattr(item.text, "value", None):
+                    return item.text.value
+            except Exception:
+                pass
+            # REST/dict shape: {"type":"text","text":{"value":"..."}}
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    text_obj = item.get("text")
+                    if isinstance(text_obj, dict):
+                        if text_obj.get("value"):
+                            return text_obj.get("value")
+                    elif isinstance(text_obj, str) and text_obj:
+                        return text_obj
+        return None
+
+    assistant_response = None
+    try:
+        data_iter = list(getattr(messages, "data", []) or [])
+        assistant_msgs = [m for m in data_iter if _get_role(m) == "assistant"]
+        if assistant_msgs:
+            if any(_created_at_int(m) is not None for m in assistant_msgs):
+                chosen = max(assistant_msgs, key=lambda m: (_created_at_int(m) or -1))
+            else:
+                # Fall back to list order if created_at is absent.
+                chosen = assistant_msgs[-1]
+            assistant_response = _extract_text_from_message(chosen)
+    except Exception:
+        assistant_response = None
+
+    if not assistant_response:
+        assistant_response = "No response from assistant."
+
+    try:
+        user_snip = (user_message or "")[:120]
+        assistant_snip = (assistant_response or "")[:120]
+        logging.info("--- interaction summary ---\n" + f"user_id={user_id} thread_id={thread_id}\n" + f"user_message={user_snip}\n" + f"assistant_message={assistant_snip}\n" + "--- end summary ---")
+    except Exception:
+        logging.debug("Failed to emit concise interaction summary")
+
+    if log_interaction:
+        save_interaction_log(
+            user_id=user_id,
+            user_message=user_message,
+            assistant_response=assistant_response,
+            thread_id=thread_id,
+            tool_calls_info=all_tool_calls,
+        )
+
+    # `total_ms` can be supplied by caller; default to 0 if not provided.
+    tools_ms = sum(call.get("duration_ms", 0) for call in all_tool_calls)
+
+    return _make_response(
+        {
+            "status": "success",
+            "response": assistant_response,
+            "thread_id": thread_id,
+            "user_id": user_id,
+            "vector_store_attached": vector_store_attached,
+            "tool_calls_count": len(all_tool_calls),
+            "timings": {
+                "total_ms": total_ms,
+                "tools_ms": tools_ms,
+            },
+        },
+        status_code=200,
+    )
+
+
 def _make_response(body: Any, status_code: int = 200):
     """Return a tuple (body, status, headers) which the Functions worker accepts for HTTP output."""
     if isinstance(body, (dict, list)):
@@ -185,6 +862,19 @@ def _make_response(body: Any, status_code: int = 200):
             # Fallback to tuple if HttpResponse construction fails for some reason
             return body_text, status_code, {"Content-Type": "application/json"}
     return body_text, status_code, {"Content-Type": "application/json"}
+
+
+def _openai_rest_headers(include_beta: bool = True) -> Dict[str, str]:
+    """Build standard headers for OpenAI REST requests, including the
+    OpenAI-Beta header required for the Assistants API when requested.
+    """
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    try:
+        if include_beta:
+            headers["OpenAI-Beta"] = "assistants=v2"
+    except Exception:
+        pass
+    return headers
 
 
 def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: str) -> Tuple[str, Dict[str, Any]]:
@@ -270,9 +960,11 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
             function_base = os.getenv("FUNCTION_URL_BASE", "http://localhost:7071").rstrip("/")
             func_url = f"{function_base}/api/{tool_name}"
             if DEBUG_TOOL_CALL_HANDLER:
-                logging.info(f"[DEBUG] GET {func_url} params={_redact_sensitive(dict(params_with_user))} headers={_redact_sensitive(dict(headers))}")
+                logging.info(f"[DEBUG] GET {func_url} params={_redact_sensitive(dict(filtered_args if 'filtered_args' in locals() else params_with_user))} headers={_redact_sensitive(dict(headers))}")
             try:
-                resp = requests.get(func_url, params=params_with_user, headers=headers, timeout=45)
+                # Use filtered_args to avoid sending assistant-supplied extras when available
+                get_params = filtered_args if 'filtered_args' in locals() else params_with_user
+                resp = requests.get(func_url, params=get_params, headers=headers, timeout=45)
                 resp.raise_for_status()
                 try:
                     result = resp.json()
@@ -290,7 +982,9 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
                 info = {"tool_name": tool_name, "arguments": normalized_args, "error": err, "status": "failed", "duration_ms": duration_ms}
                 logging.error(err)
                 return json.dumps({"error": err}), info
-            payload = {"action": tool_name, "params": params_with_user}
+            # When dispatching via proxy, prefer the filtered argument set constructed
+            # above to avoid leaking assistant-supplied or extraneous fields.
+            payload = {"action": tool_name, "params": filtered_args if 'filtered_args' in locals() else params_with_user}
             if DEBUG_TOOL_CALL_HANDLER:
                 logging.info(f"[DEBUG] POST {PROXY_URL} json={_redact_sensitive(payload)} headers={_redact_sensitive(dict(headers))}")
             try:
@@ -351,7 +1045,13 @@ def save_interaction_log(user_id: str, user_message: str, assistant_response: st
             "metadata": {"assistant_id": ASSISTANT_ID, "source": "tool_call_handler"},
         }
         headers = {"Content-Type": "application/json", "X-User-Id": user_id}
-        requests.post(url, json=payload, headers=headers, timeout=10)
+        def _fire_and_forget():
+            try:
+                requests.post(url, json=payload, headers=headers, timeout=(1, 10))
+            except Exception as post_exc:
+                logging.warning(f"save_interaction_log failed: {post_exc}")
+
+        threading.Thread(target=_fire_and_forget, daemon=True).start()
     except Exception as e:
         logging.warning(f"save_interaction_log failed: {e}")
 
@@ -359,172 +1059,154 @@ def save_interaction_log(user_id: str, user_message: str, assistant_response: st
 def main(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("=" * 60)
     logging.info("TOOL_CALL_HANDLER start")
+    file_handler = None
+    if attach_file_handler:
+        try:
+            file_handler = attach_file_handler("tool_call_handler")
+            logging.info("Attached per-invocation file log handler")
+        except Exception:
+            logging.warning("Failed to attach file log handler")
     try:
-        body = req.get_json()
-    except Exception:
-        return _make_response({"error": "Invalid JSON payload"}, status_code=400)
+        try:
+            body = req.get_json()
+        except Exception:
+            return _make_response({"error": "Invalid JSON payload"}, status_code=400)
 
-    user_message = body.get("message", "")
-    user_id = body.get("user_id")  # Do not default to 'default' for save/get actions
-    thread_id = body.get("thread_id")
-    time_only = bool(body.get("time_only", False))
-    action = body.get("action")
-    params = body.get("params", {})
-
-    # Config check (move here so it's always checked before main logic)
-    if not (OPENAI_API_KEY and ASSISTANT_ID and PROXY_URL):
-        missing = []
-        if not OPENAI_API_KEY:
-            missing.append("OPENAI_API_KEY")
-        if not ASSISTANT_ID:
-            missing.append("OPENAI_ASSISTANT_ID")
-        if not PROXY_URL:
-            missing.append("AZURE_PROXY_URL")
-        return _make_response({"error": f"Missing env vars: {', '.join(missing)}", "status": "not_configured"}, status_code=503)
-
-    # Direct save/get actions bypass agent
-    if action in ["save_interaction", "get_interaction_history"]:
-        # Enforce user_id presence
         user_message = body.get("message", "")
-        user_id = body.get("user_id")  # Do not default to 'default' for save/get actions
+        user_id, _user_id_source = resolve_user_id(req, body)
         thread_id = body.get("thread_id")
         time_only = bool(body.get("time_only", False))
         action = body.get("action")
         params = body.get("params", {})
-        if not user_id:
-            return _make_response({"error": "user_id is required for save/get actions"}, status_code=400)
-        headers = {"X-User-Id": str(user_id), "Content-Type": "application/json"}
-        params = params if params is not None else {}
-        # Build target function URL
-        base = os.getenv("FUNCTION_URL_BASE", "http://localhost:7071").rstrip("/")
-        url = f"{base}/api/{action}"
-        # Pass through function key if present
-        function_code_env = f"FUNCTION_CODE_{action.upper()}"
-        function_code = os.getenv(function_code_env)
-        if function_code:
-            url = f"{url}?code={function_code}"
-        resp = None
-        try:
-            if DEBUG_TOOL_CALL_HANDLER:
-                logging.info(f"[DEBUG] Direct call {action} URL={url} params={_redact_sensitive(dict(params))} headers={_redact_sensitive(dict(headers))}")
-            # Use GET for get_interaction_history, POST for save_interaction
-            if action == "get_interaction_history":
-                resp = requests.get(url, params=params, headers=headers, timeout=45)
-            else:
-                resp = requests.post(url, json=params, headers=headers, timeout=45)
-            resp.raise_for_status()
-            try:
-                result = resp.json()
-            except ValueError:
-                result = {"raw_response": resp.text}
-            if DEBUG_TOOL_CALL_HANDLER:
-                try:
-                    snippet = result if isinstance(result, (dict, list)) else (resp.text[:1000] + "...[truncated]" if len(resp.text) > 1000 else resp.text)
-                except Exception:
-                    snippet = "<unserializable>"
-                logging.info(f"[DEBUG] Direct response status={resp.status_code} body={_redact_sensitive(snippet if isinstance(snippet, dict) else {'raw': snippet})}")
-            return _make_response({"status": "success", "result": result}, status_code=resp.status_code)
-        except requests.HTTPError as exc:
-            if resp is not None:
-                return _make_response(resp.text, status_code=resp.status_code)
-            else:
-                if DEBUG_TOOL_CALL_HANDLER:
-                    logging.exception(f"Direct {action} call failed: {exc}")
-                return _make_response({"error": str(exc)}, status_code=500)
+        log_interaction = bool(body.get("log_interaction", True))
+
+        # Direct save/get actions bypass agent
+        if action in ["save_interaction", "get_interaction_history"]:
+            resp_direct = handle_direct_actions(req, body, action, user_id)
+            if resp_direct is not None:
+                return resp_direct
+
+        # Config check (after direct actions so save/get can work without proxy config)
+        if not (OPENAI_API_KEY and ASSISTANT_ID and PROXY_URL):
+            missing = []
+            if not OPENAI_API_KEY:
+                missing.append("OPENAI_API_KEY")
+            if not ASSISTANT_ID:
+                missing.append("OPENAI_ASSISTANT_ID")
+            if not PROXY_URL:
+                missing.append("AZURE_PROXY_URL")
+            return _make_response({"error": f"Missing env vars: {', '.join(missing)}", "status": "not_configured"}, status_code=503)
 
         # Run
+        # Initialize OpenAI client and detect SDK capabilities early so we
+        # can attempt SDK-based thread creation before falling back to REST.
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        # Note: SDK tool_resources support is detectable via _supports_tool_resources(),
+        # but the value is not used in this handler; keep function available for future use.
+
+        # If the caller didn't supply a thread identifier, attempt to restore
+        # a previously saved thread for this user from blob storage. If restore
+        # fails, create a new thread via the installed OpenAI SDK (preferred).
+        # If the SDK-based creation fails (or is unavailable), fall back to
+        # a REST call. This avoids routing issues where a hardcoded REST
+        # endpoint may be intercepted by a local proxy returning HTML.
+        if not thread_id:
+            try:
+                thread_id = restore_or_create_thread(openai_client, user_id, thread_id)
+            except RuntimeError as rexc:
+                msg = str(rexc)
+                if 'failed to create thread' in msg or 'invalid response' in msg or 'thread creation returned no id' in msg:
+                    return _make_response({"error": msg}, status_code=502)
+                return _make_response({"error": msg}, status_code=500)
+
+        # --- Synchronization: always append the user's message to the thread ---
+        # Use SDK when available, otherwise fall back to REST so the thread
+        # contains the user's message before creating a run.
+        try:
+            append_user_message(openai_client, thread_id, user_message)
+        except Exception:
+            logging.exception("Unexpected error while appending user message to thread")
+
         run = None
         all_tool_calls = []
+        tool_outputs_struct = []
         request_start = time.time()
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
-        if VECTOR_STORE_ID:
+        # Vector store support removed per configuration: we no longer attach
+        # OpenAI-managed vector stores to runs. This simplifies runtime
+        # behavior and avoids SDK/proxy compatibility issues.
+        vector_store_attached = False
+        # Run summary and per-step timestamps
+        run_summary = {"timestamps": {}, "steps": []}
+
+        # Optional pre-run restore (caller may request state restore)
+        do_restore = bool(body.get("do_restore", False))
+        if do_restore:
             try:
-                run = openai_client.beta.threads.runs.create(
-                    thread_id=thread_id,
-                    assistant_id=ASSISTANT_ID,
-                    tool_resources={"file_search": {"vector_store_ids": [VECTOR_STORE_ID]}},
-                )
-                logging.info(f"Vector store attached OK: tool_resources sent with vector_store_id={VECTOR_STORE_ID}")
-            except TypeError:
-                logging.warning("OpenAI client does not support tool_resources in runs.create; falling back without vector store.")
-        if run is None:
-            run = openai_client.beta.threads.runs.create(thread_id=thread_id, assistant_id=ASSISTANT_ID)
-    
-        # Remove static sleeps/backoff: poll as fast as possible until run is no longer actionable
-        poll_start = time.time()
-        max_poll_s = 30  # hard timeout for polling
-        while True:
-            run = openai_client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
-            if run.status == "completed":
-                break
-            if run.status == "failed":
-                return _make_response({"error": str(run.last_error)}, status_code=500)
-            if run.status == "requires_action":
-                tool_calls = run.required_action.submit_tool_outputs.tool_calls
-                outputs = []
-                for call in tool_calls:
-                    name = call.function.name
-                    args = _safe_load_json(call.function.arguments or "{}")
-                    # map legacy manage_files(list) to list_blobs
-                    if name == "manage_files" and args.get("operation") == "list":
-                        name = "list_blobs"
-                        args = {"prefix": args.get("prefix")}
-                    result, info = execute_tool_call(name, args, user_id)
-                    all_tool_calls.append(info)
-                    outputs.append({"tool_call_id": call.id, "output": result})
-                openai_client.beta.threads.runs.submit_tool_outputs(thread_id=thread_id, run_id=run.id, tool_outputs=outputs)
-                # Immediately re-fetch run status after submitting tool outputs
-                run = openai_client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
-                if run.status == "completed":
-                    break
-                if run.status == "failed":
-                    return _make_response({"error": str(run.last_error)}, status_code=500)
-                # If still requires_action, continue loop (should be rare)
-                continue
-            # break if polling takes too long (fail fast)
-            if (time.time() - poll_start) > max_poll_s:
-                return _make_response({"error": "Polling timed out"}, status_code=504)
-            # minimal delay to avoid hammering API (e.g., 50ms)
-            time.sleep(0.05)
-    
-        # Response
-        messages = openai_client.beta.threads.messages.list(thread_id=thread_id)
-        assistant_response = "No response from assistant."
-        for msg in messages.data:
-            if msg.role == "assistant":
-                for content in msg.content:
-                    if hasattr(content, "text"):
-                        assistant_response = content.text.value
-                        break
-                if assistant_response:
-                    break
-    
-        # Always save interaction history at the end, with all required fields
-        save_interaction_log(
-            user_id=user_id,
-            user_message=user_message,
-            assistant_response=assistant_response,
-            thread_id=thread_id,
-            tool_calls_info=all_tool_calls
-        )
-    
+                run_summary["timestamps"]["restore_start"] = time.time()
+                base = os.getenv("FUNCTION_URL_BASE", "http://localhost:7071").rstrip("/")
+                restore_url = f"{base}/api/restore_session"
+                function_code_env = os.getenv("FUNCTION_CODE_RESTORE_SESSION", "")
+                if function_code_env:
+                    restore_url = f"{restore_url}?code={function_code_env}"
+                headers = {"X-User-Id": str(user_id), "Content-Type": "application/json"}
+                if DEBUG_TOOL_CALL_HANDLER:
+                    logging.info(f"[DEBUG] Calling restore_session {restore_url} user_id={user_id}")
+                try:
+                    r = requests.post(restore_url, json={"user_id": user_id, "thread_id": thread_id}, headers=headers, timeout=30)
+                    r.raise_for_status()
+                    try:
+                        restore_result = r.json()
+                    except Exception:
+                        restore_result = {"raw": r.text}
+                except Exception as e:
+                    restore_result = {"error": str(e)}
+                    if DEBUG_TOOL_CALL_HANDLER:
+                        logging.exception("Restore session failed")
+                run_summary["timestamps"]["restore_end"] = time.time()
+                run_summary["steps"].append({"step": "restore", "result": restore_result})
+            except Exception as e:
+                if DEBUG_TOOL_CALL_HANDLER:
+                    logging.exception(f"Unexpected error during restore: {e}")
+
+        # Create run and poll via helper (encapsulates run creation, polling,
+        # required-action tool execution and submit outputs). Any runtime
+        # failures in that flow are converted into appropriate HTTP responses.
+        try:
+            run, all_tool_calls, tool_outputs_struct, run_summary = create_run_and_poll(openai_client, thread_id, user_id)
+        except RuntimeError as rexc:
+            return _make_response({"error": str(rexc)}, status_code=500)
+        except Exception as exc:
+            logging.exception(f"Failed during run creation/polling: {exc}")
+            return _make_response({"error": "Internal server error", "details": str(exc)}, status_code=500)
+
+        # Build final response and return
         total_ms = (time.time() - request_start) * 1000
-        tools_ms = sum(call.get("duration_ms", 0) for call in all_tool_calls)
-    
-        return _make_response(
-            {
-                "status": "success",
-                "response": assistant_response,
-                "thread_id": thread_id,
-                "user_id": user_id,
-                "tool_calls_count": len(all_tool_calls),
-                "timings": {
-                    "total_ms": total_ms,
-                    "tools_ms": tools_ms,
-                },
-            },
-            status_code=200,
+        return finalize_response(
+            openai_client,
+            thread_id,
+            user_id,
+            user_message,
+            all_tool_calls,
+            vector_store_attached,
+            total_ms=total_ms,
+            log_interaction=log_interaction,
         )
-    # Note: exceptions will propagate for local debugging; the Functions worker
-    # will catch and log them when running under the runtime.
+    # Ensure any uncaught exception returns a Functions-compatible HttpResponse
+    except Exception as e:
+        logging.exception(f"Unhandled exception in tool_call_handler.main: {e}")
+        try:
+            return _make_response({"error": "Internal server error", "details": str(e)}, status_code=500)
+        except Exception:
+            # Fallback: construct HttpResponse directly to avoid worker encoding issues
+            try:
+                return func.HttpResponse(json.dumps({"error": "Internal server error"}), status_code=500, mimetype="application/json")
+            except Exception:
+                # As a last resort, return a plain tuple (the worker may still handle it)
+                return json.dumps({"error": "Internal server error"}), 500, {"Content-Type": "application/json"}
+    finally:
+        if file_handler is not None and detach_file_handler:
+            try:
+                detach_file_handler(file_handler)
+            except Exception:
+                logging.warning("Failed to detach file log handler")
 

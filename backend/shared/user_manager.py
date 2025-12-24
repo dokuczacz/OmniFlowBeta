@@ -3,7 +3,32 @@ User management and authentication utilities
 """
 import logging
 from typing import Optional, Tuple
-import azure.functions as func
+try:
+    import azure.functions as func
+except ImportError:
+    import types as _types
+    class DummyHttpRequest:
+        def __init__(self, *a, **kw):
+            self.method = kw.get('method', 'GET')
+            self.url = kw.get('url', '')
+            self.headers = kw.get('headers', {})
+            self.params = kw.get('params', {})
+            self.route_params = kw.get('route_params', {})
+            self.body = kw.get('body', b'')
+        def get_body(self):
+            return self.body
+        def get_json(self):
+            import json
+            return json.loads(self.body.decode('utf-8')) if isinstance(self.body, (bytes, bytearray)) else json.loads(self.body)
+    class DummyHttpResponse:
+        def __init__(self, body=None, status_code=200, headers=None, mimetype=None):
+            self.body = body
+            self.status_code = status_code
+            self.headers = headers or {}
+            self.mimetype = mimetype
+        def get_body(self):
+            return self.body
+    func = _types.SimpleNamespace(HttpRequest=DummyHttpRequest, HttpResponse=DummyHttpResponse)
 
 
 class UserValidator:
@@ -57,7 +82,6 @@ class UserValidator:
         except (ValueError, AttributeError):
             pass
         
-        logging.warning("No user ID provided in request, using 'default'")
         return "default", False
     
     @staticmethod

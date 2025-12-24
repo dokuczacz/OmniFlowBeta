@@ -10,7 +10,31 @@ from azure.core.exceptions import ResourceNotFoundError, AzureError
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from shared.azure_client import AzureBlobClient
+from shared.config import AzureConfig
 from shared.user_manager import extract_user_id
+
+
+def _is_duplicate_interaction(existing_logs: list, candidate: dict, *, max_age_seconds: int = 30) -> bool:
+    if not existing_logs:
+        return False
+    try:
+        last = existing_logs[-1] if isinstance(existing_logs, list) else None
+        if not isinstance(last, dict):
+            return False
+        same_thread = (last.get("thread_id") or None) == (candidate.get("thread_id") or None)
+        same_user_msg = (last.get("user_message") or "") == (candidate.get("user_message") or "")
+        same_assistant = (last.get("assistant_response") or "") == (candidate.get("assistant_response") or "")
+        if not (same_thread and same_user_msg and same_assistant):
+            return False
+        last_ts = last.get("timestamp")
+        cand_ts = candidate.get("timestamp")
+        if not (last_ts and cand_ts):
+            return True
+        last_dt = datetime.fromisoformat(str(last_ts).replace("Z", "+00:00"))
+        cand_dt = datetime.fromisoformat(str(cand_ts).replace("Z", "+00:00"))
+        return abs((cand_dt - last_dt).total_seconds()) <= max_age_seconds
+    except Exception:
+        return False
 
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
@@ -57,29 +81,22 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     metadata = req_body.get('metadata', {})
     
     # Extract user ID from request
+
     user_id = extract_user_id(req)
+    if not user_id or not str(user_id).strip():
+        return func.HttpResponse(
+            json.dumps({"error": "Missing or invalid 'user_id' in request."}),
+            status_code=400,
+            mimetype="application/json"
+        )
     logging.info(f"save_interaction: user_id={user_id}, thread_id={thread_id}")
     
     try:
-        # Use a dedicated file for interaction logs
+        # Save-only approach: do not attempt to GET existing blob contents.
+        # Build a new logs list containing the single new interaction and upload it.
         target_blob_name = "interaction_logs.json"
-        
-        # Get blob client with user isolation
         blob_client = AzureBlobClient.get_blob_client(target_blob_name, user_id)
-        
-        # 1. Read existing logs or create empty list
-        try:
-            blob_data = blob_client.download_blob()
-            data_str = blob_data.readall().decode('utf-8')
-            logs = json.loads(data_str)
-        except ResourceNotFoundError:
-            logs = []
-        
-        # 2. Ensure logs is a list
-        if not isinstance(logs, list):
-            logs = []
-        
-        # 3. Create new interaction entry
+
         now = datetime.utcnow()
         interaction_entry = {
             "interaction_id": f"INT_{now.strftime('%Y%m%d_%H%M%S_%f')}",
@@ -91,41 +108,134 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "tool_calls": tool_calls,
             "metadata": metadata
         }
-        
-        # 4. Append new interaction
-        logs.append(interaction_entry)
-        
-        # 5. Write updated logs back
-        upload_data = json.dumps(logs, indent=2, ensure_ascii=False)
-        blob_client.upload_blob(upload_data.encode('utf-8'), overwrite=True)
-        
-        response_data = {
-            "status": "success",
-            "message": "Interaction successfully saved",
-            "interaction_id": interaction_entry["interaction_id"],
-            "timestamp": interaction_entry["timestamp"],
-            "total_interactions": len(logs),
-            "user_id": user_id,
-            "storage_location": blob_client.blob_name
-        }
-        
-        return func.HttpResponse(
-            json.dumps(response_data, ensure_ascii=False),
-            mimetype="application/json",
-            status_code=200
-        )
 
-    except AzureError as e:
-        logging.error(f"Azure error in save_interaction: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"error": f"Azure storage error: {str(e)}"}),
-            status_code=500,
-            mimetype="application/json"
-        )
+        # Read existing logs (if any) and append the new interaction to preserve history
+        try:
+            existing_logs = []
+            try:
+                # Try to download existing blob; if not found, we'll create a new list
+                if AzureBlobClient.blob_exists(target_blob_name, user_id):
+                    downloader = blob_client.download_blob()
+                    raw = downloader.readall()
+                    try:
+                        existing_logs = json.loads(raw.decode('utf-8'))
+                        if not isinstance(existing_logs, list):
+                            existing_logs = [existing_logs]
+                    except Exception:
+                        existing_logs = []
+                else:
+                    existing_logs = []
+            except ResourceNotFoundError:
+                existing_logs = []
+
+            if _is_duplicate_interaction(existing_logs, interaction_entry):
+                response_data = {
+                    "success": True,
+                    "message": "Duplicate interaction skipped",
+                    "code": "duplicate_skipped",
+                    "interaction_id": interaction_entry["interaction_id"],
+                    "timestamp": interaction_entry["timestamp"],
+                    "total_interactions": len(existing_logs),
+                    "user_id": user_id,
+                    "storage_location": blob_client.blob_name,
+                }
+                return func.HttpResponse(
+                    json.dumps(response_data, ensure_ascii=False),
+                    mimetype="application/json",
+                    status_code=200,
+                )
+
+            logs = list(existing_logs) + [interaction_entry]
+            upload_data = json.dumps(logs, indent=2, ensure_ascii=False)
+
+            # Try upload, on container-not-found attempt to create container then retry
+            upload_success = False
+            try:
+                blob_client.upload_blob(upload_data.encode('utf-8'), overwrite=True)
+                upload_success = True
+            except ResourceNotFoundError as e:
+                logging.warning(f"Upload failed with ResourceNotFoundError; attempting to create container: {e}")
+                try:
+                    service = AzureBlobClient.get_service_client()
+                    service.create_container(AzureConfig.CONTAINER_NAME)
+                    logging.info(f"Created missing container: {AzureConfig.CONTAINER_NAME}")
+                    # Re-acquire blob client and retry upload once
+                    blob_client = AzureBlobClient.get_blob_client(target_blob_name, user_id)
+                    blob_client.upload_blob(upload_data.encode('utf-8'), overwrite=True)
+                    upload_success = True
+                except Exception as create_exc:
+                    logging.error(f"Failed to create container: {create_exc}")
+                    return func.HttpResponse(
+                        json.dumps({
+                            "success": False,
+                            "message": "Failed to create container for user interaction log.",
+                            "code": "container_create_failed",
+                            "details": str(create_exc)[:200]
+                        }),
+                        status_code=500,
+                        mimetype="application/json"
+                    )
+            except AzureError as e:
+                logging.error(f"Azure error in save_interaction: {str(e)}")
+                return func.HttpResponse(
+                    json.dumps({
+                        "success": False,
+                        "message": "Azure storage error during save_interaction.",
+                        "code": "azure_error",
+                        "details": str(e)[:200]
+                    }),
+                    status_code=500,
+                    mimetype="application/json"
+                )
+        except Exception as e:
+            logging.error(f"Unexpected error preparing upload data: {e}")
+            return func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Server error preparing interaction log.",
+                    "code": "server_error",
+                    "details": str(e)[:200]
+                }),
+                status_code=500,
+                mimetype="application/json"
+            )
+
+        if upload_success:
+            response_data = {
+                "success": True,
+                "message": "Interaction successfully saved",
+                "code": "ok",
+                "interaction_id": interaction_entry["interaction_id"],
+                "timestamp": interaction_entry["timestamp"],
+                "total_interactions": len(logs),
+                "user_id": user_id,
+                "storage_location": blob_client.blob_name
+            }
+            return func.HttpResponse(
+                json.dumps(response_data, ensure_ascii=False),
+                mimetype="application/json",
+                status_code=200
+            )
+        else:
+            return func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Unknown error: upload did not succeed.",
+                    "code": "unknown_error",
+                    "details": "Upload did not complete successfully."
+                }),
+                status_code=500,
+                mimetype="application/json"
+            )
     except Exception as e:
         logging.error(f"Unexpected error in save_interaction: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"error": f"Server error: {str(e)}"}),
+            json.dumps({
+                "success": False,
+                "message": "Server error during save_interaction.",
+                "code": "server_error",
+                "details": str(e)[:200]
+            }),
             status_code=500,
             mimetype="application/json"
         )

@@ -3,7 +3,7 @@ Azure Blob Storage client factory with user isolation support
 """
 import logging
 from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient
-from azure.core.exceptions import AzureError, ResourceNotFoundError
+from azure.core.exceptions import AzureError, ResourceNotFoundError, ResourceExistsError
 from typing import Optional, List
 
 from .config import AzureConfig, UserNamespace
@@ -36,9 +36,18 @@ class AzureBlobClient:
         if cls._container_client is None:
             service_client = cls.get_service_client()
             try:
-                cls._container_client = service_client.get_container_client(
-                    AzureConfig.CONTAINER_NAME
-                )
+                cls._container_client = service_client.get_container_client(AzureConfig.CONTAINER_NAME)
+                # Ensure the container exists; try to create if it does not
+                try:
+                    cls._container_client.get_container_properties()
+                except ResourceNotFoundError:
+                    try:
+                        service_client.create_container(AzureConfig.CONTAINER_NAME)
+                        logging.info(f"Created missing container: {AzureConfig.CONTAINER_NAME}")
+                        cls._container_client = service_client.get_container_client(AzureConfig.CONTAINER_NAME)
+                    except ResourceExistsError:
+                        # container was created concurrently
+                        cls._container_client = service_client.get_container_client(AzureConfig.CONTAINER_NAME)
                 logging.info(f"Container client initialized for container: {AzureConfig.CONTAINER_NAME}")
             except AzureError as e:
                 logging.error(f"Failed to initialize container client: {e}")

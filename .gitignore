@@ -1,30 +1,49 @@
-# Azurite local emulator files
-__azurite_db_table__.json
-__azurite_db_blob__.json
-__azurite_db_blob_extent__.json
-__azurite_db_queue__.json
-__azurite_db_queue_extent__.json
+# Azurite local emulator state (do not commit)
+__azurite_db_*.json
+__blobstorage__/
+__queuestorage__/
+AzuriteConfig
+backend/__azurite_data__/
+backend/__blobstorage__/
+backend/local_sessions/
+backend/interaction_logs_default.json
+
+# Datasets
+/final_structured_dataset/
+
 # Python
-__pycache__/
+**/__pycache__/
 *.pyc
-.venv/
-.python_packages/
+**/.venv*/
+**/.python_packages/
 .env
 .env.*
 local.settings.json
+
+# Editors/IDE
+.vscode/
+
+# GitHub agent instructions (keep local by default)
+.github/instructions/
+
 # Logs
 *.log
 logs/
+frontend/logs/
+
 # Tests
-.pytest_cache/
+**/.pytest_cache/
 .coverage*
 htmlcov/
+
 # Tools
-.ruff_cache/
-.mypy_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+
 # OS
 .DS_Store
 Thumbs.db
+
 # Node/Frontend
 node_modules/
 .cache/
@@ -32,3 +51,31 @@ node_modules/
 # Streamlit secrets
 frontend/.streamlit/secrets.toml
 
+# Local workflow/progress reports (keep out of public repo)
+docs/workflow/
+
+# Local helper scripts (optional, keep local by default)
+scripts/
+backend/scripts/
+backend/tooling/
+backend/batch_tool_executor/
+backend/health_check/
+backend/shared/file_logger.py
+backend/TESTER_INSTRUCTIONS.md
+
+# Local tests (keep local by default)
+backend/tests/
+frontend/tests/
+frontend/test_*.py
+
+# Docs: keep only minimal public docs
+docs/*
+!docs/shared/
+docs/shared/*
+!docs/shared/README.md
+!docs/shared/USER_MANAGEMENT.md
+
+# Local scratch docs (optional)
+/CHANGES.md
+/COMMIT_INSTRUCTIONS.txt
+/IMPLEMENTER_AGENT.md
