@@ -7,6 +7,15 @@ This is **OmniFlow Beta**—a playground for multi-user AI agent backends, built
 
 ---
 
+## Latest updates
+
+- **Minimal public footprint** ? local tests, workflow plans, and emulator state are now ignored so the repo only exposes the essential backend/frontend code everyone needs to run and extend.
+- **Safer tool call handler** ? the Azure Functions handler now reads the latest assistant message reliably, handles direct-save actions without forcing proxy config, and keeps tool argument normalization centralized.
+- **Configurability & docs** ? added .env.example, eliminated hard-coded secrets, and documented Azure Function deployment in docs/shared/DEPLOYMENT.md so teams can publish the same version you just shipped.
+- **Live Streamlit demo** ? the current build is live at https://omniflowbeta-gjv5gjhezwbfg7pb7pucwe.streamlit.app/ for instant eyeballing before spinning up local tooling.
+
+---
+
 ## ⚡️ What’s Inside?
 
 - **Simple User Management**: User isolation is enforced, but the logic is intentionally minimal—perfect for reviewers who want to suggest improvements or test boundaries.

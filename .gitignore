@@ -74,6 +74,8 @@ docs/*
 docs/shared/*
 !docs/shared/README.md
 !docs/shared/USER_MANAGEMENT.md
+!docs/shared/DEPLOYMENT.md
+!docs/shared/DEMO.md
 
 # Local scratch docs (optional)
 /CHANGES.md
