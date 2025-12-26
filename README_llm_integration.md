@@ -61,7 +61,7 @@ curl -X POST http://localhost:7071/api/add_new_data \
 
 ### 3. Example: Custom GPT Action
 
-For a Custom GPT, you can define actions like:
+For a Custom GPT, you can define actions like (replace `servers` with your real endpoint):
 
 ```json
 {
@@ -72,7 +72,7 @@ For a Custom GPT, you can define actions like:
   },
   "servers": [
     {
-      "url": "https://your-function-app.azurewebsites.net/api"
+      "url": "https://agentbackendservice-dfcpcudzeah4b6ae.northeurope-01.azurewebsites.net/api"
     }
   ],
   "paths": {
