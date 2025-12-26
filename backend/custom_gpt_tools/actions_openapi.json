@@ -1,0 +1,486 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Agent Backend Service (Custom GPT Actions)",
+    "version": "1.0.0",
+    "description": "OpenAPI schema for Custom GPT Actions. Function keys are passed via the required `code` query parameter on every endpoint. Optional multi-user isolation via `x-user-id` header or `user_id` param/body."
+  },
+  "servers": [
+    {
+      "url": "https://agentbackendservice-dfcpcudzeah4b6ae.northeurope-01.azurewebsites.net"
+    }
+  ],
+  "components": {
+    "schemas": {
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "error": { "type": "string" },
+          "message": { "type": "string" },
+          "status": { "type": "string" },
+          "user_id": { "type": "string" },
+          "details": { "type": "string" }
+        },
+        "additionalProperties": true
+      },
+      "AddNewDataRequest": {
+        "type": "object",
+        "properties": {
+          "target_blob_name": { "type": "string", "description": "Target file name inside the user's namespace (e.g. TM.json)." },
+          "new_entry": { "type": "string", "description": "JSON-encoded entry (string). Example: \"{\\\"id\\\":\\\"TM.001.202512151230\\\",...}\"" },
+          "user_id": { "type": "string", "description": "Optional user namespace (can also be sent as x-user-id header)." }
+        },
+        "required": ["target_blob_name", "new_entry"],
+        "additionalProperties": false
+      },
+      "GetFilteredDataRequest": {
+        "type": "object",
+        "properties": {
+          "target_blob_name": { "type": "string" },
+          "filter_key": { "type": "string", "description": "Optional: field name to filter on." },
+          "filter_value": { "type": "string", "description": "Optional: field value to match." },
+          "user_id": { "type": "string" }
+        },
+        "required": ["target_blob_name"],
+        "additionalProperties": false
+      },
+      "ManageFilesRequest": {
+        "type": "object",
+        "properties": {
+          "operation": { "type": "string", "enum": ["list", "delete", "rename"] },
+          "source_name": { "type": "string", "description": "For delete/rename: current file name." },
+          "target_name": { "type": "string", "description": "For rename: new file name." },
+          "prefix": { "type": "string", "description": "For list: optional prefix within user's namespace." },
+          "user_id": { "type": "string" }
+        },
+        "required": ["operation"],
+        "additionalProperties": false
+      },
+      "UpdateDataEntryRequest": {
+        "type": "object",
+        "properties": {
+          "target_blob_name": { "type": "string" },
+          "find_key": { "type": "string" },
+          "find_value": { "type": "string" },
+          "update_key": { "type": "string" },
+          "update_value": { "type": "string" },
+          "user_id": { "type": "string" }
+        },
+        "required": ["target_blob_name", "find_key", "find_value", "update_key", "update_value"],
+        "additionalProperties": false
+      },
+      "RemoveDataEntryRequest": {
+        "type": "object",
+        "properties": {
+          "target_blob_name": { "type": "string" },
+          "key_to_find": { "type": "string" },
+          "value_to_find": { "type": "string" },
+          "user_id": { "type": "string" }
+        },
+        "required": ["target_blob_name", "key_to_find", "value_to_find"],
+        "additionalProperties": false
+      },
+      "UploadDataOrFileRequest": {
+        "type": "object",
+        "properties": {
+          "target_blob_name": { "type": "string" },
+          "file_content": { "type": "string", "description": "Raw text or JSON-encoded string." },
+          "user_id": { "type": "string" }
+        },
+        "required": ["target_blob_name", "file_content"],
+        "additionalProperties": false
+      },
+      "SaveInteractionRequest": {
+        "type": "object",
+        "properties": {
+          "user_message": { "type": "string" },
+          "assistant_response": { "type": "string" },
+          "thread_id": { "type": "string" },
+          "tool_calls": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "metadata": { "type": "object", "additionalProperties": true },
+          "user_id": { "type": "string" }
+        },
+        "required": ["user_message", "assistant_response"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "paths": {
+    "/api/get_current_time": {
+      "get": {
+        "operationId": "get_current_time",
+        "summary": "Returns current UTC time",
+        "parameters": [
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional user namespace. If omitted, backend uses 'default'."
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "REPLACE_WITH_FUNCTION_KEY"
+            }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Current time response" },
+          "400": { "description": "Bad request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "500": { "description": "Server error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
+      }
+    },
+    "/api/list_blobs": {
+      "get": {
+        "operationId": "list_blobs",
+        "summary": "Returns a list of all files in the user's Azure Blob namespace",
+        "parameters": [
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional user namespace. If omitted, backend uses 'default'."
+          },
+          { "name": "prefix", "in": "query", "required": false, "schema": { "type": "string" } },
+          { "name": "user_id", "in": "query", "required": false, "schema": { "type": "string" } },
+          {
+            "name": "code",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "REPLACE_WITH_FUNCTION_KEY"
+            }
+          }
+        ],
+        "responses": {
+          "200": { "description": "List of blob file names" }
+        }
+      }
+    },
+    "/api/read_blob_file": {
+      "get": {
+        "operationId": "read_blob_file",
+        "summary": "Reads and returns the content of a specific blob file by name (supports batch via POST body in backend)",
+        "parameters": [
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional user namespace. If omitted, backend uses 'default'."
+          },
+          { "name": "file_name", "in": "query", "required": true, "schema": { "type": "string", "example": "TM.json" } },
+          { "name": "user_id", "in": "query", "required": false, "schema": { "type": "string" } },
+          {
+            "name": "code",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "REPLACE_WITH_FUNCTION_KEY"
+            }
+          }
+        ],
+        "responses": {
+          "200": { "description": "File content returned" }
+        }
+      }
+    },
+    "/api/get_filtered_data": {
+      "post": {
+        "operationId": "get_filtered_data",
+        "summary": "Returns JSON file content with optional simple filter (server-side)",
+        "parameters": [
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional user namespace. If omitted, backend uses 'default'."
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "REPLACE_WITH_FUNCTION_KEY"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/GetFilteredDataRequest" } }
+          }
+        },
+        "responses": {
+          "200": { "description": "Filtered data" }
+        }
+      }
+    },
+    "/api/add_new_data": {
+      "post": {
+        "operationId": "add_new_data",
+        "summary": "Add new entry to JSON file (new_entry must be JSON encoded as string)",
+        "parameters": [
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional user namespace. If omitted, backend uses 'default'."
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "REPLACE_WITH_FUNCTION_KEY"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/AddNewDataRequest" } }
+          }
+        },
+        "responses": {
+          "200": { "description": "Entry added" }
+        }
+      }
+    },
+    "/api/update_data_entry": {
+      "post": {
+        "operationId": "update_data_entry",
+        "summary": "Find & update entry inside JSON file",
+        "parameters": [
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional user namespace. If omitted, backend uses 'default'."
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "REPLACE_WITH_FUNCTION_KEY"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/UpdateDataEntryRequest" } }
+          }
+        },
+        "responses": {
+          "200": { "description": "Entry updated" }
+        }
+      }
+    },
+    "/api/remove_data_entry": {
+      "post": {
+        "operationId": "remove_data_entry",
+        "summary": "Remove entry matching key/value from JSON file",
+        "parameters": [
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional user namespace. If omitted, backend uses 'default'."
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "REPLACE_WITH_FUNCTION_KEY"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/RemoveDataEntryRequest" } }
+          }
+        },
+        "responses": {
+          "200": { "description": "Entry removed" }
+        }
+      }
+    },
+    "/api/upload_data_or_file": {
+      "post": {
+        "operationId": "upload_data_or_file",
+        "summary": "Create or replace file in Azure Blob Storage (file_content must be JSON string or text)",
+        "parameters": [
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional user namespace. If omitted, backend uses 'default'."
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "REPLACE_WITH_FUNCTION_KEY"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/UploadDataOrFileRequest" } }
+          }
+        },
+        "responses": {
+          "200": { "description": "File uploaded" }
+        }
+      }
+    },
+    "/api/manage_files": {
+      "post": {
+        "operationId": "manage_files",
+        "summary": "Manage files: list, delete, rename",
+        "parameters": [
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional user namespace. If omitted, backend uses 'default'."
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "REPLACE_WITH_FUNCTION_KEY"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/ManageFilesRequest" } }
+          }
+        },
+        "responses": {
+          "200": { "description": "Files managed" }
+        }
+      }
+    },
+    "/api/save_interaction": {
+      "post": {
+        "operationId": "save_interaction",
+        "summary": "Save user/assistant interaction to blob logs",
+        "parameters": [
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional user namespace. If omitted, backend uses 'default'."
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "REPLACE_WITH_FUNCTION_KEY"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/SaveInteractionRequest" } }
+          }
+        },
+        "responses": {
+          "200": { "description": "Interaction saved" }
+        }
+      }
+    },
+    "/api/get_interaction_history": {
+      "get": {
+        "operationId": "get_interaction_history",
+        "summary": "Returns interaction logs (optional thread filter + pagination)",
+        "parameters": [
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional user namespace. If omitted, backend uses 'default'."
+          },
+          { "name": "thread_id", "in": "query", "required": false, "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 50, "minimum": 1, "maximum": 1000 } },
+          { "name": "offset", "in": "query", "required": false, "schema": { "type": "integer", "default": 0, "minimum": 0 } },
+          { "name": "user_id", "in": "query", "required": false, "schema": { "type": "string" } },
+          {
+            "name": "code",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "REPLACE_WITH_FUNCTION_KEY"
+            }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Interaction history" }
+        }
+      }
+    },
+    "/api/custom_gpt_tools": {
+      "get": {
+        "operationId": "custom_gpt_tools",
+        "summary": "Returns server-side tool metadata for Custom GPT (shape depends on backend implementation)",
+        "parameters": [
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional user namespace. If omitted, backend uses 'default'."
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "REPLACE_WITH_FUNCTION_KEY"
+            }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Tool list / metadata" }
+        }
+      }
+    }
+  }
+}

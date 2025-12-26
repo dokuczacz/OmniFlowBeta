@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from typing import Dict, Any, Tuple
+import uuid
 
 try:
     import azure.functions as func
@@ -43,6 +44,8 @@ except Exception:
 # Config
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 ASSISTANT_ID = os.environ.get("OPENAI_ASSISTANT_ID", "")
+OPENAI_PROMPT_ID = os.environ.get("OPENAI_PROMPT_ID", "")
+LLM_RUNTIME_DEFAULT = os.environ.get("LLM_RUNTIME", "assistants")
 PROXY_URL = os.environ.get("AZURE_PROXY_URL", "")
 PROXY_FUNCTION_KEY = os.environ.get("FUNCTION_CODE_PROXY_ROUTER", "")
 ENABLE_SAVE_INTERACTION = True  # Hardcoded to always enable saving for now
@@ -135,6 +138,8 @@ def _openai_call(fn, *args, **kwargs):
 logging.info("=== tool_call_handler CONFIG ===")
 logging.info(f"OPENAI_API_KEY set: {bool(OPENAI_API_KEY)}")
 logging.info(f"OPENAI_ASSISTANT_ID set: {bool(ASSISTANT_ID)}")
+logging.info(f"OPENAI_PROMPT_ID set: {bool(OPENAI_PROMPT_ID)}")
+logging.info(f"LLM_RUNTIME default: {LLM_RUNTIME_DEFAULT}")
 logging.info(f"AZURE_PROXY_URL set: {bool(PROXY_URL)}")
 logging.info(f"OPENAI_VECTOR_STORE_ID set: {bool(VECTOR_STORE_ID)}")
 logging.info("=== END CONFIG ===")
@@ -335,6 +340,160 @@ def resolve_user_id(req, body: Dict[str, Any]) -> Tuple[Any, str]:
     except Exception:
         pass
     return (None, 'none')
+
+
+def resolve_runtime(body: Dict[str, Any]) -> str:
+    """Resolve requested runtime from request body or env default."""
+    runtime = (body or {}).get("runtime") or LLM_RUNTIME_DEFAULT or "assistants"
+    runtime = str(runtime).strip().lower()
+    if runtime not in ("assistants", "responses", "auto"):
+        raise ValueError("Invalid runtime. Allowed: assistants|responses|auto")
+    return runtime
+
+
+def _missing_env_vars_for_runtime(runtime: str) -> list:
+    runtime = (runtime or "").strip().lower()
+    missing = []
+    if not OPENAI_API_KEY:
+        missing.append("OPENAI_API_KEY")
+    if not PROXY_URL:
+        missing.append("AZURE_PROXY_URL")
+    if runtime == "assistants":
+        if not ASSISTANT_ID:
+            missing.append("OPENAI_ASSISTANT_ID")
+    elif runtime == "responses":
+        if not OPENAI_PROMPT_ID:
+            missing.append("OPENAI_PROMPT_ID")
+    return missing
+
+
+def _load_handles(user_id: str) -> Dict[str, Any]:
+    """Load `handles.json` from the user's blob namespace (best-effort)."""
+    try:
+        result_str, _info = execute_tool_call("read_blob_file", {"file_name": "handles.json"}, user_id)
+        payload = json.loads(result_str) if isinstance(result_str, str) else {}
+        if isinstance(payload, dict) and payload.get("status") == "success":
+            data = payload.get("data")
+            if isinstance(data, dict):
+                return data
+            if isinstance(data, str):
+                try:
+                    parsed = json.loads(data)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    return {}
+        return {}
+    except Exception:
+        return {}
+
+
+def _save_handles(user_id: str, handles: Dict[str, Any]) -> None:
+    """Persist `handles.json` to the user's blob namespace (best-effort)."""
+    try:
+        execute_tool_call(
+            "upload_data_or_file",
+            {"target_blob_name": "handles.json", "file_content": handles or {}},
+            user_id,
+        )
+    except Exception:
+        pass
+
+
+def _extract_response_function_calls(response: Any) -> list:
+    calls = []
+    for item in (getattr(response, "output", None) or []):
+        item_type = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+        if item_type != "function_call":
+            continue
+        call_id = item.get("call_id") if isinstance(item, dict) else getattr(item, "call_id", None)
+        name = item.get("name") if isinstance(item, dict) else getattr(item, "name", None)
+        arguments = item.get("arguments") if isinstance(item, dict) else getattr(item, "arguments", None)
+        if call_id and name:
+            calls.append({"call_id": str(call_id), "name": str(name), "arguments": str(arguments or "")})
+    return calls
+
+
+def _coerce_conversation_id(value: Any) -> str:
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("id", "conversation_id"):
+            if value.get(key):
+                return str(value.get(key))
+    # Last resort: stringify object (may already be a typed mapping)
+    try:
+        return str(value)
+    except Exception:
+        return ""
+
+
+def run_responses(openai_client: OpenAI, user_id: str, user_message: str, thread_id: str) -> Tuple[str, list, Dict[str, Any], str]:
+    """Responses API deterministic tool loop using a Prompt ID (dual-runtime mode)."""
+    if not thread_id:
+        thread_id = f"handle_{uuid.uuid4().hex[:12]}"
+
+    handles = _load_handles(user_id)
+    state = handles.get(thread_id, {}) if isinstance(handles, dict) else {}
+
+    conversation_id = _coerce_conversation_id(state.get("responses_conversation_id"))
+    previous_response_id = str(state.get("responses_last_response_id") or "").strip()
+
+    all_tool_calls = []
+    current_input: Any = user_message or ""
+
+    for _ in range(25):
+        create_kwargs: Dict[str, Any] = {
+            "prompt": {"id": OPENAI_PROMPT_ID},
+            "input": current_input,
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+            "temperature": 0,
+            "top_p": 1,
+            "metadata": {"user_id": str(user_id), "thread_id": str(thread_id), "runtime": "responses"},
+        }
+        if conversation_id:
+            create_kwargs["conversation"] = conversation_id
+        if previous_response_id:
+            create_kwargs["previous_response_id"] = previous_response_id
+
+        response = _openai_call(openai_client.responses.create, **create_kwargs)
+        previous_response_id = str(getattr(response, "id", "") or previous_response_id)
+        conversation_id = _coerce_conversation_id(getattr(response, "conversation", None) or conversation_id)
+
+        handles[thread_id] = {
+            **(state if isinstance(state, dict) else {}),
+            "responses_conversation_id": conversation_id,
+            "responses_last_response_id": previous_response_id,
+            "active_runtime": "responses",
+            "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+        }
+        _save_handles(user_id, handles)
+
+        function_calls = _extract_response_function_calls(response)
+        if not function_calls:
+            final_text = getattr(response, "output_text", None) or ""
+            if not final_text:
+                final_text = "No response from assistant."
+            meta = {"responses_conversation_id": conversation_id, "responses_last_response_id": previous_response_id}
+            return final_text, all_tool_calls, meta, thread_id
+
+        tool_outputs = []
+        for call in function_calls:
+            name = call.get("name") or ""
+            args = _safe_load_json(call.get("arguments") or "")
+            result_str, info = execute_tool_call(name, args, user_id)
+            info = dict(info or {})
+            info["call_id"] = call.get("call_id")
+            info["runtime"] = "responses"
+            all_tool_calls.append(info)
+            tool_outputs.append({"type": "function_call_output", "call_id": call.get("call_id"), "output": result_str})
+
+        current_input = tool_outputs
+
+    raise RuntimeError("Responses tool loop exceeded max iterations")
 
 
 def restore_or_create_thread(openai_client: OpenAI, user_id: str, thread_id: str) -> str:
@@ -748,15 +907,20 @@ def finalize_response(
     vector_store_attached: bool,
     total_ms: float = 0,
     log_interaction: bool = True,
+    assistant_response_override: str = "",
+    runtime_used: str = "assistants",
+    responses_meta: Dict[str, Any] = None,
 ):
     """Collect assistant response, save interaction, and return final HttpResponse."""
-    # Request a limited number of messages to reduce payload and latency.
-    # Use limit=10 conservatively.
-    try:
-        messages = _openai_call(openai_client.beta.threads.messages.list, thread_id=thread_id, limit=10)
-    except TypeError:
-        # Some SDK versions may not accept 'limit' as a kwarg; fall back to call without it.
-        messages = _openai_call(openai_client.beta.threads.messages.list, thread_id=thread_id)
+    messages = None
+    if not assistant_response_override and runtime_used == "assistants":
+        # Request a limited number of messages to reduce payload and latency.
+        # Use limit=10 conservatively.
+        try:
+            messages = _openai_call(openai_client.beta.threads.messages.list, thread_id=thread_id, limit=10)
+        except TypeError:
+            # Some SDK versions may not accept 'limit' as a kwarg; fall back to call without it.
+            messages = _openai_call(openai_client.beta.threads.messages.list, thread_id=thread_id)
 
     def _get_attr(msg: Any, key: str):
         if isinstance(msg, dict):
@@ -795,19 +959,21 @@ def finalize_response(
                         return text_obj
         return None
 
-    assistant_response = None
-    try:
-        data_iter = list(getattr(messages, "data", []) or [])
-        assistant_msgs = [m for m in data_iter if _get_role(m) == "assistant"]
-        if assistant_msgs:
-            if any(_created_at_int(m) is not None for m in assistant_msgs):
-                chosen = max(assistant_msgs, key=lambda m: (_created_at_int(m) or -1))
-            else:
-                # Fall back to list order if created_at is absent.
-                chosen = assistant_msgs[-1]
-            assistant_response = _extract_text_from_message(chosen)
-    except Exception:
+    assistant_response = assistant_response_override or None
+    if not assistant_response:
         assistant_response = None
+        if runtime_used == "assistants" and messages is not None:
+            try:
+                data_iter = list(getattr(messages, "data", []) or [])
+                assistant_msgs = [m for m in data_iter if _get_role(m) == "assistant"]
+                if assistant_msgs:
+                    if any(_created_at_int(m) is not None for m in assistant_msgs):
+                        chosen = max(assistant_msgs, key=lambda m: (_created_at_int(m) or -1))
+                    else:
+                        chosen = assistant_msgs[-1]
+                    assistant_response = _extract_text_from_message(chosen)
+            except Exception:
+                assistant_response = None
 
     if not assistant_response:
         assistant_response = "No response from assistant."
@@ -831,21 +997,22 @@ def finalize_response(
     # `total_ms` can be supplied by caller; default to 0 if not provided.
     tools_ms = sum(call.get("duration_ms", 0) for call in all_tool_calls)
 
-    return _make_response(
-        {
-            "status": "success",
-            "response": assistant_response,
-            "thread_id": thread_id,
-            "user_id": user_id,
-            "vector_store_attached": vector_store_attached,
-            "tool_calls_count": len(all_tool_calls),
-            "timings": {
-                "total_ms": total_ms,
-                "tools_ms": tools_ms,
-            },
+    body = {
+        "status": "success",
+        "response": assistant_response,
+        "thread_id": thread_id,
+        "user_id": user_id,
+        "runtime_used": runtime_used,
+        "vector_store_attached": vector_store_attached,
+        "tool_calls_count": len(all_tool_calls),
+        "timings": {
+            "total_ms": total_ms,
+            "tools_ms": tools_ms,
         },
-        status_code=200,
-    )
+    }
+    if responses_meta:
+        body["responses"] = responses_meta
+    return _make_response(body, status_code=200)
 
 
 def _make_response(body: Any, status_code: int = 200):
@@ -1086,16 +1253,28 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             if resp_direct is not None:
                 return resp_direct
 
+        # Runtime selection (dual runtime: assistants|responses|auto)
+        try:
+            runtime_requested = resolve_runtime(body)
+        except ValueError as vex:
+            return _make_response({"error": str(vex)}, status_code=400)
+
+        if runtime_requested == "auto":
+            if not _missing_env_vars_for_runtime("responses"):
+                runtime_used = "responses"
+            elif not _missing_env_vars_for_runtime("assistants"):
+                runtime_used = "assistants"
+            else:
+                # Prefer listing everything required for both runtimes to aid setup.
+                missing = sorted(set(_missing_env_vars_for_runtime("responses") + _missing_env_vars_for_runtime("assistants")))
+                return _make_response({"error": f"Missing env vars: {', '.join(missing)}", "status": "not_configured"}, status_code=503)
+        else:
+            runtime_used = runtime_requested
+
         # Config check (after direct actions so save/get can work without proxy config)
-        if not (OPENAI_API_KEY and ASSISTANT_ID and PROXY_URL):
-            missing = []
-            if not OPENAI_API_KEY:
-                missing.append("OPENAI_API_KEY")
-            if not ASSISTANT_ID:
-                missing.append("OPENAI_ASSISTANT_ID")
-            if not PROXY_URL:
-                missing.append("AZURE_PROXY_URL")
-            return _make_response({"error": f"Missing env vars: {', '.join(missing)}", "status": "not_configured"}, status_code=503)
+        missing = _missing_env_vars_for_runtime(runtime_used)
+        if missing:
+            return _make_response({"error": f"Missing env vars: {', '.join(missing)}", "status": "not_configured", "runtime": runtime_used}, status_code=503)
 
         # Run
         # Initialize OpenAI client and detect SDK capabilities early so we
@@ -1103,6 +1282,37 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
         # Note: SDK tool_resources support is detectable via _supports_tool_resources(),
         # but the value is not used in this handler; keep function available for future use.
+
+        # Responses runtime (Prompt ID + deterministic tool loop)
+        if runtime_used == "responses":
+            request_start = time.time()
+            try:
+                assistant_response, all_tool_calls, responses_meta, thread_id = run_responses(
+                    openai_client=openai_client,
+                    user_id=user_id,
+                    user_message=user_message,
+                    thread_id=thread_id,
+                )
+            except RuntimeError as rexc:
+                return _make_response({"error": str(rexc), "runtime": "responses"}, status_code=500)
+            except Exception as exc:
+                logging.exception(f"Failed during responses loop: {exc}")
+                return _make_response({"error": "Internal server error", "details": str(exc), "runtime": "responses"}, status_code=500)
+
+            total_ms = (time.time() - request_start) * 1000
+            return finalize_response(
+                openai_client=openai_client,
+                thread_id=thread_id,
+                user_id=user_id,
+                user_message=user_message,
+                all_tool_calls=all_tool_calls,
+                vector_store_attached=False,
+                total_ms=total_ms,
+                log_interaction=log_interaction,
+                assistant_response_override=assistant_response,
+                runtime_used="responses",
+                responses_meta=responses_meta,
+            )
 
         # If the caller didn't supply a thread identifier, attempt to restore
         # a previously saved thread for this user from blob storage. If restore
@@ -1190,6 +1400,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             vector_store_attached,
             total_ms=total_ms,
             log_interaction=log_interaction,
+            runtime_used=runtime_used,
         )
     # Ensure any uncaught exception returns a Functions-compatible HttpResponse
     except Exception as e:

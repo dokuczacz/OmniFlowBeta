@@ -1,7 +1,15 @@
 ﻿{
   "IsEncrypted": false,
   "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
-    "FUNCTIONS_WORKER_RUNTIME": "python"
+    "AZURE_STORAGE_CONNECTION_STRING": "UseDevelopmentStorage=true",
+    "AZURE_BLOB_CONTAINER_NAME": "agent-knowledge-base",
+    "OPENAI_API_KEY": "",
+    "OPENAI_ASSISTANT_ID": "",
+    "OPENAI_PROMPT_ID": "",
+    "LLM_RUNTIME": "assistants",
+    "AZURE_PROXY_URL": "http://localhost:7071/api/proxy_router",
+    "FUNCTION_URL_BASE": "http://localhost:7071"
   }
 }
