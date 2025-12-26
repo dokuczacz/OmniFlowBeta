@@ -2,6 +2,7 @@ import json
 import logging
 import azure.functions as func
 from azure.storage.blob import BlobServiceClient
+from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
 import os
 
 
@@ -47,6 +48,15 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         
         blob_service_client = BlobServiceClient.from_connection_string(connect_str)
         container_client = blob_service_client.get_container_client(container_name)
+        try:
+            container_client.get_container_properties()
+        except ResourceNotFoundError:
+            logging.warning(f"list_blobs: container not found ({container_name}); creating")
+            try:
+                blob_service_client.create_container(container_name)
+            except ResourceExistsError:
+                pass
+            container_client = blob_service_client.get_container_client(container_name)
         
         # Build full prefix: users/{user_id}/{optional_prefix}
         user_namespace_prefix = f"users/{user_id}/"

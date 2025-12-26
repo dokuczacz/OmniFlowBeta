@@ -46,6 +46,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 ASSISTANT_ID = os.environ.get("OPENAI_ASSISTANT_ID", "")
 OPENAI_PROMPT_ID = os.environ.get("OPENAI_PROMPT_ID", "")
 LLM_RUNTIME_DEFAULT = os.environ.get("LLM_RUNTIME", "assistants")
+HANDLES_CACHE_TTL_SECONDS = int(os.environ.get("HANDLES_CACHE_TTL_SECONDS", "60") or 60)
 PROXY_URL = os.environ.get("AZURE_PROXY_URL", "")
 PROXY_FUNCTION_KEY = os.environ.get("FUNCTION_CODE_PROXY_ROUTER", "")
 ENABLE_SAVE_INTERACTION = True  # Hardcoded to always enable saving for now
@@ -55,6 +56,7 @@ OPENAI_MAX_REQUESTS = int(os.environ.get("OPENAI_MAX_REQUESTS", "0") or 0)
 # runtime counter for outbound OpenAI HTTP calls (best-effort)
 _openai_lock = threading.Lock()
 _openai_count = 0
+_handles_cache: Dict[str, Dict[str, Any]] = {}
 
 # Optional global (cross-process) limit for tests. If set (>0), this will be
 # enforced by a simple file-based counter in `backend/logs/openai_global_counter.json`.
@@ -140,6 +142,7 @@ logging.info(f"OPENAI_API_KEY set: {bool(OPENAI_API_KEY)}")
 logging.info(f"OPENAI_ASSISTANT_ID set: {bool(ASSISTANT_ID)}")
 logging.info(f"OPENAI_PROMPT_ID set: {bool(OPENAI_PROMPT_ID)}")
 logging.info(f"LLM_RUNTIME default: {LLM_RUNTIME_DEFAULT}")
+logging.info(f"HANDLES_CACHE_TTL_SECONDS: {HANDLES_CACHE_TTL_SECONDS}")
 logging.info(f"AZURE_PROXY_URL set: {bool(PROXY_URL)}")
 logging.info(f"OPENAI_VECTOR_STORE_ID set: {bool(VECTOR_STORE_ID)}")
 logging.info("=== END CONFIG ===")
@@ -369,17 +372,39 @@ def _missing_env_vars_for_runtime(runtime: str) -> list:
 
 def _load_handles(user_id: str) -> Dict[str, Any]:
     """Load `handles.json` from the user's blob namespace (best-effort)."""
+    if HANDLES_CACHE_TTL_SECONDS > 0:
+        cached = _handles_cache.get(str(user_id))
+        if cached:
+            age = time.time() - cached.get("ts", 0)
+            if age <= HANDLES_CACHE_TTL_SECONDS:
+                if DEBUG_TOOL_CALL_HANDLER:
+                    logging.info(f"[DEBUG] handles cache hit user_id={user_id} age_s={age:.2f}")
+                return cached.get("data", {}) or {}
+            if DEBUG_TOOL_CALL_HANDLER:
+                logging.info(f"[DEBUG] handles cache expired user_id={user_id} age_s={age:.2f}")
+        elif DEBUG_TOOL_CALL_HANDLER:
+            logging.info(f"[DEBUG] handles cache miss user_id={user_id}")
+    elif DEBUG_TOOL_CALL_HANDLER:
+        logging.info("[DEBUG] handles cache disabled (TTL=0)")
     try:
         result_str, _info = execute_tool_call("read_blob_file", {"file_name": "handles.json"}, user_id)
         payload = json.loads(result_str) if isinstance(result_str, str) else {}
         if isinstance(payload, dict) and payload.get("status") == "success":
             data = payload.get("data")
             if isinstance(data, dict):
+                if HANDLES_CACHE_TTL_SECONDS > 0:
+                    _handles_cache[str(user_id)] = {"data": data, "ts": time.time()}
+                    if DEBUG_TOOL_CALL_HANDLER:
+                        logging.info(f"[DEBUG] handles cache set user_id={user_id} entries={len(data)}")
                 return data
             if isinstance(data, str):
                 try:
                     parsed = json.loads(data)
                     if isinstance(parsed, dict):
+                        if HANDLES_CACHE_TTL_SECONDS > 0:
+                            _handles_cache[str(user_id)] = {"data": parsed, "ts": time.time()}
+                            if DEBUG_TOOL_CALL_HANDLER:
+                                logging.info(f"[DEBUG] handles cache set user_id={user_id} entries={len(parsed)}")
                         return parsed
                 except Exception:
                     return {}
@@ -388,14 +413,31 @@ def _load_handles(user_id: str) -> Dict[str, Any]:
         return {}
 
 
-def _save_handles(user_id: str, handles: Dict[str, Any]) -> None:
+def _save_handles(user_id: str, handles: Dict[str, Any], async_save: bool = False) -> None:
     """Persist `handles.json` to the user's blob namespace (best-effort)."""
+    def _do_save():
+        try:
+            execute_tool_call(
+                "upload_data_or_file",
+                {"target_blob_name": "handles.json", "file_content": handles or {}},
+                user_id,
+            )
+            if HANDLES_CACHE_TTL_SECONDS > 0:
+                _handles_cache[str(user_id)] = {"data": handles or {}, "ts": time.time()}
+            if DEBUG_TOOL_CALL_HANDLER:
+                logging.info(f"[DEBUG] handles async save done user_id={user_id}")
+        except Exception as exc:
+            if DEBUG_TOOL_CALL_HANDLER:
+                logging.info(f"[DEBUG] handles async save failed user_id={user_id} error={exc}")
+
+    if async_save:
+        if DEBUG_TOOL_CALL_HANDLER:
+            logging.info(f"[DEBUG] handles async save queued user_id={user_id}")
+        threading.Thread(target=_do_save, daemon=True).start()
+        return
+
     try:
-        execute_tool_call(
-            "upload_data_or_file",
-            {"target_blob_name": "handles.json", "file_content": handles or {}},
-            user_id,
-        )
+        _do_save()
     except Exception:
         pass
 
@@ -450,8 +492,6 @@ def run_responses(openai_client: OpenAI, user_id: str, user_message: str, thread
             "input": current_input,
             "tool_choice": "auto",
             "parallel_tool_calls": False,
-            "temperature": 0,
-            "top_p": 1,
             "metadata": {"user_id": str(user_id), "thread_id": str(thread_id), "runtime": "responses"},
         }
         if conversation_id:
@@ -470,7 +510,7 @@ def run_responses(openai_client: OpenAI, user_id: str, user_message: str, thread
             "active_runtime": "responses",
             "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
         }
-        _save_handles(user_id, handles)
+        _save_handles(user_id, handles, async_save=True)
 
         function_calls = _extract_response_function_calls(response)
         if not function_calls:
@@ -1201,8 +1241,53 @@ def save_interaction_log(user_id: str, user_message: str, assistant_response: st
     try:
         base = os.getenv("FUNCTION_URL_BASE", "")
         code = os.getenv("FUNCTION_CODE_SAVE_INTERACTION", "")
+        base = str(base or "").strip().rstrip("/")
+
+        # Local/dev fast path: avoid HTTP + function keys and call the function in-process.
+        # This also makes the save visible in local `func` logs.
+        if not base or base.startswith("http://localhost") or base.startswith("http://127.0.0.1"):
+            try:
+                from save_interaction import main as save_interaction_main
+
+                class _Req:
+                    def __init__(self, _payload, _user_id):
+                        self.headers = {"x-user-id": str(_user_id), "X-User-Id": str(_user_id)}
+                        self.params = {}
+                        self._payload = _payload
+
+                    def get_json(self):
+                        return dict(self._payload)
+
+                payload_local = {
+                    "user_message": user_message,
+                    "assistant_response": assistant_response,
+                    "thread_id": thread_id,
+                    "tool_calls": tool_calls_info,
+                    "metadata": {"assistant_id": ASSISTANT_ID, "source": "tool_call_handler"},
+                    "user_id": user_id,
+                }
+                resp = save_interaction_main(_Req(payload_local, user_id))
+                if DEBUG_TOOL_CALL_HANDLER:
+                    try:
+                        body_text = resp.get_body().decode("utf-8") if hasattr(resp, "get_body") else str(resp)
+                    except Exception:
+                        body_text = "<unreadable>"
+                    logging.info(f"[DEBUG] save_interaction in-process done body={body_text[:500]}")
+                try:
+                    body_text = resp.get_body().decode("utf-8") if hasattr(resp, "get_body") else ""
+                    parsed = json.loads(body_text) if body_text else {}
+                    if isinstance(parsed, dict) and parsed.get("success") is False:
+                        logging.warning(f"save_interaction failed: {parsed.get('details') or parsed}")
+                except Exception:
+                    pass
+                return
+            except Exception as inproc_exc:
+                if DEBUG_TOOL_CALL_HANDLER:
+                    logging.warning(f"[DEBUG] save_interaction in-process failed: {inproc_exc}; falling back to HTTP")
+
         if not base or not code:
             return
+
         url = f"{base}/api/save_interaction?code={code}"
         payload = {
             "user_message": user_message,
@@ -1214,7 +1299,13 @@ def save_interaction_log(user_id: str, user_message: str, assistant_response: st
         headers = {"Content-Type": "application/json", "X-User-Id": user_id}
         def _fire_and_forget():
             try:
-                requests.post(url, json=payload, headers=headers, timeout=(1, 10))
+                r = requests.post(url, json=payload, headers=headers, timeout=(1, 10))
+                if DEBUG_TOOL_CALL_HANDLER:
+                    try:
+                        snippet = (r.text or "")[:500]
+                    except Exception:
+                        snippet = "<unreadable>"
+                    logging.info(f"[DEBUG] save_interaction http status={getattr(r,'status_code','n/a')} body={snippet}")
             except Exception as post_exc:
                 logging.warning(f"save_interaction_log failed: {post_exc}")
 

@@ -3,6 +3,7 @@ import json
 import azure.functions as func
 import os
 from azure.storage.blob import BlobServiceClient
+from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('manage_files: Processing file management request')
@@ -36,9 +37,24 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     try:
         connect_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
         container_name = os.environ.get("AZURE_BLOB_CONTAINER_NAME")
+        if not connect_str or not container_name:
+            return func.HttpResponse(
+                json.dumps({"error": "Missing Azure Storage configuration.", "user_id": user_id}),
+                mimetype="application/json",
+                status_code=500,
+            )
         
         blob_service_client = BlobServiceClient.from_connection_string(connect_str)
         container_client = blob_service_client.get_container_client(container_name)
+        try:
+            container_client.get_container_properties()
+        except ResourceNotFoundError:
+            logging.warning(f"manage_files: container not found ({container_name}); creating")
+            try:
+                blob_service_client.create_container(container_name)
+            except ResourceExistsError:
+                pass
+            container_client = blob_service_client.get_container_client(container_name)
         
         result_message = ""
         

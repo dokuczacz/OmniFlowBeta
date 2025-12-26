@@ -112,6 +112,15 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 
         blob_service_client = BlobServiceClient.from_connection_string(connect_str)
         container_client = blob_service_client.get_container_client(container_name)
+        try:
+            container_client.get_container_properties()
+        except ResourceNotFoundError:
+            logging.warning(f"add_new_data: container not found ({container_name}); creating")
+            try:
+                blob_service_client.create_container(container_name)
+            except AzureError:
+                pass
+            container_client = blob_service_client.get_container_client(container_name)
         blob_client = container_client.get_blob_client(namespaced_blob_name)
 
         # 1. Read existing data or create empty list

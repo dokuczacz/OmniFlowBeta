@@ -8,6 +8,15 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 
+def get_http_session() -> requests.Session:
+    session = st.session_state.get("_http_session")
+    if isinstance(session, requests.Session):
+        return session
+    session = requests.Session()
+    st.session_state["_http_session"] = session
+    return session
+
+
 def get_backend_url() -> str:
     return (
         st.secrets.get("BACKEND_URL")
@@ -37,22 +46,27 @@ def request_headers(user_id: str) -> dict:
 
 
 def bootstrap_user_storage(user_id: str) -> tuple[bool, str]:
+    session = get_http_session()
     headers = request_headers(user_id)
     list_url = build_endpoint_url(backend_url, "list_blobs")
     upload_url = build_endpoint_url(backend_url, "upload_data_or_file")
     try:
-        resp = requests.get(list_url, headers=headers, params={"prefix": ""}, timeout=15)
+        resp = session.get(list_url, headers=headers, params={"prefix": ""}, timeout=15)
         data = resp.json() if resp.ok else {}
         count = data.get("count", 0) if isinstance(data, dict) else 0
     except Exception as exc:
         return False, f"list_blobs failed: {exc}"
     if count > 0:
         return True, "User namespace already initialized."
-    placeholders = {"current_thread.json": {}, "interaction_logs.json": []}
+    placeholders = {
+        "current_thread.json": {},
+        "interaction_logs.json": [],
+        "handles.json": {},
+    }
     for file_name, content in placeholders.items():
         payload = {"target_blob_name": file_name, "file_content": content, "user_id": user_id}
         try:
-            upload = requests.post(upload_url, json=payload, headers=headers, timeout=15)
+            upload = session.post(upload_url, json=payload, headers=headers, timeout=15)
         except Exception as exc:
             return False, f"upload_data_or_file failed: {exc}"
         if not upload.ok:
@@ -313,6 +327,7 @@ components.html(
 
 pending_user_message = st.session_state.pop("pending_user_message", None)
 if pending_user_message:
+    session = get_http_session()
     current_user = current_user_id()
     payload = {
         "message": pending_user_message,
@@ -325,7 +340,7 @@ if pending_user_message:
     with st.spinner("Przetwarzam..."):
         try:
             start = time.perf_counter()
-            resp = requests.post(backend_url, json=payload, headers=headers, timeout=30)
+            resp = session.post(backend_url, json=payload, headers=headers, timeout=30)
             st.session_state["last_latency"] = int((time.perf_counter() - start) * 1000)
             try:
                 data = resp.json()

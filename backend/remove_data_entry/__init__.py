@@ -4,6 +4,7 @@ import azure.functions as func
 import os
 from azure.storage.blob import BlobServiceClient
 from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import ResourceExistsError
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
     """
@@ -68,6 +69,15 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         
         blob_service_client = BlobServiceClient.from_connection_string(connect_str)
         container_client = blob_service_client.get_container_client(container_name)
+        try:
+            container_client.get_container_properties()
+        except ResourceNotFoundError:
+            logging.warning(f"remove_data_entry: container not found ({container_name}); creating")
+            try:
+                blob_service_client.create_container(container_name)
+            except ResourceExistsError:
+                pass
+            container_client = blob_service_client.get_container_client(container_name)
         blob_client = container_client.get_blob_client(namespaced_blob_name)
         
         # Read existing data

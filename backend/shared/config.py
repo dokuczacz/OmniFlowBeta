@@ -5,13 +5,31 @@ import os
 from typing import Optional
 
 
+_AZURITE_DEFAULT_CONNECTION_STRING = (
+    "DefaultEndpointsProtocol=http;"
+    "AccountName=devstoreaccount1;"
+    "AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;"
+    "BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+    "QueueEndpoint=http://127.0.0.1:10001/devstoreaccount1;"
+    "TableEndpoint=http://127.0.0.1:10002/devstoreaccount1"
+)
+
+
+def resolve_storage_connection_string(raw: str) -> str:
+    """Normalize Azure storage connection string for local dev.
+
+    Note: The Python Azure Storage SDK does not accept "UseDevelopmentStorage=true".
+    """
+    value = str(raw or "").strip()
+    if value.lower() == "usedevelopmentstorage=true":
+        return _AZURITE_DEFAULT_CONNECTION_STRING
+    return value or _AZURITE_DEFAULT_CONNECTION_STRING
+
+
 class AzureConfig:
     """Centralized Azure configuration"""
     
-    CONNECTION_STRING = os.environ.get(
-        "AZURE_STORAGE_CONNECTION_STRING",
-        "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;QueueEndpoint=http://127.0.0.1:10001/devstoreaccount1;TableEndpoint=http://127.0.0.1:10002/devstoreaccount1"
-    )
+    CONNECTION_STRING = resolve_storage_connection_string(os.environ.get("AZURE_STORAGE_CONNECTION_STRING", ""))
     
     CONTAINER_NAME = os.environ.get(
         "AZURE_BLOB_CONTAINER_NAME",
