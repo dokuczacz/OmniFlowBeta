@@ -52,6 +52,9 @@ curl -X POST http://localhost:7071/api/add_new_data \
 - `PUT /api/update_data_entry` - Update existing entries
 - `DELETE /api/remove_data_entry` - Remove entries
 
+**Tool Discovery**:
+- `GET /api/custom_gpt_tools` - Return the catalog of callable functions along with their HTTP methods, URLs, and Azure function keys so your GPT can invoke them directly.
+
 **Listing & Discovery**:
 - `GET /api/list_blobs` - List all blobs for a user
 - `GET /api/get_current_time` - Get server timestamp
@@ -101,6 +104,27 @@ For a Custom GPT, you can define actions like:
   }
 }
 ```
+
+### Custom GPT Tool Catalog
+
+Rather than hard-coding endpoints inside your assistant, call `/api/custom_gpt_tools` (with `X-User-Id`) to fetch a current catalog of allowed functions. Each tool entry still contains `name`, `description`, and `parameters`, plus:
+
+- `function.methods`: HTTP verbs the endpoint supports (`GET`, `POST`, etc.).
+- `function.url`: The full URL built from `FUNCTION_URL_BASE` so you know where to send the request.
+- `function.code`: The Azure function key derived from `FUNCTION_CODE_*` environment variables (e.g., `FUNCTION_CODE_ADD_NEW_DATA`, `FUNCTION_CODE_READ_BLOB_FILE`).
+
+With those fields the assistant can call any supported API directly:
+
+```bash
+curl "https://your-function-app.azurewebsites.net/api/list_blobs?code=<function_code>&user_id=alice"
+
+curl -X POST "https://your-function-app.azurewebsites.net/api/add_new_data?code=<function_code>" \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: alice" \
+  -d '{"target_blob_name":"tasks.json","new_entry":{"id":"T001","task":"Sample task"}}'
+```
+
+Mirror the same env var names from `.env.example` or your Azure app settings so the catalog always reflects valid keys.
 
 ---
 

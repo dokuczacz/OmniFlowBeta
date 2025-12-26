@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import Dict, List, Set
 
 import azure.functions as func
@@ -192,6 +193,45 @@ CUSTOM_GPT_TOOL_SCHEMAS = [
     },
 ]
 
+FUNCTION_URL_BASE = os.getenv("FUNCTION_URL_BASE", "https://agentbackendservice.azurewebsites.net").rstrip("/")
+FUNCTION_HTTP_METHODS: Dict[str, List[str]] = {
+    "add_new_data": ["POST"],
+    "get_current_time": ["GET"],
+    "get_filtered_data": ["GET", "POST"],
+    "list_blobs": ["GET"],
+    "read_blob_file": ["GET"],
+    "remove_data_entry": ["POST"],
+    "update_data_entry": ["POST"],
+    "upload_data_or_file": ["POST"],
+    "manage_files": ["POST"],
+}
+FUNCTION_CODE_ENV_MAP: Dict[str, List[str]] = {
+    "add_new_data": ["FUNCTION_CODE_ADD_NEW_DATA", "FUNCTION_CODE_ADD_DATA"],
+    "get_current_time": ["FUNCTION_CODE_GET_TIME"],
+    "get_filtered_data": ["FUNCTION_CODE_GET_FILTERED_DATA", "FUNCTION_CODE_GET_DATA"],
+    "list_blobs": ["FUNCTION_CODE_LIST_BLOBS"],
+    "read_blob_file": ["FUNCTION_CODE_READ_BLOB_FILE", "FUNCTION_CODE_READ_BLOB"],
+    "remove_data_entry": ["FUNCTION_CODE_REMOVE_DATA_ENTRY", "FUNCTION_CODE_REMOVE_DATA"],
+    "update_data_entry": ["FUNCTION_CODE_UPDATE_DATA_ENTRY", "FUNCTION_CODE_UPDATE_DATA"],
+    "upload_data_or_file": ["FUNCTION_CODE_UPLOAD_DATA_OR_FILE", "FUNCTION_CODE_UPLOAD"],
+    "manage_files": ["FUNCTION_CODE_MANAGE_FILES"],
+}
+
+def _get_function_url(tool_name: str) -> str:
+    if not FUNCTION_URL_BASE:
+        return f"/api/{tool_name}"
+    return f"{FUNCTION_URL_BASE}/api/{tool_name}"
+
+def _get_function_methods(tool_name: str) -> List[str]:
+    return FUNCTION_HTTP_METHODS.get(tool_name, ["POST"])
+
+def _get_function_code(tool_name: str) -> str:
+    for env_key in FUNCTION_CODE_ENV_MAP.get(tool_name, []):
+        code_value = os.getenv(env_key, "").strip()
+        if code_value:
+            return code_value
+    return ""
+
 
 def _parse_scopes(req: func.HttpRequest) -> Set[str]:
     raw_scopes = (
@@ -228,17 +268,22 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     try:
         scopes = _parse_scopes(req)
         filtered_tools = _filter_tools_for_scopes(scopes)
-        tools_payload = [
-            {
-                "type": "function",
-                "function": {
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "parameters": tool["parameters"],
-                },
+        tools_payload = []
+        for tool in filtered_tools:
+            function_entry = {
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool["parameters"],
+                "methods": _get_function_methods(tool["name"]),
+                "code": _get_function_code(tool["name"]),
+                "url": _get_function_url(tool["name"]),
             }
-            for tool in filtered_tools
-        ]
+            tools_payload.append(
+                {
+                    "type": "function",
+                    "function": function_entry,
+                }
+            )
 
         LocalLogger.log_to_file(
             function_name="custom_gpt_tools",

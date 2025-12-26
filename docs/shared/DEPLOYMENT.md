@@ -12,6 +12,7 @@ This document captures the steps, env vars, and sanity checks to publish the ver
 
 1. Authenticate with the Azure CLI and select your subscription.
 2. Build and test locally: `pip install -r requirements.txt`, `func start`, and run the smoke tests (e.g. `python -m pytest backend/tool_call_handler/test_*.py`).
+   - For a one-shot local runner (spawns separate PowerShell windows for Azurite, Functions, and Streamlit): `powershell -ExecutionPolicy Bypass -File scripts/run_local.ps1`
 3. Publish your function app:
    ```bash
    func azure functionapp publish <YOUR_FUNCTION_APP_NAME> --python
