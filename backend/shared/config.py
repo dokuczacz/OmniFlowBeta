@@ -4,6 +4,8 @@ Configuration and environment management with user isolation support
 import os
 from typing import Optional
 
+from .logging_setup import configure_azure_sdk_logging
+
 
 _AZURITE_DEFAULT_CONNECTION_STRING = (
     "DefaultEndpointsProtocol=http;"
@@ -96,3 +98,7 @@ class UserNamespace:
     def is_user_blob(blob_name: str) -> bool:
         """Check if blob follows user namespace convention"""
         return blob_name.startswith(f"users{UserNamespace.USER_PREFIX_SEPARATOR}")
+
+
+# Apply logging tweaks as early as possible (imported by most functions).
+configure_azure_sdk_logging()

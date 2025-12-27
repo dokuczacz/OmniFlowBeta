@@ -3,6 +3,7 @@ import json
 import azure.functions as func
 from azure.core.exceptions import ResourceNotFoundError, AzureError
 import os
+import time
 from azure.storage.blob import BlobServiceClient
 from shared.config import AzureConfig
 
@@ -20,6 +21,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     Returns:
     - JSON data (filtered if filter_key/filter_value provided, otherwise full data)
     """
+    start_t = time.perf_counter()
     logging.info('get_filtered_data: Processing HTTP request with user isolation')
     
     try:
@@ -113,6 +115,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 "count": len(filtered_data),
                 "total": len(data)
             }
+            dur_ms = int((time.perf_counter() - start_t) * 1000)
+            logging.info(f"get_filtered_data: OK user_id={user_id} file={target_blob_name} filter={filter_key} count={len(filtered_data)} total={len(data)} dur_ms={dur_ms}")
         else:
             response = {
                 "status": "success",
@@ -123,6 +127,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 "count": len(data),
                 "total": len(data)
             }
+            dur_ms = int((time.perf_counter() - start_t) * 1000)
+            logging.info(f"get_filtered_data: OK user_id={user_id} file={target_blob_name} filter=none count={len(data)} dur_ms={dur_ms}")
         
         return func.HttpResponse(
             json.dumps(response, ensure_ascii=False),

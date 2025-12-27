@@ -12,6 +12,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from shared.azure_client import AzureBlobClient
 from shared.config import AzureConfig
 from shared.user_manager import extract_user_id
+from shared.wp7_indexer import QueueThresholds, append_queue_item, build_queue_item
 
 
 def _is_duplicate_interaction(existing_logs: list, candidate: dict, *, max_age_seconds: int = 30) -> bool:
@@ -201,6 +202,19 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             )
 
         if upload_success:
+            # WP7: enqueue a sanitized item for the batch indexer (append-only JSONL).
+            try:
+                thresholds = QueueThresholds(
+                    target_tokens=int(os.environ.get("WP7_TARGET_BATCH_TOKENS", "1000") or 1000),
+                    hard_min_tokens=int(os.environ.get("WP7_HARD_MIN_BATCH_TOKENS", "600") or 600),
+                    max_wait_seconds=int(os.environ.get("WP7_MAX_WAIT_SECONDS", "300") or 300),
+                    max_items_per_run=int(os.environ.get("WP7_MAX_ITEMS_PER_RUN", "25") or 25),
+                )
+                queue_item = build_queue_item(interaction_entry, user_id=user_id, thresholds=thresholds)
+                append_queue_item(user_id, queue_item)
+            except Exception as enqueue_exc:
+                logging.warning(f"WP7 queue enqueue failed (non-fatal): {enqueue_exc}")
+
             response_data = {
                 "success": True,
                 "message": "Interaction successfully saved",

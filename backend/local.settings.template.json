@@ -8,8 +8,23 @@
     "OPENAI_API_KEY": "",
     "OPENAI_ASSISTANT_ID": "",
     "OPENAI_PROMPT_ID": "",
+    "OPENAI_INDEXER_PROMPT_ID": "",
+    "OPENAI_INDEXER_MODEL": "gpt-5-mini",
     "LLM_RUNTIME": "assistants",
     "AZURE_PROXY_URL": "http://localhost:7071/api/proxy_router",
-    "FUNCTION_URL_BASE": "http://localhost:7071"
+    "FUNCTION_URL_BASE": "http://localhost:7071",
+    "HANDLES_CACHE_TTL_SECONDS": "60",
+    "DEBUG_TOOL_CALL_HANDLER": "true",
+    "WP7_TARGET_BATCH_TOKENS": "1000",
+    "WP7_HARD_MIN_BATCH_TOKENS": "600",
+    "WP7_MAX_WAIT_SECONDS": "300",
+    "WP7_MAX_ITEMS_PER_RUN": "25",
+    "WP7_MAX_OUTPUT_TOKENS_PER_ITEM": "180",
+    "WP7_INDEXER_MODE": "sync",
+    "WP7_INDEXER_USER_IDS": "auto",
+    "WP7_MAX_USER_CHARS": "2000",
+    "WP7_MAX_ASSISTANT_CHARS": "4000",
+    "WP7_ALLOWED_CATEGORIES": "PE,UI,ML,LO,PS,TM,SYS,GEN,ID",
+    "WP7_UNCATEGORIZED_CONFIDENCE_LT": "0.6"
   }
 }

@@ -4,6 +4,7 @@ import azure.functions as func
 from azure.storage.blob import BlobServiceClient
 from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
 import os
+import time
 from shared.config import AzureConfig
 
 
@@ -34,6 +35,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     
     prefix = req.params.get("prefix", "")
     
+    start_t = time.perf_counter()
     logging.info(f"list_blobs: user_id={user_id}, prefix={prefix}")
     
     try:
@@ -77,6 +79,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "blobs": blob_list,
             "count": len(blob_list)
         }
+        dur_ms = int((time.perf_counter() - start_t) * 1000)
+        logging.info(f"list_blobs: OK user_id={user_id} prefix={prefix} count={len(blob_list)} dur_ms={dur_ms}")
         
         return func.HttpResponse(
             json.dumps(response, ensure_ascii=False),

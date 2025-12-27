@@ -3,6 +3,7 @@ import json
 import azure.functions as func
 from azure.core.exceptions import ResourceNotFoundError, AzureError
 import os
+import time
 from azure.storage.blob import BlobServiceClient
 from shared.config import AzureConfig
 
@@ -40,6 +41,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json"
         )
     
+    start_t = time.perf_counter()
     logging.info(f"read_blob_file: user_id={user_id}, file_name={file_name}")
     
     try:
@@ -82,6 +84,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 "data": parsed_data,
                 "content_type": "json"
             }
+            dur_ms = int((time.perf_counter() - start_t) * 1000)
+            logging.info(f"read_blob_file: OK user_id={user_id} file_name={file_name} content_type=json bytes={len(blob_data)} dur_ms={dur_ms}")
         except Exception:
             response = {
                 "status": "success",
@@ -90,6 +94,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 "data": blob_text,
                 "content_type": "text"
             }
+            dur_ms = int((time.perf_counter() - start_t) * 1000)
+            logging.info(f"read_blob_file: OK user_id={user_id} file_name={file_name} content_type=text bytes={len(blob_data)} dur_ms={dur_ms}")
         return func.HttpResponse(
             json.dumps(response, ensure_ascii=False),
             mimetype="application/json"
