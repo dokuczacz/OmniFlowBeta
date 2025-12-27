@@ -35,7 +35,8 @@ jobs:
           source venv/bin/activate
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; elif [ -f backend/requirements.txt ]; then pip install -r backend/requirements.txt; else echo "No requirements.txt found"; exit 1; fi
 
       # Optional: Add step to run tests here
 

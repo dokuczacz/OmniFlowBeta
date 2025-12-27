@@ -21,7 +21,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; elif [ -f backend/requirements.txt ]; then pip install -r backend/requirements.txt; else echo "No requirements.txt found (skipping)"; fi
 
     - name: Basic sanity checks (no secrets)
       run: |
