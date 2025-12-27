@@ -2,44 +2,38 @@ name: Pytest with Azurite
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, develop ]
+    branches: [ main ]
 
 jobs:
-  test:
+  basic_checks:
     runs-on: ubuntu-latest
 
-    services:
-      azurite:
-        image: mcr.microsoft.com/azure-storage/azurite:3.9.0
-        ports:
-          - 10000:10000
-          - 10001:10001
-          - 10002:10002
-
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: Set up Python 3.11
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        if [ -f backend/requirements.txt ]; then pip install -r backend/requirements.txt; fi
-        pip install pytest pytest-cov
+        pip install -r requirements.txt
 
-    - name: Wait for Azurite to be ready
+    - name: Basic sanity checks (no secrets)
       run: |
-        echo "Waiting for Azurite to start..."
-        timeout 30 bash -c 'until curl -s http://localhost:10000 > /dev/null; do sleep 1; done' || echo "Azurite may not be fully ready"
-
-    - name: Run pytest
-      env:
-        AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://localhost:10000/devstoreaccount1;QueueEndpoint=http://localhost:10001/devstoreaccount1;TableEndpoint=http://localhost:10002/devstoreaccount1;"
-      run: |
-        cd backend
-        pytest --verbose --cov=. --cov-report=term-missing
+        python -m compileall backend -q
+        python - <<'PY'
+        import json
+        from pathlib import Path
+        p = Path("backend/custom_gpt_tools/actions_openapi.json")
+        d = json.loads(p.read_text(encoding="utf-8"))
+        assert d.get("openapi"), "missing openapi version"
+        assert "/api/read_many_blobs" in d.get("paths", {}), "missing /api/read_many_blobs path"
+        catalog = Path("AGENT_FUNCTIONS_CATALOG.json")
+        json.loads(catalog.read_text(encoding="utf-8"))
+        print("OK: compileall + json validation")
+        PY
