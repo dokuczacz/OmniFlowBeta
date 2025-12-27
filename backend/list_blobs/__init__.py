@@ -34,6 +34,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     user_id = str(user_id).strip()
     
     prefix = req.params.get("prefix", "")
+    include_meta = str(req.params.get("include_meta", "") or "").strip().lower() in ("1", "true", "yes", "y", "on")
     
     start_t = time.perf_counter()
     logging.info(f"list_blobs: user_id={user_id}, prefix={prefix}")
@@ -67,17 +68,32 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         
         # List blobs in user's namespace
         blob_list = []
+        blob_meta = []
         blobs = container_client.list_blobs(name_starts_with=full_prefix)
         for blob in blobs:
             # Return blob name relative to user's namespace (strip users/{user_id}/)
             relative_name = blob.name[len(user_namespace_prefix):]
             blob_list.append(relative_name)
+            if include_meta:
+                try:
+                    blob_meta.append(
+                        {
+                            "name": relative_name,
+                            "size": int(getattr(blob, "size", 0) or 0),
+                            "last_modified": getattr(blob, "last_modified", None).isoformat().replace("+00:00", "Z")
+                            if getattr(blob, "last_modified", None)
+                            else None,
+                        }
+                    )
+                except Exception:
+                    blob_meta.append({"name": relative_name})
         
         response = {
             "status": "success",
             "user_id": user_id,
             "blobs": blob_list,
-            "count": len(blob_list)
+            "count": len(blob_list),
+            "blobs_meta": blob_meta if include_meta else None
         }
         dur_ms = int((time.perf_counter() - start_t) * 1000)
         logging.info(f"list_blobs: OK user_id={user_id} prefix={prefix} count={len(blob_list)} dur_ms={dur_ms}")

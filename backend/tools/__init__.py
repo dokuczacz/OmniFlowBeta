@@ -6,6 +6,7 @@ from .get_current_time import get_current_time
 from .get_filtered_data import get_filtered_data
 from .list_blobs import list_blobs
 from .read_blob_file import read_blob_file
+from .read_many_blobs import read_many_blobs
 from .remove_data_entry import remove_data_entry
 from .update_data_entry import update_data_entry
 from .upload_data_or_file import upload_data_or_file
@@ -17,6 +18,7 @@ tool_registry = {
     "get_filtered_data": get_filtered_data,
     "list_blobs": list_blobs,
     "read_blob_file": read_blob_file,
+    "read_many_blobs": read_many_blobs,
     "remove_data_entry": remove_data_entry,
     "update_data_entry": update_data_entry,
     "upload_data_or_file": upload_data_or_file,

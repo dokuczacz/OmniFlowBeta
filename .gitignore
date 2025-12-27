@@ -19,6 +19,7 @@ backend/interaction_logs_default.json
 .env
 .env.*
 local.settings.json
+backend/local.settings.json
 
 # Editors/IDE
 .vscode/

@@ -102,6 +102,19 @@
         },
         "required": ["user_message", "assistant_response"],
         "additionalProperties": false
+      },
+      "ReadManyBlobsRequest": {
+        "type": "object",
+        "properties": {
+          "files": { "type": "array", "items": { "type": "string" }, "description": "List of blob names relative to the user's namespace (e.g. TM.json, interactions/semantic/index.jsonl)." },
+          "tail_lines": { "type": "integer", "minimum": 0, "maximum": 500, "default": 0, "description": "If >0, returns last N lines (best-effort, for text/JSONL/MD)." },
+          "tail_bytes": { "type": "integer", "minimum": 1024, "maximum": 262144, "default": 65536, "description": "Max bytes to read from the end when using tail_lines." },
+          "max_bytes_per_file": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 262144, "description": "Max bytes per file (prefix read). Larger blobs are truncated." },
+          "parse_json": { "type": "boolean", "default": true, "description": "If true, tries to JSON-decode each file; falls back to text on parse failure." },
+          "user_id": { "type": "string", "description": "Optional user namespace (can also be sent as x-user-id header)." }
+        },
+        "required": ["files"],
+        "additionalProperties": false
       }
     }
   },
@@ -190,6 +203,41 @@
         ],
         "responses": {
           "200": { "description": "File content returned" }
+        }
+      }
+    },
+    "/api/read_many_blobs": {
+      "post": {
+        "operationId": "read_many_blobs",
+        "summary": "Reads many blob files in one request with safety limits (supports optional tail for JSONL/text)",
+        "parameters": [
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional user namespace. If omitted, backend uses 'default'."
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": ["__SET_FUNCTION_CODE_READ_MANY_BLOBS__"]
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/ReadManyBlobsRequest" } }
+          }
+        },
+        "responses": {
+          "200": { "description": "Files read (some items may contain per-file errors)" },
+          "400": { "description": "Bad request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "500": { "description": "Server error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
     },

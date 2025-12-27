@@ -1159,6 +1159,7 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
             "manage_files": ["operation", "source_name", "target_name", "prefix"],
             "proxy_router": ["action", "params"],
             "read_blob_file": ["file_name"],
+            "read_many_blobs": ["files", "tail_lines", "tail_bytes", "max_bytes_per_file", "parse_json", "max_files"],
             "remove_data_entry": ["target_blob_name", "key_to_find", "value_to_find"],
             "save_interaction": ["user_message", "assistant_response", "thread_id", "tool_calls", "metadata"],
             "update_data_entry": ["target_blob_name", "find_key", "find_value", "update_key", "update_value"],

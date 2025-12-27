@@ -1,0 +1,435 @@
+{
+  "schema_version": "omniflow.agent_functions.v1",
+  "source_of_truth": "backend/custom_gpt_tools/actions_openapi.json",
+  "notes": [
+    "Always pass full blob paths exactly as returned by list_blobs (e.g. interactions/semantic/index.jsonl).",
+    "Prefer batch reads via read_many_blobs to reduce latency and context usage.",
+    "All tools support optional user isolation via x-user-id header or user_id field (if omitted, backend defaults to 'default')."
+  ],
+  "tools": [
+    {
+      "operation_id": "get_current_time",
+      "method": "GET",
+      "path": "/api/get_current_time",
+      "purpose": "Return current UTC time (ISO 8601). Use for stable IDs/timestamps and relative dates (today/tomorrow/etc.).",
+      "inputs": {
+        "query": [],
+        "body": null
+      },
+      "outputs": {
+        "content_type": "application/json",
+        "shape": "time payload"
+      },
+      "examples": [
+        {
+          "request": "GET /api/get_current_time?code=<CODE_GET_TIME>",
+          "notes": "Use before creating IDs or interpreting relative dates."
+        }
+      ]
+    },
+    {
+      "operation_id": "list_blobs",
+      "method": "GET",
+      "path": "/api/list_blobs",
+      "purpose": "List files in the user's namespace. Optionally filter by prefix.",
+      "inputs": {
+        "query": [
+          { "name": "prefix", "type": "string", "required": false, "notes": "Prefix inside user namespace." },
+          { "name": "include_meta", "type": "boolean", "required": false, "notes": "If true, return name/size/last_modified in blobs_meta." }
+        ],
+        "body": null
+      },
+      "outputs": {
+        "content_type": "application/json",
+        "shape": "{ status, user_id, blobs[], count, blobs_meta? }"
+      },
+      "examples": [
+        { "request": "GET /api/list_blobs?prefix=&include_meta=1&user_id=default&code=<CODE_LIST_BLOBS>" }
+      ]
+    },
+    {
+      "operation_id": "read_blob_file",
+      "method": "GET",
+      "path": "/api/read_blob_file",
+      "purpose": "Read a single blob file by name. Returns JSON if parseable, otherwise text.",
+      "inputs": {
+        "query": [
+          { "name": "file_name", "type": "string", "required": true, "notes": "Full path inside user namespace (e.g. TM.json, interactions/semantic/index.jsonl)." }
+        ],
+        "body": null
+      },
+      "outputs": {
+        "content_type": "application/json",
+        "shape": "{ status, user_id, file_name, content_type, data }"
+      },
+      "examples": [
+        { "request": "GET /api/read_blob_file?file_name=TM.json&user_id=default&code=<CODE_READ_BLOB_FILE>" }
+      ],
+      "gotchas": [
+        "If you pass only basename (e.g. index.jsonl) and it is nested, backend attempts unique suffix resolution; if ambiguous it returns candidates[]."
+      ]
+    },
+    {
+      "operation_id": "read_many_blobs",
+      "method": "POST",
+      "path": "/api/read_many_blobs",
+      "purpose": "Read many blob files in one request with safety limits. Supports tail reads for text/JSONL.",
+      "inputs": {
+        "query": [],
+        "body": {
+          "required": ["files"],
+          "properties": [
+            { "name": "files", "type": "string[]", "required": true, "notes": "Blob names relative to user namespace." },
+            { "name": "tail_lines", "type": "int", "required": false, "default": 0, "notes": "If >0, return last N lines (best-effort) and do not parse JSON." },
+            { "name": "tail_bytes", "type": "int", "required": false, "default": 65536, "notes": "Bytes from end when using tail_lines." },
+            { "name": "max_bytes_per_file", "type": "int", "required": false, "default": 262144, "notes": "Prefix read limit per file (truncates larger files)." },
+            { "name": "parse_json", "type": "bool", "required": false, "default": true, "notes": "Try JSON decode per file; fallback to text." }
+          ]
+        }
+      },
+      "outputs": {
+        "content_type": "application/json",
+        "shape": "{ status, user_id, count, errors, items[] }"
+      },
+      "examples": [
+        {
+          "request": "POST /api/read_many_blobs?code=<CODE_READ_MANY_BLOBS>",
+          "body": {
+            "user_id": "default",
+            "files": ["TM.json", "LO.json", "PS.json"],
+            "max_bytes_per_file": 262144,
+            "parse_json": true
+          }
+        },
+        {
+          "request": "POST /api/read_many_blobs?code=<CODE_READ_MANY_BLOBS>",
+          "body": {
+            "user_id": "default",
+            "files": ["interactions/semantic/index.jsonl", "interactions/indexer_queue.jsonl"],
+            "tail_lines": 50,
+            "tail_bytes": 65536,
+            "parse_json": false
+          }
+        }
+      ],
+      "safety": {
+        "max_files_default": 25,
+        "max_bytes_per_file_default": 262144,
+        "tail_bytes_default": 65536
+      }
+    },
+    {
+      "operation_id": "get_filtered_data",
+      "method": "POST",
+      "path": "/api/get_filtered_data",
+      "purpose": "Read a JSON file and optionally filter by a key/value on server-side (simple equality filter).",
+      "inputs": {
+        "query": [],
+        "body": {
+          "required": ["target_blob_name"],
+          "properties": [
+            { "name": "target_blob_name", "type": "string", "required": true },
+            { "name": "filter_key", "type": "string", "required": false },
+            { "name": "filter_value", "type": "string", "required": false }
+          ]
+        }
+      },
+      "outputs": {
+        "content_type": "application/json",
+        "shape": "{ status, user_id, file, filter?, data, count, total }"
+      },
+      "examples": [
+        {
+          "request": "POST /api/get_filtered_data?code=<CODE_GET_FILTERED_DATA>",
+          "body": { "user_id": "default", "target_blob_name": "TM.json", "filter_key": "status", "filter_value": "todo" }
+        }
+      ]
+    },
+    {
+      "operation_id": "add_new_data",
+      "method": "POST",
+      "path": "/api/add_new_data",
+      "purpose": "Append a new entry to a JSON file (entry is provided as a JSON-encoded string).",
+      "inputs": {
+        "query": [],
+        "body": { "required": ["target_blob_name", "new_entry"] }
+      },
+      "outputs": { "content_type": "application/json", "shape": "success payload" }
+    },
+    {
+      "operation_id": "update_data_entry",
+      "method": "POST",
+      "path": "/api/update_data_entry",
+      "purpose": "Find first record by (find_key/find_value) and update update_key to update_value.",
+      "inputs": {
+        "query": [],
+        "body": {
+          "required": ["target_blob_name", "find_key", "find_value", "update_key", "update_value"]
+        }
+      },
+      "outputs": { "content_type": "application/json", "shape": "success payload" }
+    },
+    {
+      "operation_id": "remove_data_entry",
+      "method": "POST",
+      "path": "/api/remove_data_entry",
+      "purpose": "Remove all records matching key/value from a JSON file.",
+      "inputs": { "query": [], "body": { "required": ["target_blob_name", "key_to_find", "value_to_find"] } },
+      "outputs": { "content_type": "application/json", "shape": "success payload" }
+    },
+    {
+      "operation_id": "upload_data_or_file",
+      "method": "POST",
+      "path": "/api/upload_data_or_file",
+      "purpose": "Create or replace a file in blob storage (raw text or JSON).",
+      "inputs": { "query": [], "body": { "required": ["target_blob_name", "file_content"] } },
+      "outputs": { "content_type": "application/json", "shape": "success payload" }
+    },
+    {
+      "operation_id": "manage_files",
+      "method": "POST",
+      "path": "/api/manage_files",
+      "purpose": "File operations: list/delete/rename (legacy; prefer list_blobs for listing).",
+      "inputs": { "query": [], "body": { "required": ["operation"] } },
+      "outputs": { "content_type": "application/json", "shape": "success payload" }
+    },
+    {
+      "operation_id": "save_interaction",
+      "method": "POST",
+      "path": "/api/save_interaction",
+      "purpose": "Persist raw user/assistant interaction logs (and enqueue WP7 indexing job).",
+      "inputs": { "query": [], "body": { "required": ["user_message", "assistant_response"] } },
+      "outputs": { "content_type": "application/json", "shape": "success payload" }
+    },
+    {
+      "operation_id": "get_interaction_history",
+      "method": "GET",
+      "path": "/api/get_interaction_history",
+      "purpose": "Read saved interaction history (optional thread_id + pagination).",
+      "inputs": {
+        "query": [
+          { "name": "thread_id", "type": "string", "required": false },
+          { "name": "limit", "type": "int", "required": false, "default": 50 },
+          { "name": "offset", "type": "int", "required": false, "default": 0 }
+        ],
+        "body": null
+      },
+      "outputs": { "content_type": "application/json", "shape": "history payload" }
+    },
+    {
+      "operation_id": "custom_gpt_tools",
+      "method": "GET",
+      "path": "/api/custom_gpt_tools",
+      "purpose": "Return server-side tool metadata (shape depends on backend implementation).",
+      "inputs": { "query": [], "body": null },
+      "outputs": { "content_type": "application/json", "shape": "tool list/metadata" }
+    }
+  ],
+  "openai_function_schemas": [
+    {
+      "name": "get_current_time",
+      "description": "Returns current UTC time (ISO 8601).",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "user_id": { "type": "string", "description": "Optional user namespace (if omitted backend uses 'default')." }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "list_blobs",
+      "description": "Returns a list of all files in the user's Azure Blob namespace.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "prefix": { "type": "string", "description": "Optional prefix within user's namespace." },
+          "include_meta": { "type": "boolean", "description": "If true, include size/last_modified per blob (blobs_meta)." },
+          "user_id": { "type": "string", "description": "Optional user namespace (if omitted backend uses 'default')." }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "read_blob_file",
+      "description": "Reads and returns the content of a specific blob file by name.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_name": { "type": "string", "description": "Blob file name (full path in user namespace, e.g. TM.json or interactions/semantic/index.jsonl)." },
+          "user_id": { "type": "string", "description": "Optional user namespace (if omitted backend uses 'default')." }
+        },
+        "required": ["file_name"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "read_many_blobs",
+      "description": "Reads many blob files in one request with safety limits (supports optional tail for JSONL/text).",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "files": { "type": "array", "items": { "type": "string" }, "description": "Blob names relative to the user's namespace." },
+          "tail_lines": { "type": "integer", "minimum": 0, "maximum": 500, "default": 0, "description": "If >0, return last N lines (best-effort) for text/JSONL/MD." },
+          "tail_bytes": { "type": "integer", "minimum": 1024, "maximum": 262144, "default": 65536, "description": "Bytes from end when using tail_lines." },
+          "max_bytes_per_file": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 262144, "description": "Prefix read limit per file (truncates larger files)." },
+          "parse_json": { "type": "boolean", "default": true, "description": "Try JSON decode per file; fallback to text." },
+          "max_files": { "type": "integer", "minimum": 1, "maximum": 50, "default": 25, "description": "Hard cap; requests with more files are rejected." },
+          "user_id": { "type": "string", "description": "Optional user namespace (if omitted backend uses 'default')." }
+        },
+        "required": ["files"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_filtered_data",
+      "description": "Returns JSON file content with optional simple filter (server-side).",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target_blob_name": { "type": "string", "description": "Target JSON file name inside user's namespace (e.g. TM.json)." },
+          "filter_key": { "type": "string", "description": "Optional field name to filter on." },
+          "filter_value": { "type": "string", "description": "Optional field value to match." },
+          "user_id": { "type": "string", "description": "Optional user namespace (if omitted backend uses 'default')." }
+        },
+        "required": ["target_blob_name"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "add_new_data",
+      "description": "Add new entry to JSON file (new_entry must be JSON encoded as string).",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target_blob_name": { "type": "string" },
+          "new_entry": { "type": "string", "description": "JSON-encoded entry (string)." },
+          "user_id": { "type": "string", "description": "Optional user namespace (if omitted backend uses 'default')." }
+        },
+        "required": ["target_blob_name", "new_entry"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "update_data_entry",
+      "description": "Find & update entry inside JSON file (first match).",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target_blob_name": { "type": "string" },
+          "find_key": { "type": "string" },
+          "find_value": { "type": "string" },
+          "update_key": { "type": "string" },
+          "update_value": { "type": "string" },
+          "user_id": { "type": "string", "description": "Optional user namespace (if omitted backend uses 'default')." }
+        },
+        "required": ["target_blob_name", "find_key", "find_value", "update_key", "update_value"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "remove_data_entry",
+      "description": "Remove entry matching key/value from JSON file.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target_blob_name": { "type": "string" },
+          "key_to_find": { "type": "string" },
+          "value_to_find": { "type": "string" },
+          "user_id": { "type": "string", "description": "Optional user namespace (if omitted backend uses 'default')." }
+        },
+        "required": ["target_blob_name", "key_to_find", "value_to_find"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "upload_data_or_file",
+      "description": "Create or replace file in Azure Blob Storage (file_content must be JSON string or text).",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target_blob_name": { "type": "string" },
+          "file_content": { "type": "string", "description": "Raw text or JSON-encoded string." },
+          "user_id": { "type": "string", "description": "Optional user namespace (if omitted backend uses 'default')." }
+        },
+        "required": ["target_blob_name", "file_content"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "manage_files",
+      "description": "Manage files: list, delete, rename.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "operation": { "type": "string", "enum": ["list", "delete", "rename"] },
+          "source_name": { "type": "string", "description": "For delete/rename: current file name." },
+          "target_name": { "type": "string", "description": "For rename: new file name." },
+          "prefix": { "type": "string", "description": "For list: optional prefix within user's namespace." },
+          "user_id": { "type": "string", "description": "Optional user namespace (if omitted backend uses 'default')." }
+        },
+        "required": ["operation"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "save_interaction",
+      "description": "Save user/assistant interaction to blob logs.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "user_message": { "type": "string" },
+          "assistant_response": { "type": "string" },
+          "thread_id": { "type": "string" },
+          "tool_calls": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "metadata": { "type": "object", "additionalProperties": true },
+          "user_id": { "type": "string", "description": "Optional user namespace (if omitted backend uses 'default')." }
+        },
+        "required": ["user_message", "assistant_response"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_interaction_history",
+      "description": "Returns interaction logs (optional thread filter + pagination).",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "thread_id": { "type": "string" },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+          "offset": { "type": "integer", "minimum": 0, "default": 0 },
+          "user_id": { "type": "string", "description": "Optional user namespace (if omitted backend uses 'default')." }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "custom_gpt_tools",
+      "description": "Returns server-side tool metadata for Custom GPT (shape depends on backend implementation).",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "user_id": { "type": "string", "description": "Optional user namespace (if omitted backend uses 'default')." }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

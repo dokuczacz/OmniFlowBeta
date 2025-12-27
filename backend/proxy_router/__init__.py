@@ -59,6 +59,11 @@ ACTION_MAP = {
         "url": os.getenv("FUNCTION_URL_BASE", "https://agentbackendservice.azurewebsites.net") + "/api/read_blob_file",
         "code": _get_code("FUNCTION_CODE_READ_BLOB_FILE", "FUNCTION_CODE_READ_BLOB")
     },
+    "read_many_blobs": {
+        "method": "POST",
+        "url": os.getenv("FUNCTION_URL_BASE", "https://agentbackendservice.azurewebsites.net") + "/api/read_many_blobs",
+        "code": _get_code("FUNCTION_CODE_READ_MANY_BLOBS")
+    },
     "save_interaction": {
         "method": "POST",
         "url": os.getenv("FUNCTION_URL_BASE", "https://agentbackendservice.azurewebsites.net") + "/api/save_interaction",
@@ -74,6 +79,7 @@ ACTION_MAP = {
 # Parameter validation: required keys for each action
 ACTION_SCHEMA = {
     "read_blob_file": ["file_name"],
+    "read_many_blobs": ["files"],
     "get_filtered_data": ["target_blob_name"],
     "remove_data_entry": ["target_blob_name", "key_to_find", "value_to_find"],
     "update_data_entry": ["target_blob_name", "find_key", "find_value", "update_key", "update_value"],
@@ -96,7 +102,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 
     action = data.get("action")
     params = data.get("params", {})
-    user_id = params.get("user_id", "default")
+    user_id = req.headers.get("x-user-id") or req.headers.get("X-User-Id") or params.get("user_id") or "default"
+    user_id = str(user_id).strip() or "default"
+    if isinstance(params, dict) and "user_id" not in params:
+        params["user_id"] = user_id
 
     logging.info(f"proxy_router: routing action={action} for user_id={user_id}")
 
@@ -122,9 +131,14 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         if method == "GET":
             query_params = params.copy()
             query_params["code"] = code
-            res = requests.get(url, params=query_params, timeout=10)
+            res = requests.get(url, params=query_params, headers={"x-user-id": user_id}, timeout=10)
         elif method == "POST":
-            res = requests.post(f"{url}?code={code}", json=params, timeout=10)
+            res = requests.post(
+                f"{url}?code={code}",
+                json=params,
+                headers={"x-user-id": user_id, "Content-Type": "application/json"},
+                timeout=10,
+            )
         else:
             return func.HttpResponse("Unsupported method", status_code=400)
 
