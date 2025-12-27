@@ -14,6 +14,9 @@ from shiny import App, reactive, render, ui
 
 DEFAULT_BACKEND_URL = "http://localhost:7071/api/tool_call_handler"
 USERS_ENV = "UI_USERS_JSON"
+ENV_DEV_URL = "BACKEND_URL_DEV"
+ENV_PROD_URL = "BACKEND_URL_PROD"
+ENV_UI_ENV = "UI_ENV"
 
 
 def normalize_user_id(value: str) -> str:
@@ -110,12 +113,19 @@ def tool_call_handler_request(
 app_ui = ui.page_sidebar(
     ui.sidebar(
         ui.h3("OmniFlow PA"),
+        ui.input_select(
+            "env",
+            "Environment",
+            choices=["prod", "dev"],
+            selected=str(os.environ.get(ENV_UI_ENV) or "prod").strip().lower() or "prod",
+        ),
         ui.input_text(
             "backend_url",
-            "Backend URL (tool_call_handler)",
-            value=os.environ.get("BACKEND_URL", DEFAULT_BACKEND_URL),
+            "Backend URL override (optional)",
+            value=str(os.environ.get("BACKEND_URL") or "").strip(),
             placeholder=DEFAULT_BACKEND_URL,
         ),
+        ui.output_text("effective_backend_label"),
         ui.hr(),
         ui.h4("Login"),
         ui.input_text("login_user_id", "User ID", placeholder="MarioBros"),
@@ -128,6 +138,32 @@ app_ui = ui.page_sidebar(
         ui.output_text("active_user_label"),
         ui.output_text("active_thread_label"),
         ui.output_text("last_latency_label"),
+    ),
+    ui.tags.style(
+        """
+        body { background: #0d1117; color: #e6edf3; }
+        .sidebar { background: #0d1117; }
+        .chat-history {
+            max-height: 55vh;
+            overflow-y: auto;
+            padding: 10px;
+            border: 1px solid #30363d;
+            border-radius: 10px;
+            background: #0d1117;
+            margin-bottom: 12px;
+        }
+        .bubble {
+            padding: 10px 12px;
+            border-radius: 10px;
+            margin-bottom: 8px;
+            border: 1px solid #30363d;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .bubble-user { background: #1f6feb; color: #ffffff; border-color: #1f6feb; }
+        .bubble-assistant { background: #161b22; color: #e6edf3; }
+        .muted { color: #8b949e; font-size: 0.9em; }
+        """
     ),
     ui.navset_tab(
         ui.nav(
@@ -165,6 +201,26 @@ def server(input, output, session):
     last_latency_ms = reactive.Value(None)  # float | None
 
     history: reactive.Value[List[Dict[str, str]]] = reactive.Value([])
+
+    def _effective_backend_url() -> str:
+        override = str(input.backend_url() or "").strip()
+        if override:
+            return override
+        env_choice = str(input.env() or "prod").strip().lower()
+        if env_choice == "dev":
+            dev = str(os.environ.get(ENV_DEV_URL) or "").strip()
+            if dev:
+                return dev
+        prod = str(os.environ.get(ENV_PROD_URL) or "").strip()
+        if prod:
+            return prod
+        return DEFAULT_BACKEND_URL
+
+    @output
+    @render.text
+    def effective_backend_label():
+        url = _effective_backend_url()
+        return f"Effective backend: {url}"
 
     @reactive.effect
     @reactive.event(input.logout_btn)
@@ -248,7 +304,7 @@ def server(input, output, session):
         if not msg:
             chat_error.set("Empty message.")
             return
-        backend_url = str(input.backend_url() or DEFAULT_BACKEND_URL).strip()
+        backend_url = _effective_backend_url()
 
         _append("user", msg)
         try:
@@ -278,15 +334,28 @@ def server(input, output, session):
         items = history.get()
         if not items:
             return ui.p("No messages yet.")
-        blocks = []
+        blocks: List[Any] = []
         for msg in items:
             role = msg.get("role", "assistant")
             content = msg.get("content", "")
+            ts = msg.get("timestamp", "")
             if role == "user":
-                blocks.append(ui.div(ui.strong("You: "), ui.span(content)))
+                blocks.append(
+                    ui.div(
+                        ui.div(ui.strong("You"), ui.span(f"  {ts}", class_="muted")),
+                        ui.div(content),
+                        class_="bubble bubble-user",
+                    )
+                )
             else:
-                blocks.append(ui.div(ui.strong("Assistant: "), ui.span(content)))
-        return ui.div(*blocks, style="white-space: pre-wrap;")
+                blocks.append(
+                    ui.div(
+                        ui.div(ui.strong("Assistant"), ui.span(f"  {ts}", class_="muted")),
+                        ui.div(content),
+                        class_="bubble bubble-assistant",
+                    )
+                )
+        return ui.div(*blocks, class_="chat-history")
 
     @output
     @render.text
@@ -298,4 +367,3 @@ def server(input, output, session):
 
 
 app = App(app_ui, server)
-

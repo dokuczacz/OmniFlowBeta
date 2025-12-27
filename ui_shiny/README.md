@@ -12,9 +12,13 @@ pip install -r ui_shiny/requirements.txt
 
 2) Set env vars:
 
-- `BACKEND_URL` (tool_call_handler endpoint), e.g.:
+- `BACKEND_URL` (optional override for tool_call_handler endpoint), e.g.:
   - local: `http://localhost:7071/api/tool_call_handler`
   - prod: `https://<your-app>.azurewebsites.net/api/tool_call_handler?code=<FUNCTION_KEY>`
+- or use environment presets:
+  - `BACKEND_URL_PROD` (recommended)
+  - `BACKEND_URL_DEV` (optional)
+  - `UI_ENV=prod|dev` (default: prod)
 - `UI_USERS_JSON` (per-user password map, see below)
 
 3) Run:
@@ -44,4 +48,3 @@ Generate hashes:
 ```bash
 python ui_shiny/hash_password.py --user MarioBros --password "your_password"
 ```
-
