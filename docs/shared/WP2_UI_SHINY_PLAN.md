@@ -48,8 +48,26 @@ Avoid accidental use of `default` and reduce cross-user mistakes in UI.
   - set `X-User-Id: <active_user_id>` for every request
 
 ### TODO decision (needs your pick)
-- Which mode: shared password or per-user passwords?
+- Chosen: Option B (per-user passwords) via `UI_USERS_JSON`.
 - Where to store secrets for Shiny deployment (env vars / hosting secrets)?
+
+### `UI_USERS_JSON` contract (recommended, dependency-free)
+Store it as an environment variable containing JSON object:
+
+```json
+{
+  "MarioBros": "pbkdf2_sha256$260000$<salt_b64>$<hash_b64>",
+  "default": "pbkdf2_sha256$260000$<salt_b64>$<hash_b64>"
+}
+```
+
+- Algorithm: `pbkdf2_sha256` using Python stdlib (`hashlib.pbkdf2_hmac`) - no extra packages.
+- Encoding: `salt_b64` and `hash_b64` are Base64.
+- Comparison must be constant-time (`hmac.compare_digest`).
+
+Notes:
+- Keep `"default"` disabled by policy in UI (or require explicit enable flag), to avoid accidental shared sessions.
+- If `user_id` not present in `UI_USERS_JSON`, login fails (no auto-create users in UI).
 
 ## 2) Migration strategy: "copy/paste Streamlit -> Shiny"
 
@@ -121,4 +139,3 @@ Avoid accidental use of `default` and reduce cross-user mistakes in UI.
 - No OAuth / Easy Auth here (future WP8).
 - No vector DB / classic RAG (WP3 parked).
 - No full streaming/job system in this MVP (separate backend work).
-
