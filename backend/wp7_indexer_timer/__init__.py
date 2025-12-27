@@ -31,6 +31,7 @@ from shared.wp7_indexer import (
     append_uncategorized_portfolio_item,
     build_batch_audit_item,
     build_semantic_index_item,
+    compact_indexer_items,
     derive_signal_level,
     download_queue_tail,
     load_indexer_state,
@@ -270,7 +271,9 @@ def _enqueue_uncategorized_portfolio(user_id: str, artifact: Dict[str, Any], sem
 
 
 def _create_indexer_input(items: List[Dict[str, Any]]) -> str:
-    payload = {"schema_version": "omniflow.wp7.indexer_input.v1", "format_hint": "json", "items": items}
+    compact = str(os.environ.get("WP7_INDEXER_INPUT_COMPACT") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
+    payload_items = compact_indexer_items(items) if compact else items
+    payload = {"schema_version": "omniflow.wp7.indexer_input.v1", "format_hint": "json", "items": payload_items}
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 

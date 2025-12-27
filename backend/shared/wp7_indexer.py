@@ -126,6 +126,39 @@ def estimate_tokens_chars(text: str) -> Tuple[int, int]:
     return max(0, int(low)), max(0, int(high))
 
 
+def compact_indexer_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Reduce queue item payload for sending to the indexer prompt.
+
+    Goal: minimize input tokens by keeping only what the model needs to produce the semantic artifact.
+    """
+    out: Dict[str, Any] = {
+        "interaction_id": str(item.get("interaction_id") or "").strip(),
+        "user_message": str(item.get("user_message") or ""),
+        "assistant_response": str(item.get("assistant_response") or ""),
+    }
+
+    ts = item.get("timestamp_utc")
+    if isinstance(ts, str) and ts.strip():
+        out["timestamp_utc"] = ts.strip()
+
+    tid = item.get("thread_id")
+    if isinstance(tid, str) and tid.strip():
+        out["thread_id"] = tid.strip()
+
+    tools = item.get("tools_used")
+    if isinstance(tools, list):
+        tools_clean = [str(t).strip() for t in tools if isinstance(t, (str, int, float)) and str(t).strip()]
+        if tools_clean:
+            out["tools_used"] = tools_clean[:25]
+
+    return out
+
+
+def compact_indexer_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [compact_indexer_item(i) for i in items if isinstance(i, dict)]
+
+
 def derive_signal_level(artifact: Dict[str, Any]) -> str:
     """
     Return a deterministic signal level for a semantic artifact.
