@@ -78,6 +78,7 @@ docs/shared/*
 !docs/shared/DEPLOYMENT.md
 !docs/shared/DEMO.md
 !docs/shared/GITHUB_DISCUSSIONS_TEMPLATES.md
+!docs/shared/WP2_UI_SHINY_PLAN.md
 
 # Local scratch docs (optional)
 /CHANGES.md
