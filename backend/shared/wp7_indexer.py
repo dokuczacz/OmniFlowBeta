@@ -37,12 +37,14 @@ WP7_STATE_BLOB_NAME = "interactions/indexer_state.json"
 WP7_SEMANTIC_PREFIX = "interactions/semantic/"
 WP7_SEMANTIC_INDEX_BLOB_NAME = "interactions/semantic/index.jsonl"
 WP7_UNCATEGORIZED_PORTFOLIO_BLOB_NAME = "interactions/portfolio/uncategorized.jsonl"
+WP7_BATCH_AUDIT_BLOB_NAME = "interactions/batch/audit.jsonl"
 
 WP7_QUEUE_SCHEMA_V1 = "omniflow.wp7.queue.v1"
 WP7_STATE_SCHEMA_V1 = "omniflow.wp7.state.v1"
 WP7_SEMANTIC_SCHEMA_V1 = "omniflow.wp7.semantic.v1"
 WP7_SEMANTIC_INDEX_SCHEMA_V1 = "omniflow.wp7.semantic_index.v1"
 WP7_UNCATEGORIZED_SCHEMA_V1 = "omniflow.wp7.uncategorized.v1"
+WP7_BATCH_AUDIT_SCHEMA_V1 = "omniflow.wp7.batch_audit.v1"
 
 
 def utc_now_iso() -> str:
@@ -55,7 +57,64 @@ def _truncate(text: str, max_chars: int) -> str:
         return value
     if len(value) <= max_chars:
         return value
-    return value[: max_chars - 1] + "…"
+    # Keep ASCII-only truncation marker to avoid encoding issues in JSONL logs.
+    if max_chars <= 3:
+        return value[:max_chars]
+    return value[: max_chars - 3] + "..."
+
+
+def build_batch_audit_item(
+    *,
+    user_id: str,
+    event: str,
+    batch_id: str,
+    custom_id: str | None = None,
+    prompt_id: str | None = None,
+    model: str | None = None,
+    input_file_id: str | None = None,
+    output_file_id: str | None = None,
+    request_id: str | None = None,
+    status_code: int | None = None,
+    usage: dict | None = None,
+    details: dict | None = None,
+) -> Dict[str, Any]:
+    """
+    Minimal, compact WP7 batch audit entry.
+
+    Intentionally excludes prompt/system/instructions text. Use prompt_id/model for traceability.
+    """
+    item: Dict[str, Any] = {
+        "schema_version": WP7_BATCH_AUDIT_SCHEMA_V1,
+        "timestamp_utc": utc_now_iso(),
+        "user_id": str(user_id),
+        "event": str(event),
+        "batch_id": str(batch_id),
+    }
+    if custom_id:
+        item["custom_id"] = str(custom_id)
+    if prompt_id:
+        item["prompt_id"] = str(prompt_id)
+    if model:
+        item["model"] = str(model)
+    if input_file_id:
+        item["input_file_id"] = str(input_file_id)
+    if output_file_id:
+        item["output_file_id"] = str(output_file_id)
+    if request_id:
+        item["request_id"] = str(request_id)
+    if status_code is not None:
+        item["status_code"] = int(status_code)
+    if isinstance(usage, dict) and usage:
+        safe_usage: Dict[str, Any] = {}
+        for k in ("input_tokens", "output_tokens", "total_tokens"):
+            v = usage.get(k)
+            if isinstance(v, (int, float)):
+                safe_usage[k] = int(v)
+        if safe_usage:
+            item["usage"] = safe_usage
+    if isinstance(details, dict) and details:
+        item["details"] = details
+    return item
 
 
 def estimate_tokens_chars(text: str) -> Tuple[int, int]:
@@ -131,6 +190,20 @@ def append_semantic_index_item(user_id: str, item: Dict[str, Any]) -> None:
         _append_jsonl_line(client, line)
     except AzureError as e:
         logging.error(f"WP7 append_semantic_index_item failed: {e}")
+        raise
+
+
+def append_batch_audit_item(user_id: str, item: Dict[str, Any]) -> None:
+    """Append a single JSONL line to the per-user WP7 batch audit log (compact, no prompt text)."""
+    line = json.dumps(item, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    if not line.endswith("\n"):
+        line += "\n"
+
+    client = _get_append_blob_client(user_id, WP7_BATCH_AUDIT_BLOB_NAME)
+    try:
+        _append_jsonl_line(client, line)
+    except AzureError as e:
+        logging.error(f"WP7 append_batch_audit_item failed: {e}")
         raise
 
 

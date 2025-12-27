@@ -152,6 +152,7 @@ def _call_indexer_model(openai_client: OpenAI, prompt_id: str, items: List[Dict[
         tool_choice="none",
         parallel_tool_calls=False,
         max_output_tokens=max_output_tokens,
+        store=False,
         metadata={"runtime": "wp7_indexer"},
     )
     output = getattr(resp, "output_text", None) or ""

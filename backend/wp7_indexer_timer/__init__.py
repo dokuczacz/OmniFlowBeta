@@ -20,13 +20,16 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from shared.azure_client import AzureBlobClient
 from shared.wp7_indexer import (
     QueueThresholds,
+    WP7_BATCH_AUDIT_BLOB_NAME,
     WP7_QUEUE_BLOB_NAME,
     WP7_SEMANTIC_PREFIX,
     WP7_SEMANTIC_SCHEMA_V1,
     WP7_UNCATEGORIZED_PORTFOLIO_BLOB_NAME,
     WP7_UNCATEGORIZED_SCHEMA_V1,
+    append_batch_audit_item,
     append_semantic_index_item,
     append_uncategorized_portfolio_item,
+    build_batch_audit_item,
     build_semantic_index_item,
     derive_signal_level,
     download_queue_tail,
@@ -332,6 +335,8 @@ def _submit_openai_batch(
         "tool_choice": "none",
         "parallel_tool_calls": False,
         "max_output_tokens": max_output_tokens,
+        # Avoid storing the response on OpenAI side unless explicitly needed.
+        "store": False,
         "metadata": {"runtime": "wp7_indexer_timer_batch", "user_id": str(user_id)},
     }
     custom_id = f"wp7:{user_id}:{uuid.uuid4().hex}"
@@ -359,6 +364,22 @@ def _submit_openai_batch(
             model,
             custom_id,
         )
+        try:
+            append_batch_audit_item(
+                user_id,
+                build_batch_audit_item(
+                    user_id=user_id,
+                    event="submitted",
+                    batch_id=str(getattr(batch, "id", None) or ""),
+                    custom_id=custom_id,
+                    prompt_id=prompt_id,
+                    model=model,
+                    input_file_id=str(getattr(file_obj, "id", None) or ""),
+                    details={"audit_blob": WP7_BATCH_AUDIT_BLOB_NAME},
+                ),
+            )
+        except Exception as e:
+            logging.warning(f"WP7 batch audit append failed (submitted) user_id={user_id}: {e}")
     finally:
         try:
             os.unlink(tmp_path)
@@ -429,6 +450,7 @@ def _ingest_batch_output(
     if not isinstance(resp, dict):
         raise RuntimeError("Batch output record missing `response` object")
     status_code = int(resp.get("status_code") or 0)
+    request_id = str(resp.get("request_id") or "").strip()
     if status_code != 200:
         raise RuntimeError(f"Batch response status_code={status_code}")
 
@@ -525,7 +547,7 @@ def _ingest_batch_output(
     save_indexer_state(user_id, state)
     _clear_batch_state(user_id)
 
-    return {
+    result = {
         "status": "batch_ingested",
         "user_id": user_id,
         "indexed": indexed,
@@ -536,6 +558,40 @@ def _ingest_batch_output(
         "queue_size_bytes": total,
         "planned_advance_bytes": planned_advance,
     }
+
+    try:
+        prompt_in_body = None
+        if isinstance(body, dict):
+            p = body.get("prompt")
+            if isinstance(p, dict) and isinstance(p.get("id"), str):
+                prompt_in_body = p.get("id")
+        usage = body.get("usage") if isinstance(body, dict) else None
+        append_batch_audit_item(
+            user_id,
+            build_batch_audit_item(
+                user_id=user_id,
+                event="ingested",
+                batch_id=str(batch_state.get("batch_id") or ""),
+                custom_id=str(batch_state.get("custom_id") or "") or None,
+                prompt_id=prompt_in_body or str(batch_state.get("prompt_id") or "") or None,
+                model=(body.get("model") if isinstance(body, dict) else None) or None,
+                output_file_id=str(batch_state.get("output_file_id") or "") or None,
+                request_id=request_id or None,
+                status_code=status_code,
+                usage=usage if isinstance(usage, dict) else None,
+                details={
+                    "indexed": indexed,
+                    "skipped_existing": skipped_existing,
+                    "missing_outputs": missing,
+                    "advanced_bytes": advanced_bytes,
+                    "byte_offset": state.get("byte_offset", offset_start),
+                },
+            ),
+        )
+    except Exception as e:
+        logging.warning(f"WP7 batch audit append failed (ingested) user_id={user_id}: {e}")
+
+    return result
 
 
 def _resync_offset_to_newline(user_id: str, *, offset: int, lookback: int = 8192) -> int:
@@ -563,6 +619,7 @@ def _call_indexer_model(openai_client: OpenAI, prompt_id: str, items: List[Dict[
         tool_choice="none",
         parallel_tool_calls=False,
         max_output_tokens=max_output_tokens,
+        store=False,
         metadata={"runtime": "wp7_indexer_timer"},
     )
     output = getattr(resp, "output_text", None) or ""
@@ -627,6 +684,8 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
                 return {"status": "batch_missing_output_file", "user_id": user_id, "batch_id": batch_id}
 
             try:
+                bs["output_file_id"] = output_file_id
+                _save_batch_state(user_id, bs)
                 logging.info(f"WP7: batch_completed user_id={user_id} batch_id={batch_id} output_file_id={output_file_id}")
                 logging.info(
                     f"WP7: batch_ingest_start user_id={user_id} batch_id={batch_id} output_file_id={output_file_id}"
