@@ -38,6 +38,12 @@ jobs:
         run: |
           if [ -f requirements.txt ]; then pip install -r requirements.txt; elif [ -f backend/requirements.txt ]; then pip install -r backend/requirements.txt; else echo "No requirements.txt found"; exit 1; fi
 
+      - name: Vendor dependencies into .python_packages (Azure Functions)
+        run: |
+          python -m pip install --upgrade pip
+          mkdir -p backend/.python_packages/lib/site-packages
+          pip install -r backend/requirements.txt --target backend/.python_packages/lib/site-packages
+
       # Optional: Add step to run tests here
 
       - name: Zip artifact for deployment
