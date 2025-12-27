@@ -1,0 +1,3 @@
+[submodule "ui_shiny/py-shiny-templates"]
+	path = ui_shiny/py-shiny-templates
+	url = https://github.com/posit-dev/py-shiny-templates.git
