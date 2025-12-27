@@ -11,15 +11,18 @@ OmniFlow Beta is designed to be integrated with Custom GPTs, LangChain agents, o
 To integrate OmniFlow with your Custom GPT or LLM system, ensure the following environment variables are configured:
 
 ### Core Configuration
-- `AZURE_STORAGE_CONNECTION_STRING` - Azure Storage connection (or Azurite for local dev)
-- `OPENAI_API_KEY` or `AZURE_OPENAI_API_KEY` - Your OpenAI/Azure OpenAI key
-- `AZURE_OPENAI_ENDPOINT` (if using Azure OpenAI)
-- `AZURE_OPENAI_DEPLOYMENT_NAME` (if using Azure OpenAI)
+- `AZURE_STORAGE_CONNECTION_STRING` or `AzureWebJobsStorage` - Azure Storage connection (or Azurite for local dev)
+- `AZURE_BLOB_CONTAINER_NAME` - Target container (default used by this repo: `agent-knowledge-base`)
+- `OPENAI_API_KEY` - OpenAI key
+- `LLM_RUNTIME` - `responses|assistants|auto` (recommended: `responses`)
+- `OPENAI_PROMPT_ID` - Prompt ID configured in the OpenAI dashboard (Responses runtime)
 
 ### Optional Configuration
-- `OMNIFLOW_DEFAULT_CONTAINER` - Default blob container name (default: `omniflow-data`)
-- `OMNIFLOW_MAX_BLOB_SIZE_MB` - Maximum blob size in MB (default: `10`)
-- `LOG_LEVEL` - Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+- `OPENAI_ASSISTANT_ID` - Assistant ID for legacy Threads/Assistants runtime
+- `AZURE_PROXY_URL` - Proxy router endpoint (if you route tool calls through the proxy)
+- `FUNCTION_URL_BASE` - Base URL used by proxy_router to construct endpoint URLs
+- `FUNCTION_CODE_*` - Azure function keys for each endpoint (used by Custom GPT Actions)
+- WP7 (Indexer): `OPENAI_INDEXER_PROMPT_ID`, `OPENAI_INDEXER_MODEL`, `WP7_INDEXER_MODE`, `WP7_INDEXER_USER_IDS`, `WP7_*` thresholds
 
 See `.env.example` for a complete list of configuration options.
 
@@ -57,6 +60,7 @@ curl -X POST http://localhost:7071/api/add_new_data \
 
 **Listing & Discovery**:
 - `GET /api/list_blobs` - List all blobs for a user
+- `POST /api/read_many_blobs` - Read many blobs in one call (optional tail extraction for JSONL/text)
 - `GET /api/get_current_time` - Get server timestamp
 
 ### 3. Example: Custom GPT Action
