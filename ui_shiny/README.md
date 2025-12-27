@@ -48,3 +48,22 @@ Generate hashes:
 ```bash
 python ui_shiny/hash_password.py --user MarioBros --password "your_password"
 ```
+
+## Shiny Templates
+
+This directory includes the official [Shiny for Python templates](https://github.com/posit-dev/py-shiny-templates) as a git submodule in `ui_shiny/py-shiny-templates/`.
+
+The templates provide examples and starter code for various Shiny application patterns:
+- Basic apps and dashboards
+- Navigation patterns
+- Database integration
+- Gen AI applications
+- And more
+
+To initialize the submodule (if not already done):
+
+```bash
+git submodule update --init --recursive
+```
+
+Browse the templates in `ui_shiny/py-shiny-templates/` to find patterns and examples for your Shiny development.
