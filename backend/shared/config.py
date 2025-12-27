@@ -29,7 +29,11 @@ def resolve_storage_connection_string(raw: str) -> str:
 class AzureConfig:
     """Centralized Azure configuration"""
     
-    CONNECTION_STRING = resolve_storage_connection_string(os.environ.get("AZURE_STORAGE_CONNECTION_STRING", ""))
+    CONNECTION_STRING = resolve_storage_connection_string(
+        os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+        or os.environ.get("AzureWebJobsStorage")
+        or ""
+    )
     
     CONTAINER_NAME = os.environ.get(
         "AZURE_BLOB_CONTAINER_NAME",

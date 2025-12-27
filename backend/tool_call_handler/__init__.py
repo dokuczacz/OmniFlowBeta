@@ -408,6 +408,12 @@ def _load_handles(user_id: str) -> Dict[str, Any]:
                         return parsed
                 except Exception:
                     return {}
+        if isinstance(payload, dict) and payload.get("error"):
+            error_text = str(payload.get("error") or "")
+            if "not found" in error_text.lower() or "blobnotfound" in error_text.lower():
+                if DEBUG_TOOL_CALL_HANDLER:
+                    logging.info(f"[DEBUG] handles.json missing; initializing user_id={user_id}")
+                _save_handles(user_id, {}, async_save=True)
         return {}
     except Exception:
         return {}

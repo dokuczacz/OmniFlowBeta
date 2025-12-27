@@ -4,6 +4,7 @@ import azure.functions as func
 from azure.core.exceptions import ResourceNotFoundError, AzureError
 import os
 from azure.storage.blob import BlobServiceClient
+from shared.config import AzureConfig
 
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
@@ -87,8 +88,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     
     try:
         # Storage configuration
-        connect_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-        container_name = os.environ.get("AZURE_BLOB_CONTAINER_NAME")
+        connect_str = AzureConfig.CONNECTION_STRING
+        container_name = AzureConfig.CONTAINER_NAME
         function_name = "add_new_data"
         status = "error"
         entry_count = None

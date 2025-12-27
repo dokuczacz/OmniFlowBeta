@@ -4,6 +4,7 @@ import azure.functions as func
 import os
 from azure.storage.blob import BlobServiceClient
 from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
+from shared.config import AzureConfig
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('manage_files: Processing file management request')
@@ -35,8 +36,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("Missing required field 'operation'.", status_code=400)
 
     try:
-        connect_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-        container_name = os.environ.get("AZURE_BLOB_CONTAINER_NAME")
+        connect_str = AzureConfig.CONNECTION_STRING
+        container_name = AzureConfig.CONTAINER_NAME
         if not connect_str or not container_name:
             return func.HttpResponse(
                 json.dumps({"error": "Missing Azure Storage configuration.", "user_id": user_id}),

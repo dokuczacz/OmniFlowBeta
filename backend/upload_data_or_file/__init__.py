@@ -4,6 +4,7 @@ import azure.functions as func
 import os
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
+from shared.config import AzureConfig
 
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
@@ -41,10 +42,9 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     # --- 2. Konfiguracja środowiska ---
-    try:
-        connect_str = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
-        container_name = os.environ["AZURE_BLOB_CONTAINER_NAME"]
-    except KeyError:
+    connect_str = AzureConfig.CONNECTION_STRING
+    container_name = AzureConfig.CONTAINER_NAME
+    if not connect_str or not container_name:
         return func.HttpResponse(
             json.dumps({"error": "Missing Azure Storage configuration."}, ensure_ascii=False),
             mimetype="application/json",
