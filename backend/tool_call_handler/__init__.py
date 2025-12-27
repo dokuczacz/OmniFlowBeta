@@ -491,6 +491,7 @@ def run_responses(openai_client: OpenAI, user_id: str, user_message: str, thread
 
     all_tool_calls = []
     current_input: Any = user_message or ""
+    retried_without_previous = False
 
     for _ in range(25):
         create_kwargs: Dict[str, Any] = {
@@ -505,18 +506,43 @@ def run_responses(openai_client: OpenAI, user_id: str, user_message: str, thread
         if previous_response_id:
             create_kwargs["previous_response_id"] = previous_response_id
 
-        response = _openai_call(openai_client.responses.create, **create_kwargs)
+        try:
+            response = _openai_call(openai_client.responses.create, **create_kwargs)
+        except Exception as exc:
+            # If the last persisted `previous_response_id` points to a response that had pending tool calls
+            # (e.g., crash before tool outputs were submitted), OpenAI rejects new input with:
+            # "No tool output found for function call call_...". We can safely self-heal by retrying once
+            # without previous_response_id (conversation id may still be kept).
+            msg = str(exc)
+            if (
+                (not retried_without_previous)
+                and previous_response_id
+                and isinstance(current_input, (str, bytes))
+                and ("No tool output found for function call" in msg)
+            ):
+                retried_without_previous = True
+                logging.warning(
+                    "Responses loop detected pending tool-call state for previous_response_id; retrying without previous_response_id "
+                    f"user_id={user_id} thread_id={thread_id}"
+                )
+                previous_response_id = ""
+                # Best-effort: clear persisted last_response_id to avoid repeated failures on next calls.
+                try:
+                    if isinstance(handles, dict):
+                        handles[thread_id] = {
+                            **(state if isinstance(state, dict) else {}),
+                            "responses_conversation_id": conversation_id,
+                            "responses_last_response_id": "",
+                            "active_runtime": "responses",
+                            "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+                        }
+                        _save_handles(user_id, handles, async_save=True)
+                except Exception:
+                    pass
+                continue
+            raise
         previous_response_id = str(getattr(response, "id", "") or previous_response_id)
         conversation_id = _coerce_conversation_id(getattr(response, "conversation", None) or conversation_id)
-
-        handles[thread_id] = {
-            **(state if isinstance(state, dict) else {}),
-            "responses_conversation_id": conversation_id,
-            "responses_last_response_id": previous_response_id,
-            "active_runtime": "responses",
-            "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
-        }
-        _save_handles(user_id, handles, async_save=True)
 
         function_calls = _extract_response_function_calls(response)
         if not function_calls:
@@ -524,6 +550,19 @@ def run_responses(openai_client: OpenAI, user_id: str, user_message: str, thread
             if not final_text:
                 final_text = "No response from assistant."
             meta = {"responses_conversation_id": conversation_id, "responses_last_response_id": previous_response_id}
+            # Persist only after reaching a "final" response to avoid saving a response id with pending tool calls.
+            try:
+                if isinstance(handles, dict):
+                    handles[thread_id] = {
+                        **(state if isinstance(state, dict) else {}),
+                        "responses_conversation_id": conversation_id,
+                        "responses_last_response_id": previous_response_id,
+                        "active_runtime": "responses",
+                        "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+                    }
+                    _save_handles(user_id, handles, async_save=True)
+            except Exception:
+                pass
             return final_text, all_tool_calls, meta, thread_id
 
         tool_outputs = []
@@ -535,7 +574,9 @@ def run_responses(openai_client: OpenAI, user_id: str, user_message: str, thread
             info["call_id"] = call.get("call_id")
             info["runtime"] = "responses"
             all_tool_calls.append(info)
-            tool_outputs.append({"type": "function_call_output", "call_id": call.get("call_id"), "output": result_str})
+            tool_outputs.append(
+                {"type": "function_call_output", "call_id": call.get("call_id"), "output": str(result_str)}
+            )
 
         current_input = tool_outputs
 
