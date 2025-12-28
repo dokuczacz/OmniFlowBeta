@@ -14,6 +14,7 @@ backend/interaction_logs_default.json
 # Python
 **/__pycache__/
 *.pyc
+*.tsbuildinfo
 **/.venv*/
 **/.python_packages/
 .env
@@ -48,6 +49,8 @@ Thumbs.db
 # Node/Frontend
 node_modules/
 .cache/
+.next/
+.turbo/
 
 # Streamlit secrets
 frontend/.streamlit/secrets.toml
@@ -81,7 +84,7 @@ docs/shared/*
 !docs/shared/DEPLOYMENT.md
 !docs/shared/DEMO.md
 !docs/shared/GITHUB_DISCUSSIONS_TEMPLATES.md
-!docs/shared/WP2_UI_SHINY_PLAN.md
+!docs/shared/WP2_NEXT_UI_PLAN.md
 
 # Local scratch docs (optional)
 /CHANGES.md

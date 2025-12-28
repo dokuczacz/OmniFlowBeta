@@ -11,5 +11,5 @@ This folder contains the minimal public documentation kept in the repo.
 
 ## UI roadmap
 
-- WP2 (Shiny UI plan + TODOs): `docs/shared/WP2_UI_SHINY_PLAN.md`
-
+- WP2 (Next.js MVP UI): `ai-chatbot/`
+- WP2 plan: `docs/shared/WP2_NEXT_UI_PLAN.md`
