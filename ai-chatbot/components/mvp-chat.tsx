@@ -535,7 +535,25 @@ export function MVPChat({
             className="border-border/60 bg-background/80"
           />
           <div className="flex items-center justify-between">
-            <div className="text-xs text-muted-foreground">
+            <div
+              className="text-xs text-muted-foreground"
+              style={{
+                display: "-webkit-box",
+                WebkitLineClamp: 2,
+                WebkitBoxOrient: "vertical",
+                overflow: "hidden",
+                wordBreak: "break-word",
+              }}
+              title={[
+                `Thread: ${threadId || "(none)"}`,
+                `Latency: ${latencyMs !== null ? `${latencyMs} ms` : "(none)"}`,
+                !activeUser ? "Missing active user" : `Active user: ${activeUser}`,
+                contentType ? `Content-Type: ${contentType}` : null,
+                status === "error" && error ? `Error: ${error}` : null,
+              ]
+                .filter(Boolean)
+                .join(" | ")}
+            >
               Thread: {threadId || "(none)"} | Latency:{" "}
               {latencyMs !== null ? `${latencyMs} ms` : "(none)"}
               {!activeUser ? " | Missing active user" : ""}
@@ -552,32 +570,6 @@ export function MVPChat({
           </div>
         </div>
       </div>
-
-      {runs.length > 0 && (
-        <div className="border-t border-border/40 bg-background/80 px-4 py-3">
-          <div className="mx-auto w-full max-w-2xl">
-            <div className="mb-3 text-xs uppercase tracking-[0.2em] text-muted-foreground">
-              Runs / Reports
-            </div>
-            <div className="space-y-2">
-              {runs.slice(0, 10).map((run) => (
-                <div
-                  key={run.id}
-                  className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border/40 bg-background/70 px-3 py-2 text-xs"
-                >
-                  <span className="text-muted-foreground">{run.timestamp}</span>
-                  <span>Latency: {run.latencyMs ?? "(none)"} ms</span>
-                  <span>Status: {run.status}</span>
-                  <span>Thread: {run.threadId || "(none)"}</span>
-                  <span className="text-muted-foreground">
-                    {run.messageExcerpt}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
