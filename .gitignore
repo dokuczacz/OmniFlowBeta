@@ -52,6 +52,9 @@ node_modules/
 # Streamlit secrets
 frontend/.streamlit/secrets.toml
 
+# Shiny UI local auth (keep local)
+ui_shiny/ui_users.json
+
 # Local workflow/progress reports (keep out of public repo)
 docs/workflow/
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -61,6 +62,80 @@ def _truncate(text: str, max_chars: int) -> str:
     if max_chars <= 3:
         return value[:max_chars]
     return value[: max_chars - 3] + "..."
+
+
+_INTENT_RE_TS = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?\b",
+    re.IGNORECASE,
+)
+_INTENT_RE_LONGNUM = re.compile(r"\b\d{6,}\b")
+_INTENT_RE_TOKEN_WITH_8DIGITS = re.compile(r"\b(?=\w*\d{8,})\w+\b", re.IGNORECASE)
+_INTENT_RE_DOTTED_ID = re.compile(r"\b[a-z]{1,6}\.\d{1,6}\.[a-z0-9]{6,24}\b", re.IGNORECASE)
+_INTENT_RE_NONWORD = re.compile(r"[^\w]+", re.UNICODE)
+_INTENT_RE_WS = re.compile(r"\s+")
+
+
+def normalize_intent(text: Any, *, max_len: int = 280) -> str:
+    """
+    Deterministic normalization for "same intent" deduplication.
+
+    Goal: remove volatile tokens (timestamps, IDs, long numbers) and collapse the text to a stable key.
+    """
+    s = str(text or "").strip().lower()
+    if not s:
+        return ""
+    s = _INTENT_RE_TS.sub(" ", s)
+    s = _INTENT_RE_DOTTED_ID.sub(" ", s)
+    s = _INTENT_RE_LONGNUM.sub(" ", s)
+    s = _INTENT_RE_TOKEN_WITH_8DIGITS.sub(" ", s)
+    s = _INTENT_RE_NONWORD.sub(" ", s)
+    s = _INTENT_RE_WS.sub(" ", s).strip()
+    if max_len and len(s) > max_len:
+        s = s[:max_len].rstrip()
+    return s
+
+
+def dedup_items_by_intent_norm(
+    items: List[Dict[str, Any]],
+    *,
+    text_key: str = "user_message",
+) -> Tuple[List[Dict[str, Any]], Dict[str, str], int]:
+    """
+    Returns:
+      - rep_items: list of representative items (stable order: first seen wins)
+      - member_to_rep: mapping interaction_id -> representative interaction_id
+      - distinct_intents: count of distinct intent_norm buckets (excluding empty intents)
+    """
+    rep_items: List[Dict[str, Any]] = []
+    member_to_rep: Dict[str, str] = {}
+    rep_by_intent: Dict[str, str] = {}
+    distinct = 0
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        iid = str(item.get("interaction_id") or "").strip()
+        if not iid:
+            continue
+
+        raw = item.get(text_key) or item.get("assistant_response") or ""
+        intent = normalize_intent(raw)
+        if not intent:
+            # Empty intent: treat as unique to avoid collapsing unrelated items.
+            rep_items.append(item)
+            member_to_rep[iid] = iid
+            continue
+
+        rep_iid = rep_by_intent.get(intent)
+        if not rep_iid:
+            rep_by_intent[intent] = iid
+            rep_iid = iid
+            rep_items.append(item)
+            distinct += 1
+
+        member_to_rep[iid] = rep_iid
+
+    return rep_items, member_to_rep, distinct
 
 
 def build_batch_audit_item(

@@ -26,6 +26,7 @@ from shared.wp7_indexer import (
     append_uncategorized_portfolio_item,
     build_semantic_index_item,
     compact_indexer_items,
+    dedup_items_by_intent_norm,
     derive_signal_level,
     download_queue_tail,
     load_indexer_state,
@@ -36,6 +37,10 @@ from shared.wp7_indexer import (
 
 def _parse_bool(value: Any) -> bool:
     return str(value or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _wp7_enabled() -> bool:
+    return str(os.environ.get("WP7_ENABLED", "1") or "").strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _safe_int(value: Any, default: int) -> int:
@@ -275,6 +280,13 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     user_id = extract_user_id(req) or "default"
     thresholds = _load_thresholds(req)
 
+    if not _wp7_enabled():
+        return func.HttpResponse(
+            json.dumps({"status": "disabled", "user_id": user_id, "reason": "WP7_ENABLED=0"}, ensure_ascii=False),
+            mimetype="application/json",
+            status_code=503,
+        )
+
     try:
         body = req.get_json() if req.method.lower() == "post" else {}
     except Exception:
@@ -402,6 +414,15 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         if item.get("_skip"):
             continue
         batch_items.append(item)
+    rep_items, member_to_rep, distinct_intents = dedup_items_by_intent_norm(batch_items)
+    if batch_items and len(rep_items) != len(batch_items):
+        logging.info(
+            "WP7: dedup user_id=%s candidates=%s reps=%s distinct_intents=%s",
+            user_id,
+            len(batch_items),
+            len(rep_items),
+            distinct_intents,
+        )
 
     if dry_run:
         return func.HttpResponse(
@@ -431,7 +452,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     openai_client = OpenAI(api_key=openai_key)
 
     try:
-        artifacts = _call_indexer_model(openai_client, prompt_id, batch_items)
+        artifacts = _call_indexer_model(openai_client, prompt_id, rep_items)
     except Exception as e:
         logging.error(f"WP7 indexer call failed: {e}")
         # keep first_pending_at_utc to measure waiting window, do not advance offset
@@ -464,21 +485,23 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         iid = str(item.get("interaction_id") or "").strip()
         if not iid:
             continue
-        art = by_id.get(iid)
+        rep_iid = str(member_to_rep.get(iid) or iid).strip()
+        art = by_id.get(rep_iid)
         if art is None:
             # Do not advance offset past an item we didn't get an output for.
             missing += 1
             break
         try:
             semantic_blob_path = f"users/{user_id}/{WP7_SEMANTIC_PREFIX}{iid}.json"
-            _write_semantic_artifact(user_id, iid, art)
+            payload = dict(art or {})
+            payload["interaction_id"] = iid
+            _write_semantic_artifact(user_id, iid, payload)
             should_portfolio, reasons = _should_portfolio_uncategorized(art)
             if should_portfolio:
                 try:
-                    art = dict(art or {})
-                    art.setdefault("interaction_id", iid)
-                    art["portfolio_reasons"] = reasons
-                    _enqueue_uncategorized_portfolio(user_id, art, semantic_blob_path)
+                    p = dict(payload or {})
+                    p["portfolio_reasons"] = reasons
+                    _enqueue_uncategorized_portfolio(user_id, p, semantic_blob_path)
                 except Exception as pe:
                     logging.warning(f"WP7 uncategorized portfolio append failed for {iid}: {pe}")
             indexed += 1

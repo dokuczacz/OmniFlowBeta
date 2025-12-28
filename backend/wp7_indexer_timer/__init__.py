@@ -32,6 +32,7 @@ from shared.wp7_indexer import (
     build_batch_audit_item,
     build_semantic_index_item,
     compact_indexer_items,
+    dedup_items_by_intent_norm,
     derive_signal_level,
     download_queue_tail,
     load_indexer_state,
@@ -101,6 +102,10 @@ def _iter_jsonl_lines(data: bytes) -> List[Tuple[int, str]]:
 
 def _wp7_mode() -> str:
     return str(os.environ.get("WP7_INDEXER_MODE") or "sync").strip().lower()
+
+
+def _wp7_enabled() -> bool:
+    return str(os.environ.get("WP7_ENABLED", "1") or "").strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _discover_user_ids_with_queue() -> list[str]:
@@ -323,8 +328,10 @@ def _submit_openai_batch(
     offset_start: int,
     candidates_count: int,
     submitted_ids: List[str],
+    submitted_rep_ids: List[str] | None = None,
     candidate_ids: List[str],
     planned_advance_bytes: int,
+    member_to_rep: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
     input_text = _create_indexer_input(batch_items)
     per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 180)
@@ -402,6 +409,8 @@ def _submit_openai_batch(
         "candidate_count": int(candidates_count),
         "candidate_interaction_ids": candidate_ids,
         "submitted_interaction_ids": submitted_ids,
+        "submitted_rep_interaction_ids": submitted_rep_ids or [],
+        "dedup_member_to_rep": member_to_rep or {},
     }
     _save_batch_state(user_id, state)
     return {
@@ -413,6 +422,7 @@ def _submit_openai_batch(
         "planned_advance_bytes": planned_advance_bytes,
         "candidate_count": candidates_count,
         "submitted_items": len(submitted_ids),
+        "submitted_rep_items": len(submitted_rep_ids or []),
         "custom_id": custom_id,
     }
 
@@ -496,6 +506,9 @@ def _ingest_batch_output(
     lines = _iter_jsonl_lines(data)
 
     submitted_ids = set(batch_state.get("submitted_interaction_ids") or [])
+    member_to_rep = batch_state.get("dedup_member_to_rep") or {}
+    if not isinstance(member_to_rep, dict):
+        member_to_rep = {}
     advanced_bytes = 0
     indexed = 0
     skipped_existing = 0
@@ -525,19 +538,21 @@ def _ingest_batch_output(
             # Stop: we cannot safely advance beyond an unsubmitted, unindexed item.
             break
 
-        art = by_id.get(iid)
+        rep_iid = str(member_to_rep.get(iid) or iid).strip()
+        art = by_id.get(rep_iid)
         if art is None:
             missing += 1
             break
         semantic_blob_path = f"users/{user_id}/{WP7_SEMANTIC_PREFIX}{iid}.json"
-        _write_semantic_artifact(user_id, iid, art)
+        payload = dict(art or {})
+        payload["interaction_id"] = iid
+        _write_semantic_artifact(user_id, iid, payload)
         should_portfolio, reasons = _should_portfolio_uncategorized(art)
         if should_portfolio:
             try:
-                art = dict(art or {})
-                art.setdefault("interaction_id", iid)
-                art["portfolio_reasons"] = reasons
-                _enqueue_uncategorized_portfolio(user_id, art, semantic_blob_path)
+                p = dict(payload or {})
+                p["portfolio_reasons"] = reasons
+                _enqueue_uncategorized_portfolio(user_id, p, semantic_blob_path)
             except Exception as pe:
                 logging.warning(f"WP7 uncategorized portfolio append failed for {iid}: {pe}")
         indexed += 1
@@ -809,10 +824,20 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
         }
 
     batch_items: List[Dict[str, Any]] = [it for _, it in candidates if not it.get("_skip")]
+    rep_items, member_to_rep, distinct_intents = dedup_items_by_intent_norm(batch_items)
+    if batch_items and len(rep_items) != len(batch_items):
+        logging.info(
+            "WP7: dedup user_id=%s candidates=%s reps=%s distinct_intents=%s",
+            user_id,
+            len(batch_items),
+            len(rep_items),
+            distinct_intents,
+        )
 
     if mode == "batch":
         candidate_ids: List[str] = []
         submitted_ids: List[str] = []
+        submitted_rep_ids: List[str] = []
         planned_advance = 0
         for line_len, item in candidates:
             planned_advance += line_len
@@ -821,11 +846,16 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
                 candidate_ids.append(iid)
             if not item.get("_skip") and iid:
                 submitted_ids.append(iid)
+        for it in rep_items:
+            iid = str(it.get("interaction_id") or "").strip()
+            if iid:
+                submitted_rep_ids.append(iid)
         logging.info(
-            "WP7: batch_submit user_id=%s candidates=%s submitted=%s tokens_sum=%s planned_advance_bytes=%s",
+            "WP7: batch_submit user_id=%s candidates=%s submitted=%s submitted_reps=%s tokens_sum=%s planned_advance_bytes=%s",
             user_id,
             len(candidate_ids),
             len(submitted_ids),
+            len(submitted_rep_ids),
             token_sum,
             planned_advance,
         )
@@ -833,15 +863,17 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
             openai_client,
             prompt_id=prompt_id,
             user_id=user_id,
-            batch_items=batch_items,
+            batch_items=rep_items,
             offset_start=offset,
             candidates_count=len(candidates),
             submitted_ids=submitted_ids,
+            submitted_rep_ids=submitted_rep_ids,
             candidate_ids=candidate_ids,
             planned_advance_bytes=planned_advance,
+            member_to_rep=member_to_rep,
         )
 
-    artifacts = _call_indexer_model(openai_client, prompt_id, batch_items)
+    artifacts = _call_indexer_model(openai_client, prompt_id, rep_items)
 
     by_id: Dict[str, Dict[str, Any]] = {}
     for art in artifacts:
@@ -863,19 +895,21 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
         iid = str(item.get("interaction_id") or "").strip()
         if not iid:
             continue
-        art = by_id.get(iid)
+        rep_iid = str(member_to_rep.get(iid) or iid).strip()
+        art = by_id.get(rep_iid)
         if art is None:
             missing += 1
             break
         semantic_blob_path = f"users/{user_id}/{WP7_SEMANTIC_PREFIX}{iid}.json"
-        _write_semantic_artifact(user_id, iid, art)
+        payload = dict(art or {})
+        payload["interaction_id"] = iid
+        _write_semantic_artifact(user_id, iid, payload)
         should_portfolio, reasons = _should_portfolio_uncategorized(art)
         if should_portfolio:
             try:
-                art = dict(art or {})
-                art.setdefault("interaction_id", iid)
-                art["portfolio_reasons"] = reasons
-                _enqueue_uncategorized_portfolio(user_id, art, semantic_blob_path)
+                p = dict(payload or {})
+                p["portfolio_reasons"] = reasons
+                _enqueue_uncategorized_portfolio(user_id, p, semantic_blob_path)
             except Exception as pe:
                 logging.warning(f"WP7 uncategorized portfolio append failed for {iid}: {pe}")
         indexed += 1
@@ -909,15 +943,20 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
 
 
 def main(timer: func.TimerRequest) -> None:
+    if not _wp7_enabled():
+        logging.info("WP7 indexer timer disabled (WP7_ENABLED=0)")
+        return
     user_ids_env = str(os.environ.get("WP7_INDEXER_USER_IDS", "default") or "").strip()
     if user_ids_env.lower() in ("auto", "*"):
         user_ids = _discover_user_ids_with_queue()
+        user_ids = [u for u in user_ids if str(u).strip() and str(u).strip().lower() not in ("none", "null")]
         if not user_ids:
             # No queues present; avoid doing any work.
             logging.info("WP7: timer_start user_ids=none (auto)")
             return
     else:
         user_ids = [u.strip() for u in user_ids_env.split(",") if u.strip()]
+        user_ids = [u for u in user_ids if u.strip().lower() not in ("none", "null")]
         if not user_ids:
             user_ids = ["default"]
 
