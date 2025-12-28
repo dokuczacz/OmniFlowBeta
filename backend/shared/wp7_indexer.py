@@ -309,7 +309,7 @@ def append_batch_audit_item(user_id: str, item: Dict[str, Any]) -> None:
 
     client = _get_append_blob_client(user_id, WP7_BATCH_AUDIT_BLOB_NAME)
     try:
-        _append_jsonl_line(client, line)
+        _append_jsonl_line(client, line, user_id=user_id, blob_label=WP7_BATCH_AUDIT_BLOB_NAME)
     except AzureError as e:
         logging.error(f"WP7 append_batch_audit_item failed: {e}")
         raise
@@ -404,7 +404,7 @@ def append_queue_item(user_id: str, item: Dict[str, Any]) -> None:
 
     client = _get_append_blob_client(user_id, WP7_QUEUE_BLOB_NAME)
     try:
-        _append_jsonl_line(client, line)
+        _append_jsonl_line(client, line, user_id=user_id, blob_label=WP7_QUEUE_BLOB_NAME)
     except AzureError as e:
         logging.error(f"WP7 append_queue_item failed: {e}")
         raise
@@ -418,33 +418,72 @@ def append_uncategorized_portfolio_item(user_id: str, item: Dict[str, Any]) -> N
 
     client = _get_append_blob_client(user_id, WP7_UNCATEGORIZED_PORTFOLIO_BLOB_NAME)
     try:
-        _append_jsonl_line(client, line)
+        _append_jsonl_line(client, line, user_id=user_id, blob_label=WP7_UNCATEGORIZED_PORTFOLIO_BLOB_NAME)
     except AzureError as e:
         logging.error(f"WP7 append_uncategorized_portfolio_item failed: {e}")
         raise
 
 
-def _append_jsonl_line(client: BlobClient, line: str) -> None:
-    """Append a JSONL line using Append Blob operations; migrate if blob exists as Block Blob."""
-    data = line.encode("utf-8")
-
-    # Create append blob if missing
+def _ensure_append_blob(client: BlobClient, *, user_id: str, blob_label: str) -> None:
+    """Ensure the target blob is an Append Blob, migrating if needed."""
     try:
-        client.get_blob_properties()
+        props = client.get_blob_properties()
     except ResourceNotFoundError:
         try:
             client.create_append_blob()
         except ResourceExistsError:
             pass
+        return
+
+    blob_type = getattr(props, "blob_type", "").lower()
+    if blob_type == "appendblob":
+        return
+
+    existing = b""
+    try:
+        existing = client.download_blob().readall()
+    except AzureError:
+        existing = b""
+
+    client.delete_blob()
+    try:
+        client.create_append_blob()
+    except ResourceExistsError:
+        pass
+    if existing:
+        client.upload_blob(existing, overwrite=True)
+    logging.warning(
+        "WP7: recreated %s for user_id=%s as AppendBlob (preserved %d bytes).",
+        blob_label,
+        user_id,
+        len(existing),
+    )
+
+
+def _append_jsonl_line(client: BlobClient, line: str, *, user_id: str, blob_label: str) -> None:
+    """Append a JSONL line using Append Blob operations; migrate if blob exists as Block Blob."""
+    data = line.encode("utf-8")
+
+    _ensure_append_blob(client, user_id=user_id, blob_label=blob_label)
 
     try:
         client.append_block(data)
         return
     except HttpResponseError as e:
-        # If the blob exists but is not an append blob (e.g. created earlier via upload_blob),
-        # fall back to overwrite-with-appended-text once (migration path).
-        msg = str(getattr(e, "message", "") or str(e))
-        if "AppendBlob" not in msg and "append" not in msg.lower():
+        err_msg = str(getattr(e, "message", "") or e)
+        err_code = str(getattr(e, "error_code", "") or "").lower()
+        if "invalidblobtype" in err_code or "invalidblobtype" in err_msg.lower():
+            _ensure_append_blob(client, user_id=user_id, blob_label=blob_label)
+            merged = data
+            existing = b""
+            try:
+                existing = client.download_blob().readall()
+            except ResourceNotFoundError:
+                existing = b""
+            merged = existing + data
+            client.upload_blob(merged, overwrite=True)
+            return
+        if "appendblob" not in err_msg.lower() and "append" not in err_msg.lower():
             raise
 
     existing = b""
