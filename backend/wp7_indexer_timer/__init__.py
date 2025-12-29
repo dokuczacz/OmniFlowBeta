@@ -30,6 +30,7 @@ from shared.wp7_indexer import (
     append_semantic_index_item,
     append_uncategorized_portfolio_item,
     backfill_semantic_index_if_empty,
+    reconcile_semantic_index_missing,
     build_batch_audit_item,
     build_semantic_index_item,
     compact_indexer_items,
@@ -684,6 +685,8 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
     try:
         max_backfill = _safe_int(os.environ.get("WP7_INDEX_BACKFILL_MAX_ITEMS"), 250)
         backfill_semantic_index_if_empty(user_id, max_items=max_backfill)
+        if str(os.environ.get("WP7_INDEX_RECONCILE_MISSING", "1") or "").strip().lower() in ("1", "true", "yes", "y", "on"):
+            reconcile_semantic_index_missing(user_id, max_items=max_backfill)
     except Exception as e:
         logging.warning("WP7 semantic index backfill failed user_id=%s: %s", user_id, e)
     if mode == "batch":

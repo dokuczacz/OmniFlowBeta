@@ -462,6 +462,118 @@ def backfill_semantic_index_if_empty(
     return {"status": "backfilled", "user_id": user_id, "indexed": indexed, "max_items": max_items}
 
 
+def reconcile_semantic_index_missing(
+    user_id: str,
+    *,
+    max_items: int = 250,
+) -> Dict[str, Any]:
+    """
+    Reconcile a partially filled semantic index by appending missing entries for existing artifacts.
+
+    This is useful after:
+    - a previous bug prevented index appends while artifacts were written
+    - manual wipes/restore left artifacts present but index incomplete
+
+    Safety:
+    - Only appends; never edits existing lines.
+    - Limits scan+append to `max_items` semantic artifacts.
+    """
+    if max_items <= 0:
+        return {"status": "skipped", "reason": "max_items<=0", "user_id": user_id, "appended": 0}
+
+    # Load existing index IDs (if index is missing, treat as empty).
+    index_ids: set[str] = set()
+    index_bc = AzureBlobClient.get_blob_client(WP7_SEMANTIC_INDEX_BLOB_NAME, user_id)
+    try:
+        raw = index_bc.download_blob().readall()
+        for ln in raw.decode("utf-8", errors="replace").splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                obj = json.loads(ln)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                iid = str(obj.get("interaction_id") or "").strip()
+                if iid:
+                    index_ids.add(iid)
+    except ResourceNotFoundError:
+        index_ids = set()
+    except Exception as e:
+        logging.warning("WP7 index reconcile: failed to read index user_id=%s: %s", user_id, e)
+        return {"status": "failed", "reason": "index_read_failed", "user_id": user_id, "appended": 0}
+
+    # Iterate semantic artifacts (bounded).
+    try:
+        container = AzureBlobClient.get_container_client()
+        user_prefix = f"users/{user_id}/"
+        full_prefix = f"{user_prefix}{WP7_SEMANTIC_PREFIX}INT_"
+        semantic_names: list[str] = []
+        for blob in container.list_blobs(name_starts_with=full_prefix):
+            name = getattr(blob, "name", None)
+            if not isinstance(name, str):
+                continue
+            if not name.endswith(".json"):
+                continue
+            rel = name[len(user_prefix) :] if name.startswith(user_prefix) else name
+            semantic_names.append(rel)
+            if len(semantic_names) >= max_items:
+                break
+    except Exception as e:
+        logging.warning("WP7 index reconcile: list semantic failed user_id=%s: %s", user_id, e)
+        return {"status": "failed", "reason": "list_failed", "user_id": user_id, "appended": 0}
+
+    missing_blob_names: list[str] = []
+    for rel in sorted(semantic_names):
+        iid = rel[len(WP7_SEMANTIC_PREFIX) : -len(".json")]
+        if iid and iid not in index_ids:
+            missing_blob_names.append(rel)
+
+    if not missing_blob_names:
+        return {"status": "ok", "user_id": user_id, "appended": 0, "scanned": len(semantic_names)}
+
+    appended = 0
+    for blob_name in missing_blob_names:
+        interaction_id = blob_name[len(WP7_SEMANTIC_PREFIX) : -len(".json")]
+        try:
+            bc = AzureBlobClient.get_blob_client(blob_name, user_id)
+            payload_raw = bc.download_blob().readall()
+            payload = json.loads(payload_raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                continue
+            semantic_blob_path = f"users/{user_id}/{blob_name}"
+            append_semantic_index_item(
+                user_id,
+                build_semantic_index_item(
+                    payload,
+                    user_id=user_id,
+                    interaction_id=interaction_id,
+                    semantic_blob_path=semantic_blob_path,
+                ),
+            )
+            appended += 1
+        except Exception as e:
+            logging.warning("WP7 index reconcile item failed user_id=%s blob=%s: %s", user_id, blob_name, e)
+            continue
+
+    logging.info(
+        "WP7: semantic index reconciled user_id=%s appended=%s missing_before=%s scanned=%s",
+        user_id,
+        appended,
+        len(missing_blob_names),
+        len(semantic_names),
+    )
+    return {
+        "status": "reconciled",
+        "user_id": user_id,
+        "appended": appended,
+        "missing_before": len(missing_blob_names),
+        "scanned": len(semantic_names),
+        "max_items": max_items,
+    }
+
+
 def extract_tools_used(tool_calls: Any, *, max_items: int = 25) -> List[str]:
     """Extract a compact list of tool names used in an interaction."""
     names: List[str] = []
