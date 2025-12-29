@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import time
+import hashlib
 from typing import Dict, Any, Tuple
 import uuid
 
@@ -71,6 +72,13 @@ WP6_PREFERENCES_AUTO_CREATE = str(os.environ.get("WP6_PREFERENCES_AUTO_CREATE", 
     "on",
 )
 _prefs_loading = threading.local()
+
+WP6_FAST_MAX_INPUT_TOKENS = int(os.environ.get("WP6_FAST_MAX_INPUT_TOKENS", "2000") or 2000)
+WP6_FAST_MAX_SOURCES = int(os.environ.get("WP6_FAST_MAX_SOURCES", "4") or 4)
+WP6_FAST_MAX_RAW_BYTES = int(os.environ.get("WP6_FAST_MAX_RAW_BYTES", "64000") or 64000)
+WP6_DEEP_MAX_PACK_TOKENS = int(os.environ.get("WP6_DEEP_MAX_PACK_TOKENS", "16000") or 16000)
+WP6_CONTEXT_PACK_TTL_SECONDS = int(os.environ.get("WP6_CONTEXT_PACK_TTL_SECONDS", "300") or 300)
+OPENAI_CONTEXT_BUILDER_PROMPT_ID = os.environ.get("OPENAI_CONTEXT_BUILDER_PROMPT_ID", "")
 
 def _inprocess_call_function_main(main_fn, user_id: str, *, params: Dict[str, Any] | None = None, body: Dict[str, Any] | None = None):
     """
@@ -263,6 +271,254 @@ def _wp6_allowed_to_read(tool_name: str, normalized_args: Dict[str, Any], prefs:
                 return False, f"Blocked by preferences: target not in allowed_reads (target={t})."
 
     return True, ""
+
+
+def _wp6_est_tokens_from_text(text: str) -> int:
+    return int((len(text or "") + 3) // 4)
+
+
+def _wp6_norm_intent_key(user_message: str) -> str:
+    raw = str(user_message or "").strip().lower()
+    raw = " ".join(raw.split())
+    raw = raw[:256]
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _wp6_extract_semantic_ids_from_index(index_jsonl_text: str, max_ids: int) -> list[str]:
+    ids: list[str] = []
+    for line in (index_jsonl_text or "").splitlines()[::-1]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        iid = obj.get("interaction_id")
+        if not iid:
+            continue
+        iid_s = str(iid).strip()
+        if not iid_s:
+            continue
+        if iid_s not in ids:
+            ids.append(iid_s)
+        if len(ids) >= max_ids:
+            break
+    return ids
+
+
+def _wp6_fast_context_from_wp7_semantic(user_id: str, max_sources: int, max_chars: int) -> Tuple[str, Dict[str, Any]]:
+    meta: Dict[str, Any] = {"semantic_candidates_count": 0, "selected_sources_count": 0, "raw_bytes_read": 0}
+
+    # Tail the semantic index
+    idx_str, _ = execute_tool_call(
+        "read_many_blobs",
+        {
+            "files": ["interactions/semantic/index.jsonl"],
+            "tail_lines": 200,
+            "tail_bytes": 65536,
+            "max_bytes_per_file": 48000,
+            "parse_json": False,
+            "max_files": 1,
+        },
+        user_id,
+    )
+    try:
+        idx_payload = json.loads(idx_str) if isinstance(idx_str, str) else {}
+    except Exception:
+        idx_payload = {}
+
+    index_text = ""
+    if isinstance(idx_payload, dict) and idx_payload.get("status") == "success":
+        items = idx_payload.get("items") or []
+        if isinstance(items, list) and items and isinstance(items[0], dict):
+            index_text = str(items[0].get("data") or "")
+            meta["raw_bytes_read"] += int(items[0].get("bytes") or 0)
+
+    interaction_ids = _wp6_extract_semantic_ids_from_index(index_text, max(1, max_sources) * 2)
+    meta["semantic_candidates_count"] = len(interaction_ids)
+    if not interaction_ids:
+        return "", meta
+
+    semantic_files = [f"interactions/semantic/{iid}.json" for iid in interaction_ids[: max(1, max_sources) * 2]]
+    sem_str, _ = execute_tool_call(
+        "read_many_blobs",
+        {
+            "files": semantic_files,
+            "max_bytes_per_file": max(2048, max_chars),
+            "parse_json": True,
+            "max_files": max(1, max_sources) * 2,
+        },
+        user_id,
+    )
+    try:
+        sem_payload = json.loads(sem_str) if isinstance(sem_str, str) else {}
+    except Exception:
+        sem_payload = {}
+
+    items_data: list[dict] = []
+    if isinstance(sem_payload, dict) and sem_payload.get("status") == "success":
+        for it in (sem_payload.get("items") or []):
+            if not isinstance(it, dict):
+                continue
+            meta["raw_bytes_read"] += int(it.get("bytes") or 0)
+            data = it.get("data")
+            if isinstance(data, dict):
+                items_data.append(data)
+
+    def _sig_rank(x: dict) -> int:
+        sl = str((x or {}).get("signal_level") or "").lower()
+        return 3 if sl == "high" else (2 if sl == "medium" else 1)
+
+    items_data.sort(key=_sig_rank, reverse=True)
+    out_lines: list[str] = []
+    used = 0
+    for it in items_data:
+        if used >= max_sources:
+            break
+        iid = str(it.get("interaction_id") or "").strip()
+        cat = str(it.get("category") or "").strip()
+        summ = str(it.get("summary") or "").strip()
+        tags = it.get("tags") if isinstance(it.get("tags"), list) else []
+        tags_s = ",".join([str(t) for t in tags[:6] if str(t).strip()])
+        if not iid or not summ:
+            continue
+        line = f"- [{cat}] {summ} (id={iid}{';tags='+tags_s if tags_s else ''})"
+        if (sum(len(x) + 1 for x in out_lines) + len(line)) > max_chars:
+            break
+        out_lines.append(line)
+        used += 1
+
+    meta["selected_sources_count"] = used
+    if not out_lines:
+        return "", meta
+
+    ctx = "WP7 semantic context (recent, prioritized):\n" + "\n".join(out_lines)
+    return ctx, meta
+
+
+def _wp6_route_context_mode(body: Dict[str, Any], user_message: str) -> Tuple[str, str, Dict[str, Any]]:
+    requested = str(body.get("context_mode") or body.get("context") or "AUTO").strip().upper()
+    if requested not in ("AUTO", "FAST", "DEEP"):
+        requested = "AUTO"
+
+    est_prompt_tokens = _wp6_est_tokens_from_text(user_message or "")
+    meta = {"context_mode_requested": requested, "prompt_chars": len(user_message or ""), "prompt_tokens_est": est_prompt_tokens}
+
+    if requested in ("FAST", "DEEP"):
+        return requested, "explicit", meta
+
+    if est_prompt_tokens > WP6_FAST_MAX_INPUT_TOKENS:
+        return "DEEP", "prompt_tokens_est_exceeded", meta
+    return "FAST", "prompt_tokens_est_within_fast", meta
+
+
+def _wp6_load_cached_pack_from_handles(state: Dict[str, Any], intent_key: str) -> Tuple[str, bool]:
+    try:
+        pack = (state or {}).get("context_pack")
+        if not isinstance(pack, dict):
+            return "", False
+        if str(pack.get("intent_key") or "") != str(intent_key):
+            return "", False
+        created_ts = float(pack.get("created_ts") or 0.0)
+        if not created_ts or (time.time() - created_ts) > WP6_CONTEXT_PACK_TTL_SECONDS:
+            return "", False
+        pack_id = str(pack.get("pack_id") or "").strip()
+        return pack_id, bool(pack_id)
+    except Exception:
+        return "", False
+
+
+def _wp6_save_pack_to_blob(user_id: str, pack: Dict[str, Any]) -> str:
+    pack_id = str(pack.get("pack_id") or "").strip()
+    if not pack_id:
+        pack_id = f"pack_{uuid.uuid4().hex[:12]}"
+        pack["pack_id"] = pack_id
+    path = f"semantics/context_packs/{pack_id}.json"
+    execute_tool_call("upload_data_or_file", {"target_blob_name": path, "file_content": pack}, user_id)
+    return path
+
+
+def _wp6_build_or_reuse_context_pack(
+    openai_client: OpenAI,
+    user_id: str,
+    thread_id: str,
+    user_message: str,
+    state: Dict[str, Any],
+    fast_ctx: str,
+    intent_key: str,
+) -> Tuple[str, Dict[str, Any]]:
+    meta: Dict[str, Any] = {"intent_key": intent_key, "pack_reused": False, "pack_path": "", "pack_id": "", "pack_tokens_est": 0}
+
+    pack_id, ok = _wp6_load_cached_pack_from_handles(state, intent_key)
+    if ok:
+        try:
+            pack_str, _ = execute_tool_call("read_blob_file", {"file_name": f"semantics/context_packs/{pack_id}.json"}, user_id)
+            pack_payload = json.loads(pack_str) if isinstance(pack_str, str) else {}
+            if isinstance(pack_payload, dict) and pack_payload.get("status") == "success":
+                pack = pack_payload.get("data")
+                if isinstance(pack, dict):
+                    meta["pack_reused"] = True
+                    meta["pack_id"] = pack_id
+                    meta["pack_path"] = f"semantics/context_packs/{pack_id}.json"
+                    meta["pack_tokens_est"] = int(((pack.get("estimates") or {}).get("estimated_tokens_selected") or 0))
+                    return json.dumps(pack, ensure_ascii=False), meta
+        except Exception:
+            pass
+
+    if not OPENAI_CONTEXT_BUILDER_PROMPT_ID:
+        meta["error"] = "OPENAI_CONTEXT_BUILDER_PROMPT_ID not set"
+        return "", meta
+
+    cb_input = {
+        "schema_version": "omniflow.wp6.context_builder_input.v1",
+        "user_id": str(user_id),
+        "thread_id": str(thread_id),
+        "intent_key": intent_key,
+        "user_message": str(user_message or ""),
+        "fast_semantic_context": str(fast_ctx or ""),
+        "constraints": {"max_pack_tokens_est": WP6_DEEP_MAX_PACK_TOKENS},
+    }
+
+    cb_kwargs: Dict[str, Any] = {
+        "prompt": {"id": OPENAI_CONTEXT_BUILDER_PROMPT_ID},
+        "input": cb_input,
+        "max_output_tokens": min(WP6_DEEP_MAX_PACK_TOKENS, 8192),
+        "metadata": {"user_id": str(user_id), "thread_id": str(thread_id), "runtime": "context_builder"},
+    }
+    cb_resp = _openai_call(openai_client.responses.create, **cb_kwargs)
+    cb_text = getattr(cb_resp, "output_text", None) or ""
+    try:
+        pack = json.loads(cb_text) if cb_text else {}
+    except Exception:
+        pack = {}
+    if not isinstance(pack, dict) or pack.get("schema_version") != "omniflow.wp6.context_pack.v1":
+        meta["error"] = "invalid_context_pack_output"
+        return "", meta
+
+    try:
+        pack_path = _wp6_save_pack_to_blob(user_id, pack)
+        meta["pack_path"] = pack_path
+        meta["pack_id"] = str(pack.get("pack_id") or "")
+        meta["pack_tokens_est"] = int(((pack.get("estimates") or {}).get("estimated_tokens_selected") or 0))
+        try:
+            handles = _load_handles(user_id)
+            if isinstance(handles, dict):
+                thread_state = handles.get(thread_id, {}) if isinstance(handles.get(thread_id), dict) else {}
+                handles[thread_id] = {
+                    **thread_state,
+                    "context_pack": {"pack_id": meta["pack_id"], "intent_key": intent_key, "created_ts": time.time()},
+                    "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+                }
+                _save_handles(user_id, handles, async_save=True)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    return json.dumps(pack, ensure_ascii=False), meta
 
 # Optional global (cross-process) limit for tests. If set (>0), this will be
 # enforced by a simple file-based counter in `backend/logs/openai_global_counter.json`.
@@ -1709,6 +1965,64 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         if runtime_used == "responses":
             request_start = time.time()
             try:
+                wp6_meta: Dict[str, Any] = {}
+                routed_mode, route_reason, route_meta = _wp6_route_context_mode(body, user_message)
+
+                # Build bounded FAST semantic context (used also as an input for DEEP builder).
+                fast_ctx, fast_meta = _wp6_fast_context_from_wp7_semantic(
+                    user_id=user_id,
+                    max_sources=min(WP6_FAST_MAX_SOURCES, 10),
+                    max_chars=min(WP6_FAST_MAX_RAW_BYTES, WP6_FAST_MAX_INPUT_TOKENS * 4),
+                )
+                wp6_meta = {**route_meta, **fast_meta}
+
+                mode_used = "FAST"
+                mode_reason = route_reason
+
+                # If DEEP requested/routed, try Context Builder prompt; else fallback to FAST.
+                if routed_mode == "DEEP":
+                    handles_for_thread = _load_handles(user_id)
+                    state_for_thread = (
+                        handles_for_thread.get(thread_id, {}) if (thread_id and isinstance(handles_for_thread, dict)) else {}
+                    )
+                    intent_key = _wp6_norm_intent_key(user_message)
+                    pack_text, pack_meta = _wp6_build_or_reuse_context_pack(
+                        openai_client=openai_client,
+                        user_id=user_id,
+                        thread_id=str(thread_id or ""),
+                        user_message=user_message,
+                        state=state_for_thread if isinstance(state_for_thread, dict) else {},
+                        fast_ctx=fast_ctx,
+                        intent_key=intent_key,
+                    )
+                    wp6_meta.update(pack_meta)
+                    if pack_text:
+                        mode_used = "DEEP"
+                        mode_reason = route_reason
+                        user_message = f"[CONTEXT_PACK_JSON]\n{pack_text}\n\n[USER_MESSAGE]\n{user_message}"
+                    else:
+                        mode_used = "FAST"
+                        mode_reason = f"deep_fallback:{pack_meta.get('error') or 'no_pack'}"
+                        if fast_ctx:
+                            user_message = f"[FAST_CONTEXT]\n{fast_ctx}\n\n[USER_MESSAGE]\n{user_message}"
+                else:
+                    if fast_ctx:
+                        user_message = f"[FAST_CONTEXT]\n{fast_ctx}\n\n[USER_MESSAGE]\n{user_message}"
+
+                wp6_meta["context_mode_used"] = mode_used
+                wp6_meta["context_mode_reason"] = mode_reason
+                wp6_meta["fast_ctx_tokens_est"] = _wp6_est_tokens_from_text(fast_ctx or "")
+                wp6_meta["fast_ctx_chars"] = len(fast_ctx or "")
+
+                logging.info(
+                    "WP6 route user_id=%s mode=%s reason=%s prompt_tokens_est=%s selected_sources=%s raw_bytes=%s",
+                    user_id,
+                    mode_used,
+                    mode_reason,
+                    wp6_meta.get("prompt_tokens_est"),
+                    wp6_meta.get("selected_sources_count"),
+                    wp6_meta.get("raw_bytes_read"),
+                )
                 assistant_response, all_tool_calls, responses_meta, thread_id = run_responses(
                     openai_client=openai_client,
                     user_id=user_id,
@@ -1722,6 +2036,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 return _make_response({"error": "Internal server error", "details": str(exc), "runtime": "responses"}, status_code=500)
 
             total_ms = (time.time() - request_start) * 1000
+            try:
+                if isinstance(responses_meta, dict):
+                    responses_meta["wp6"] = wp6_meta
+            except Exception:
+                pass
             return finalize_response(
                 openai_client=openai_client,
                 thread_id=thread_id,
