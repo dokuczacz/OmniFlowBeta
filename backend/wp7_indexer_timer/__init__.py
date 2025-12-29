@@ -669,19 +669,28 @@ def _call_indexer_model(openai_client: OpenAI, prompt_id: str, items: List[Dict[
 
 
 def _thresholds_from_env() -> QueueThresholds:
+    # Reduce daily organization usage by sending larger batches less often.
+    # Multiplier affects only thresholds (when to run), not output schema limits (maxItems=25).
+    batch_mult = _safe_int(os.environ.get("WP7_BATCH_SIZE_MULTIPLIER"), 9)
+    batch_mult = max(1, batch_mult)
     return QueueThresholds(
-        target_tokens=_safe_int(os.environ.get("WP7_TARGET_BATCH_TOKENS"), 1000),
-        hard_min_tokens=_safe_int(os.environ.get("WP7_HARD_MIN_BATCH_TOKENS"), 600),
+        target_tokens=_safe_int(os.environ.get("WP7_TARGET_BATCH_TOKENS"), 1000) * batch_mult,
+        hard_min_tokens=_safe_int(os.environ.get("WP7_HARD_MIN_BATCH_TOKENS"), 600) * batch_mult,
         max_wait_seconds=_safe_int(os.environ.get("WP7_MAX_WAIT_SECONDS"), 300),
-        max_items_per_run=_safe_int(os.environ.get("WP7_MAX_ITEMS_PER_RUN"), 25),
+        max_items_per_run=min(_safe_int(os.environ.get("WP7_MAX_ITEMS_PER_RUN"), 25), 25),
         max_user_chars=_safe_int(os.environ.get("WP7_MAX_USER_CHARS"), 2000),
         max_assistant_chars=_safe_int(os.environ.get("WP7_MAX_ASSISTANT_CHARS"), 4000),
     )
 
 
+def _wp7_log_verbose() -> bool:
+    return str(os.environ.get("WP7_LOG_VERBOSE", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, thresholds: QueueThresholds) -> Dict[str, Any]:
     mode = _wp7_mode()
-    logging.info(f"WP7: tick user_id={user_id} mode={mode}")
+    if _wp7_log_verbose():
+        logging.info(f"WP7: tick user_id={user_id} mode={mode}")
     try:
         max_backfill = _safe_int(os.environ.get("WP7_INDEX_BACKFILL_MAX_ITEMS"), 250)
         backfill_semantic_index_if_empty(user_id, max_items=max_backfill)
@@ -783,7 +792,8 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
     if not lines:
         state["first_pending_at_utc"] = None
         save_indexer_state(user_id, state)
-        logging.info(f"WP7: idle user_id={user_id} mode={mode} queue_size_bytes={total} byte_offset={offset}")
+        if _wp7_log_verbose():
+            logging.info(f"WP7: idle user_id={user_id} mode={mode} queue_size_bytes={total} byte_offset={offset}")
         return {"status": "idle", "user_id": user_id, "byte_offset": offset, "queue_size_bytes": total}
 
     candidates: List[Tuple[int, Dict[str, Any]]] = []
@@ -818,17 +828,28 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
     should_run = token_sum >= thresholds.target_tokens or (
         elapsed_s >= thresholds.max_wait_seconds and token_sum >= thresholds.hard_min_tokens
     )
-    logging.info(
-        "WP7: queue_check user_id=%s mode=%s queue_size_bytes=%s byte_offset=%s candidates=%s tokens_sum=%s elapsed_s=%s should_run=%s",
-        user_id,
-        mode,
-        total,
-        offset,
-        len(candidates),
-        token_sum,
-        elapsed_s,
-        should_run,
-    )
+    if _wp7_log_verbose():
+        logging.info(
+            "WP7: queue_check user_id=%s mode=%s queue_size_bytes=%s byte_offset=%s candidates=%s tokens_sum=%s elapsed_s=%s should_run=%s",
+            user_id,
+            mode,
+            total,
+            offset,
+            len(candidates),
+            token_sum,
+            elapsed_s,
+            should_run,
+        )
+    elif should_run:
+        logging.info(
+            "WP7: run_trigger user_id=%s mode=%s candidates=%s tokens_sum=%s queue_size_bytes=%s byte_offset=%s",
+            user_id,
+            mode,
+            len(candidates),
+            token_sum,
+            total,
+            offset,
+        )
     if not should_run:
         save_indexer_state(user_id, state)
         return {
@@ -989,12 +1010,18 @@ def main(timer: func.TimerRequest) -> None:
 
     thresholds = _thresholds_from_env()
     openai_client = OpenAI(api_key=openai_key)
+    batch_mult = max(1, _safe_int(os.environ.get("WP7_BATCH_SIZE_MULTIPLIER"), 9))
+    base_target = _safe_int(os.environ.get("WP7_TARGET_BATCH_TOKENS"), 1000)
+    base_hard_min = _safe_int(os.environ.get("WP7_HARD_MIN_BATCH_TOKENS"), 600)
     logging.info(
-        "WP7: timer_start user_ids=%s mode=%s target_tokens=%s hard_min_tokens=%s max_wait_s=%s max_items=%s",
+        "WP7: timer_start user_ids=%s mode=%s multiplier=%s target_tokens_eff=%s hard_min_eff=%s (base_target=%s base_hard_min=%s) max_wait_s=%s max_items=%s",
         ",".join(user_ids),
         _wp7_mode(),
+        batch_mult,
         thresholds.target_tokens,
         thresholds.hard_min_tokens,
+        base_target,
+        base_hard_min,
         thresholds.max_wait_seconds,
         thresholds.max_items_per_run,
     )
@@ -1002,7 +1029,8 @@ def main(timer: func.TimerRequest) -> None:
     for user_id in user_ids:
         try:
             result = _run_for_user(openai_client, prompt_id, user_id, thresholds)
-            logging.info(f"WP7 indexer tick: {json.dumps(result, ensure_ascii=False)}")
+            if _wp7_log_verbose():
+                logging.info(f"WP7 indexer tick: {json.dumps(result, ensure_ascii=False)}")
         except AzureError as e:
             logging.error(f"WP7 indexer tick AzureError user_id={user_id}: {e}")
         except Exception as e:

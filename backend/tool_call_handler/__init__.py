@@ -46,7 +46,9 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 ASSISTANT_ID = os.environ.get("OPENAI_ASSISTANT_ID", "")
 OPENAI_PROMPT_ID = os.environ.get("OPENAI_PROMPT_ID", "")
 LLM_RUNTIME_DEFAULT = os.environ.get("LLM_RUNTIME", "assistants")
-HANDLES_CACHE_TTL_SECONDS = int(os.environ.get("HANDLES_CACHE_TTL_SECONDS", "60") or 60)
+# Cache `handles.json` in-memory to avoid repeated blob reads.
+# Default TTL is 10 minutes to tolerate long responses/tool loops without frequent cache refresh.
+HANDLES_CACHE_TTL_SECONDS = int(os.environ.get("HANDLES_CACHE_TTL_SECONDS", "600") or 600)
 PROXY_URL = os.environ.get("AZURE_PROXY_URL", "")
 PROXY_FUNCTION_KEY = os.environ.get("FUNCTION_CODE_PROXY_ROUTER", "")
 ENABLE_SAVE_INTERACTION = True  # Hardcoded to always enable saving for now
@@ -57,6 +59,210 @@ OPENAI_MAX_REQUESTS = int(os.environ.get("OPENAI_MAX_REQUESTS", "0") or 0)
 _openai_lock = threading.Lock()
 _openai_count = 0
 _handles_cache: Dict[str, Dict[str, Any]] = {}
+
+# WP6.M1: preferences cache (best-effort; no hard dependency)
+_prefs_cache: Dict[str, Dict[str, Any]] = {}
+PREFERENCES_CACHE_TTL_SECONDS = int(os.environ.get("PREFERENCES_CACHE_TTL_SECONDS", "600") or 600)
+WP6_PREFERENCES_AUTO_CREATE = str(os.environ.get("WP6_PREFERENCES_AUTO_CREATE", "1") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+)
+_prefs_loading = threading.local()
+
+def _inprocess_call_function_main(main_fn, user_id: str, *, params: Dict[str, Any] | None = None, body: Dict[str, Any] | None = None):
+    """
+    Call an Azure Functions `main(req)` handler in-process without going through `execute_tool_call()`.
+
+    Purpose: avoid recursion (e.g. preferences loading calling execute_tool_call calling preferences loading).
+    """
+    class _Req:
+        def __init__(self, _params: Dict[str, Any] | None, _body: Dict[str, Any] | None, _user_id: str):
+            self.headers = {"x-user-id": str(_user_id), "X-User-Id": str(_user_id)}
+            self.params = dict(_params or {})
+            self._body = dict(_body or {})
+
+        def get_json(self):
+            return dict(self._body)
+
+    return main_fn(_Req(params, body, user_id))
+
+
+def _inprocess_read_blob_file(user_id: str, file_name: str) -> Dict[str, Any]:
+    from read_blob_file import main as read_blob_file_main
+    resp = _inprocess_call_function_main(read_blob_file_main, user_id, params={"file_name": file_name})
+    try:
+        body_text = resp.get_body().decode("utf-8") if hasattr(resp, "get_body") else str(resp)
+        return json.loads(body_text) if body_text else {}
+    except Exception:
+        return {}
+
+
+def _inprocess_upload_data_or_file(user_id: str, target_blob_name: str, file_content: Any) -> Dict[str, Any]:
+    from upload_data_or_file import main as upload_main
+    resp = _inprocess_call_function_main(
+        upload_main,
+        user_id,
+        body={"target_blob_name": target_blob_name, "file_content": file_content, "user_id": user_id},
+    )
+    try:
+        body_text = resp.get_body().decode("utf-8") if hasattr(resp, "get_body") else str(resp)
+        return json.loads(body_text) if body_text else {}
+    except Exception:
+        return {}
+
+
+def _load_preferences(user_id: str) -> Dict[str, Any]:
+    """
+    Load users/{user_id}/semantics/preferences.json (best-effort).
+
+    Behavior:
+    - If missing/invalid, returns {}.
+    - Cached in-memory for PREFERENCES_CACHE_TTL_SECONDS.
+    """
+    uid = str(user_id or "default").strip() or "default"
+    if PREFERENCES_CACHE_TTL_SECONDS > 0:
+        cached = _prefs_cache.get(uid)
+        if cached:
+            age = time.time() - cached.get("ts", 0)
+            if age <= PREFERENCES_CACHE_TTL_SECONDS:
+                return cached.get("data", {}) or {}
+    try:
+        setattr(_prefs_loading, "active", True)
+        payload = _inprocess_read_blob_file(uid, "semantics/preferences.json")
+        if isinstance(payload, dict) and payload.get("status") == "success":
+            prefs = payload.get("data")
+            if isinstance(prefs, str):
+                try:
+                    prefs = json.loads(prefs)
+                except Exception:
+                    prefs = {}
+            if isinstance(prefs, dict):
+                if PREFERENCES_CACHE_TTL_SECONDS > 0:
+                    _prefs_cache[uid] = {"data": prefs, "ts": time.time()}
+                return prefs
+
+        if WP6_PREFERENCES_AUTO_CREATE and isinstance(payload, dict) and payload.get("error"):
+            err_text = str(payload.get("error") or "").lower()
+            if "not found" in err_text or "blobnotfound" in err_text:
+                default_prefs = {
+                    "schema_version": "omniflow.wp6.preferences.v1",
+                    "updated_utc": datetime.datetime.utcnow().isoformat() + "Z",
+                    "brevity": "medium",
+                    "fast_mode": False,
+                    "allowed_reads": [],
+                    "disable_history_reads": False,
+                }
+                try:
+                    _inprocess_upload_data_or_file(uid, "semantics/preferences.json", default_prefs)
+                    if PREFERENCES_CACHE_TTL_SECONDS > 0:
+                        _prefs_cache[uid] = {"data": default_prefs, "ts": time.time()}
+                    return default_prefs
+                except Exception:
+                    pass
+        return {}
+    except Exception:
+        return {}
+    finally:
+        try:
+            setattr(_prefs_loading, "active", False)
+        except Exception:
+            pass
+
+
+def _bool_pref(prefs: Dict[str, Any], key: str, default: bool = False) -> bool:
+    try:
+        if key in (prefs or {}):
+            return str(prefs.get(key) or "").strip().lower() in ("1", "true", "yes", "y", "on")
+    except Exception:
+        pass
+    return default
+
+
+def _list_pref(prefs: Dict[str, Any], key: str) -> list:
+    v = (prefs or {}).get(key)
+    if isinstance(v, list):
+        out = []
+        for item in v:
+            s = str(item or "").strip()
+            if s:
+                out.append(s)
+        return out
+    return []
+
+
+def _wp6_is_history_path(file_name: str) -> bool:
+    fn = str(file_name or "").strip().lower()
+    return fn == "interaction_logs.json" or fn.startswith("interactions/")
+
+
+def _wp6_is_semantic_ok(file_name: str) -> bool:
+    fn = str(file_name or "").strip().lower()
+    # WP7 semantic artifacts are the intended source for cheap context rebuild.
+    return fn.startswith("interactions/semantic/") or fn.startswith("interactions/portfolio/")
+
+
+def _wp6_allowed_to_read(tool_name: str, normalized_args: Dict[str, Any], prefs: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Enforce WP6.M1 preferences on read-style tools.
+
+    - disable_history_reads blocks: get_interaction_history and interaction_logs/interactions reads (except semantic/portfolio).
+    - allowed_reads (if non-empty) restricts read targets to the allowlist (plus always-needed system files).
+    """
+    tool = str(tool_name or "").strip()
+    args = dict(normalized_args or {})
+
+    disable_history = _bool_pref(prefs, "disable_history_reads", False)
+    allowed_reads = set([s.strip() for s in _list_pref(prefs, "allowed_reads") if str(s).strip()])
+
+    always_allowed_files = {
+        "handles.json",
+        "current_thread.json",
+        "semantics/preferences.json",
+        "agent_exchange/agent_exchange.jsonl",
+    }
+
+    # If allowlist is active, block list_blobs to prevent broad browsing.
+    if tool == "list_blobs" and allowed_reads:
+        return False, "Blocked by preferences: allowed_reads is set; prefer read_blob_file/read_many_blobs on allowlisted files."
+
+    if tool == "get_interaction_history" and disable_history:
+        return False, "Blocked by preferences: disable_history_reads=true (use semantic index instead)."
+
+    # Determine read targets by tool
+    targets: list[str] = []
+    if tool == "read_blob_file":
+        targets = [str(args.get("file_name") or "").strip()]
+    elif tool == "read_many_blobs":
+        files = args.get("files")
+        if isinstance(files, list):
+            targets = [str(x or "").strip() for x in files]
+    elif tool == "get_filtered_data":
+        targets = [str(args.get("target_blob_name") or "").strip()]
+
+    targets = [t for t in targets if t]
+    if not targets:
+        return True, ""
+
+    # History gating
+    if disable_history:
+        for t in targets:
+            if _wp6_is_history_path(t) and not _wp6_is_semantic_ok(t):
+                return False, f"Blocked by preferences: disable_history_reads=true (target={t})."
+
+    # Allowlist gating (if present)
+    if allowed_reads:
+        for t in targets:
+            if t in always_allowed_files:
+                continue
+            if _wp6_is_semantic_ok(t):
+                continue
+            if t not in allowed_reads:
+                return False, f"Blocked by preferences: target not in allowed_reads (target={t})."
+
+    return True, ""
 
 # Optional global (cross-process) limit for tests. If set (>0), this will be
 # enforced by a simple file-based counter in `backend/logs/openai_global_counter.json`.
@@ -173,8 +379,13 @@ def normalize_tool_arguments(tool_name: str, tool_arguments: Dict[str, Any]) -> 
     if tool_name == "read_blob_file":
         file_name = pop_first("file_name", "target_blob_name", "blob_name", "name")
         if file_name:
-            if "/" in file_name:
-                file_name = file_name.split("/")[-1]
+            # Preserve user-relative paths (e.g. "interactions/semantic/index.jsonl").
+            # If the assistant passes "users/<id>/<path>", normalize to "<path>".
+            parts = [p for p in str(file_name).strip().split("/") if p]
+            if len(parts) >= 3 and parts[0].lower() == "users":
+                file_name = "/".join(parts[2:])
+            else:
+                file_name = "/".join(parts)
             args["file_name"] = file_name
 
     elif tool_name == "get_filtered_data":
@@ -492,6 +703,9 @@ def run_responses(openai_client: OpenAI, user_id: str, user_message: str, thread
     all_tool_calls = []
     current_input: Any = user_message or ""
     retried_without_previous = False
+    responses_max_output_tokens = int(os.environ.get("RESPONSES_MAX_OUTPUT_TOKENS", "4096") or 4096)
+    retried_with_smaller_output = False
+    retried_after_tpm_reset = False
 
     for _ in range(25):
         create_kwargs: Dict[str, Any] = {
@@ -499,6 +713,9 @@ def run_responses(openai_client: OpenAI, user_id: str, user_message: str, thread
             "input": current_input,
             "tool_choice": "auto",
             "parallel_tool_calls": False,
+            # Important: without an explicit cap, the Prompt/model defaults may request very large output budgets,
+            # which can blow TPM limits even for tiny user prompts (because conversation history is server-side).
+            "max_output_tokens": responses_max_output_tokens,
             "metadata": {"user_id": str(user_id), "thread_id": str(thread_id), "runtime": "responses"},
         }
         if conversation_id:
@@ -509,11 +726,56 @@ def run_responses(openai_client: OpenAI, user_id: str, user_message: str, thread
         try:
             response = _openai_call(openai_client.responses.create, **create_kwargs)
         except Exception as exc:
+            msg = str(exc)
+            # If the request exceeds TPM due to a large server-side conversation context + large output budget,
+            # retry once with a much smaller max_output_tokens.
+            if (
+                (not retried_with_smaller_output)
+                and responses_max_output_tokens > 1024
+                and ("Request too large" in msg or "tokens per min" in msg or "TPM" in msg)
+            ):
+                retried_with_smaller_output = True
+                old = responses_max_output_tokens
+                responses_max_output_tokens = 1024
+                logging.warning(
+                    "Responses request hit TPM size limit; retrying with smaller max_output_tokens "
+                    f"user_id={user_id} thread_id={thread_id} old={old} new={responses_max_output_tokens}"
+                )
+                continue
+
+            # If shrinking output isn't enough, the server-side conversation history itself can exceed TPM.
+            # Self-heal by resetting persisted continuation pointers for this thread, then retry once.
+            if (
+                (not retried_after_tpm_reset)
+                and ("Request too large" in msg or "tokens per min" in msg or "TPM" in msg)
+                and (previous_response_id or conversation_id)
+                and isinstance(current_input, (str, bytes))
+            ):
+                retried_after_tpm_reset = True
+                logging.warning(
+                    "Responses request hit TPM size limit; resetting conversation continuation (previous_response_id + conversation) "
+                    f"user_id={user_id} thread_id={thread_id}"
+                )
+                previous_response_id = ""
+                conversation_id = ""
+                # Persist cleared continuation so subsequent calls don't keep failing.
+                try:
+                    if isinstance(handles, dict):
+                        handles[thread_id] = {
+                            **(state if isinstance(state, dict) else {}),
+                            "responses_conversation_id": "",
+                            "responses_last_response_id": "",
+                            "active_runtime": "responses",
+                            "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+                        }
+                        _save_handles(user_id, handles, async_save=True)
+                except Exception:
+                    pass
+                continue
             # If the last persisted `previous_response_id` points to a response that had pending tool calls
             # (e.g., crash before tool outputs were submitted), OpenAI rejects new input with:
             # "No tool output found for function call call_...". We can safely self-heal by retrying once
             # without previous_response_id (conversation id may still be kept).
-            msg = str(exc)
             if (
                 (not retried_without_previous)
                 and previous_response_id
@@ -1137,6 +1399,27 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
     normalized_args = normalize_tool_arguments(tool_name, tool_arguments)
     params_with_user = {**(normalized_args or {}), "user_id": user_id}
     logging.debug(f"Dispatching tool={tool_name} with params={params_with_user}")
+
+    # WP6.M1 preferences enforcement (best-effort).
+    # Goal: reduce costly/history reads and prevent agent "browsing" beyond allowlisted files.
+    try:
+        # Prevent recursion while loading preferences.
+        if not getattr(_prefs_loading, "active", False):
+            prefs = _load_preferences(user_id)
+            allowed, reason = _wp6_allowed_to_read(tool_name, normalized_args, prefs)
+            if not allowed:
+                duration_ms = (time.time() - start_time) * 1000
+                info = {
+                    "tool_name": tool_name,
+                    "arguments": normalized_args,
+                    "status": "failed",
+                    "duration_ms": duration_ms,
+                    "error": reason,
+                    "code": "preferences_blocked",
+                }
+                return json.dumps({"error": reason, "code": "preferences_blocked"}), info
+    except Exception:
+        pass
 
     # Try in-process dispatch first
     try:

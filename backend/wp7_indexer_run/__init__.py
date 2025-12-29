@@ -42,6 +42,10 @@ def _parse_bool(value: Any) -> bool:
     return str(value or "").strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _wp7_log_verbose() -> bool:
+    return str(os.environ.get("WP7_LOG_VERBOSE", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def _wp7_enabled() -> bool:
     return str(os.environ.get("WP7_ENABLED", "1") or "").strip().lower() in ("1", "true", "yes", "y", "on")
 
@@ -112,11 +116,28 @@ def _load_thresholds(req: func.HttpRequest) -> QueueThresholds:
         body = req.get_json() if req.method.lower() == "post" else {}
     except Exception:
         body = {}
+    batch_mult = _safe_int(body.get("batch_size_multiplier") or os.environ.get("WP7_BATCH_SIZE_MULTIPLIER"), 9)
+    batch_mult = max(1, batch_mult)
+    if _wp7_log_verbose():
+        base_target = _safe_int(body.get("target_tokens") or os.environ.get("WP7_TARGET_BATCH_TOKENS"), 1000)
+        base_hard = _safe_int(body.get("hard_min_tokens") or os.environ.get("WP7_HARD_MIN_BATCH_TOKENS"), 600)
+        max_wait = _safe_int(body.get("max_wait_seconds") or os.environ.get("WP7_MAX_WAIT_SECONDS"), 300)
+        max_items = min(_safe_int(body.get("max_items_per_run") or os.environ.get("WP7_MAX_ITEMS_PER_RUN"), 25), 25)
+        logging.info(
+            "WP7(run): thresholds multiplier=%s target_tokens_eff=%s hard_min_eff=%s (base_target=%s base_hard_min=%s) max_wait_s=%s max_items=%s",
+            batch_mult,
+            base_target * batch_mult,
+            base_hard * batch_mult,
+            base_target,
+            base_hard,
+            max_wait,
+            max_items,
+        )
     return QueueThresholds(
-        target_tokens=_safe_int(body.get("target_tokens") or os.environ.get("WP7_TARGET_BATCH_TOKENS"), 1000),
-        hard_min_tokens=_safe_int(body.get("hard_min_tokens") or os.environ.get("WP7_HARD_MIN_BATCH_TOKENS"), 600),
+        target_tokens=_safe_int(body.get("target_tokens") or os.environ.get("WP7_TARGET_BATCH_TOKENS"), 1000) * batch_mult,
+        hard_min_tokens=_safe_int(body.get("hard_min_tokens") or os.environ.get("WP7_HARD_MIN_BATCH_TOKENS"), 600) * batch_mult,
         max_wait_seconds=_safe_int(body.get("max_wait_seconds") or os.environ.get("WP7_MAX_WAIT_SECONDS"), 300),
-        max_items_per_run=_safe_int(body.get("max_items_per_run") or os.environ.get("WP7_MAX_ITEMS_PER_RUN"), 25),
+        max_items_per_run=min(_safe_int(body.get("max_items_per_run") or os.environ.get("WP7_MAX_ITEMS_PER_RUN"), 25), 25),
         max_user_chars=_safe_int(os.environ.get("WP7_MAX_USER_CHARS"), 2000),
         max_assistant_chars=_safe_int(os.environ.get("WP7_MAX_ASSISTANT_CHARS"), 4000),
     )
