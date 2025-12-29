@@ -310,7 +310,12 @@ def _wp6_extract_semantic_ids_from_index(index_jsonl_text: str, max_ids: int) ->
 
 
 def _wp6_fast_context_from_wp7_semantic(user_id: str, max_sources: int, max_chars: int) -> Tuple[str, Dict[str, Any]]:
-    meta: Dict[str, Any] = {"semantic_candidates_count": 0, "selected_sources_count": 0, "raw_bytes_read": 0}
+    meta: Dict[str, Any] = {
+        "semantic_candidates_count": 0,
+        "selected_sources_count": 0,
+        "raw_bytes_read": 0,
+        "candidate_sources": [],
+    }
 
     # Tail the semantic index
     idx_str, _ = execute_tool_call(
@@ -389,6 +394,15 @@ def _wp6_fast_context_from_wp7_semantic(user_id: str, max_sources: int, max_char
         if (sum(len(x) + 1 for x in out_lines) + len(line)) > max_chars:
             break
         out_lines.append(line)
+        try:
+            meta["candidate_sources"].append(
+                {
+                    "path": f"interactions/semantic/{iid}.json",
+                    "excerpt_or_snippet": summ[:400],
+                }
+            )
+        except Exception:
+            pass
         used += 1
 
     meta["selected_sources_count"] = used
@@ -425,17 +439,14 @@ def _wp6_load_cached_pack_from_handles(state: Dict[str, Any], intent_key: str) -
         created_ts = float(pack.get("created_ts") or 0.0)
         if not created_ts or (time.time() - created_ts) > WP6_CONTEXT_PACK_TTL_SECONDS:
             return "", False
-        pack_id = str(pack.get("pack_id") or "").strip()
-        return pack_id, bool(pack_id)
+        pack_path = str(pack.get("path") or "").strip()
+        return pack_path, bool(pack_path)
     except Exception:
         return "", False
 
 
 def _wp6_save_pack_to_blob(user_id: str, pack: Dict[str, Any]) -> str:
-    pack_id = str(pack.get("pack_id") or "").strip()
-    if not pack_id:
-        pack_id = f"pack_{uuid.uuid4().hex[:12]}"
-        pack["pack_id"] = pack_id
+    pack_id = f"pack_{uuid.uuid4().hex[:12]}"
     path = f"semantics/context_packs/{pack_id}.json"
     execute_tool_call("upload_data_or_file", {"target_blob_name": path, "file_content": pack}, user_id)
     return path
@@ -449,21 +460,21 @@ def _wp6_build_or_reuse_context_pack(
     state: Dict[str, Any],
     fast_ctx: str,
     intent_key: str,
+    candidate_sources: list[dict] | None = None,
 ) -> Tuple[str, Dict[str, Any]]:
-    meta: Dict[str, Any] = {"intent_key": intent_key, "pack_reused": False, "pack_path": "", "pack_id": "", "pack_tokens_est": 0}
+    meta: Dict[str, Any] = {"intent_key": intent_key, "pack_reused": False, "pack_path": "", "pack_tokens_est": 0}
 
-    pack_id, ok = _wp6_load_cached_pack_from_handles(state, intent_key)
+    pack_path_cached, ok = _wp6_load_cached_pack_from_handles(state, intent_key)
     if ok:
         try:
-            pack_str, _ = execute_tool_call("read_blob_file", {"file_name": f"semantics/context_packs/{pack_id}.json"}, user_id)
+            pack_str, _ = execute_tool_call("read_blob_file", {"file_name": pack_path_cached}, user_id)
             pack_payload = json.loads(pack_str) if isinstance(pack_str, str) else {}
             if isinstance(pack_payload, dict) and pack_payload.get("status") == "success":
                 pack = pack_payload.get("data")
                 if isinstance(pack, dict):
                     meta["pack_reused"] = True
-                    meta["pack_id"] = pack_id
-                    meta["pack_path"] = f"semantics/context_packs/{pack_id}.json"
-                    meta["pack_tokens_est"] = int(((pack.get("estimates") or {}).get("estimated_tokens_selected") or 0))
+                    meta["pack_path"] = pack_path_cached
+                    meta["pack_tokens_est"] = int(pack.get("pack_tokens_est") or 0)
                     return json.dumps(pack, ensure_ascii=False), meta
         except Exception:
             pass
@@ -472,14 +483,15 @@ def _wp6_build_or_reuse_context_pack(
         meta["error"] = "OPENAI_CONTEXT_BUILDER_PROMPT_ID not set"
         return "", meta
 
+    # Contract: {request, candidate_sources[], constraints}
+    cand = list(candidate_sources or [])
+    if not cand:
+        cand = [{"path": "interactions/semantic/index.jsonl", "excerpt_or_snippet": str(fast_ctx or "")[:1200]}]
+
     cb_input = {
-        "schema_version": "omniflow.wp6.context_builder_input.v1",
-        "user_id": str(user_id),
-        "thread_id": str(thread_id),
-        "intent_key": intent_key,
-        "user_message": str(user_message or ""),
-        "fast_semantic_context": str(fast_ctx or ""),
-        "constraints": {"max_pack_tokens_est": WP6_DEEP_MAX_PACK_TOKENS},
+        "request": {"user_prompt": str(user_message or "")},
+        "candidate_sources": cand[:12],
+        "constraints": {"max_pack_tokens": WP6_DEEP_MAX_PACK_TOKENS, "max_bullets": 6, "max_top_sources": 5},
     }
 
     cb_kwargs: Dict[str, Any] = {
@@ -494,22 +506,23 @@ def _wp6_build_or_reuse_context_pack(
         pack = json.loads(cb_text) if cb_text else {}
     except Exception:
         pack = {}
-    if not isinstance(pack, dict) or pack.get("schema_version") != "omniflow.wp6.context_pack.v1":
-        meta["error"] = "invalid_context_pack_output"
+    # Accept the configured schema (mode, summary, bullets, top_sources, pack_tokens_est, coverage, need_more_sources, created_utc)
+    required_keys = ("mode", "summary", "bullets", "top_sources", "pack_tokens_est", "coverage", "need_more_sources", "created_utc")
+    if not isinstance(pack, dict) or any(k not in pack for k in required_keys):
+        meta["error"] = "invalid_context_pack_output_schema"
         return "", meta
 
     try:
         pack_path = _wp6_save_pack_to_blob(user_id, pack)
         meta["pack_path"] = pack_path
-        meta["pack_id"] = str(pack.get("pack_id") or "")
-        meta["pack_tokens_est"] = int(((pack.get("estimates") or {}).get("estimated_tokens_selected") or 0))
+        meta["pack_tokens_est"] = int(pack.get("pack_tokens_est") or 0)
         try:
             handles = _load_handles(user_id)
             if isinstance(handles, dict):
                 thread_state = handles.get(thread_id, {}) if isinstance(handles.get(thread_id), dict) else {}
                 handles[thread_id] = {
                     **thread_state,
-                    "context_pack": {"pack_id": meta["pack_id"], "intent_key": intent_key, "created_ts": time.time()},
+                    "context_pack": {"path": pack_path, "intent_key": intent_key, "created_ts": time.time()},
                     "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
                 }
                 _save_handles(user_id, handles, async_save=True)
@@ -1994,6 +2007,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         state=state_for_thread if isinstance(state_for_thread, dict) else {},
                         fast_ctx=fast_ctx,
                         intent_key=intent_key,
+                        candidate_sources=list((fast_meta or {}).get("candidate_sources") or []),
                     )
                     wp6_meta.update(pack_meta)
                     if pack_text:
