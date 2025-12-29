@@ -29,6 +29,7 @@ from shared.wp7_indexer import (
     append_batch_audit_item,
     append_semantic_index_item,
     append_uncategorized_portfolio_item,
+    backfill_semantic_index_if_empty,
     build_batch_audit_item,
     build_semantic_index_item,
     compact_indexer_items,
@@ -38,6 +39,7 @@ from shared.wp7_indexer import (
     load_indexer_state,
     save_indexer_state,
     utc_now_iso,
+    wp7_text_json_schema_format,
 )
 
 
@@ -346,6 +348,10 @@ def _submit_openai_batch(
         "input": input_text,
         "tool_choice": "none",
         "parallel_tool_calls": False,
+        # Enforce strict output at request-time (not only in Dashboard prompt settings).
+        "text": wp7_text_json_schema_format(),
+        # Keep reasoning minimal to avoid "completed but no output_text" / incomplete outputs.
+        "reasoning": {"effort": "minimal"},
         "max_output_tokens": max_output_tokens,
         # Avoid storing the response on OpenAI side unless explicitly needed.
         "store": False,
@@ -675,6 +681,11 @@ def _thresholds_from_env() -> QueueThresholds:
 def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, thresholds: QueueThresholds) -> Dict[str, Any]:
     mode = _wp7_mode()
     logging.info(f"WP7: tick user_id={user_id} mode={mode}")
+    try:
+        max_backfill = _safe_int(os.environ.get("WP7_INDEX_BACKFILL_MAX_ITEMS"), 250)
+        backfill_semantic_index_if_empty(user_id, max_items=max_backfill)
+    except Exception as e:
+        logging.warning("WP7 semantic index backfill failed user_id=%s: %s", user_id, e)
     if mode == "batch":
         bs = _load_batch_state(user_id)
         if _is_active_batch_state(bs):

@@ -24,6 +24,7 @@ from shared.wp7_indexer import (
     WP7_UNCATEGORIZED_SCHEMA_V1,
     append_semantic_index_item,
     append_uncategorized_portfolio_item,
+    backfill_semantic_index_if_empty,
     build_semantic_index_item,
     compact_indexer_items,
     dedup_items_by_intent_norm,
@@ -32,6 +33,7 @@ from shared.wp7_indexer import (
     load_indexer_state,
     save_indexer_state,
     utc_now_iso,
+    wp7_text_json_schema_format,
 )
 
 
@@ -159,6 +161,8 @@ def _call_indexer_model(openai_client: OpenAI, prompt_id: str, items: List[Dict[
         input=input_text,
         tool_choice="none",
         parallel_tool_calls=False,
+        text=wp7_text_json_schema_format(),
+        reasoning={"effort": "minimal"},
         max_output_tokens=max_output_tokens,
         store=False,
         metadata={"runtime": "wp7_indexer"},
@@ -286,6 +290,12 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=503,
         )
+
+    try:
+        max_backfill = _safe_int(os.environ.get("WP7_INDEX_BACKFILL_MAX_ITEMS"), 250)
+        backfill_semantic_index_if_empty(user_id, max_items=max_backfill)
+    except Exception as e:
+        logging.warning("WP7 semantic index backfill failed user_id=%s: %s", user_id, e)
 
     try:
         body = req.get_json() if req.method.lower() == "post" else {}

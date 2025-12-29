@@ -47,6 +47,81 @@ WP7_SEMANTIC_INDEX_SCHEMA_V1 = "omniflow.wp7.semantic_index.v1"
 WP7_UNCATEGORIZED_SCHEMA_V1 = "omniflow.wp7.uncategorized.v1"
 WP7_BATCH_AUDIT_SCHEMA_V1 = "omniflow.wp7.batch_audit.v1"
 
+WP7_INTERACTION_ITEMS_SCHEMA_V1 = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "description": "A list of interaction item objects.",
+            "maxItems": 25,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "interaction_id": {
+                        "type": "string",
+                        "description": "Unique identifier starting with 'INT_'.",
+                        "pattern": "^INT_.*",
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Interaction category: PE, UI, ML, LO, PS, TM, SYS, GEN, or ID.",
+                        "enum": ["PE", "UI", "ML", "LO", "PS", "TM", "SYS", "GEN", "ID"],
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Concise summary in the format: Intent; Action(tool); Result (Scope). 1–2 sentences, max 220 characters.",
+                        "maxLength": 220,
+                    },
+                    "tags": {
+                        "type": "array",
+                        "description": "3–6 stable lowercase-kebab-case tags.",
+                        "minItems": 3,
+                        "maxItems": 6,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                        },
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "description": "Confidence score (float between 0.0 and 1.0).",
+                        "minimum": 0,
+                        "maximum": 1,
+                    },
+                    "signal_level": {
+                        "type": "string",
+                        "description": "Strength of the signal: low, medium, or high.",
+                        "enum": ["low", "medium", "high"],
+                    },
+                },
+                "required": ["interaction_id", "category", "summary", "tags", "confidence", "signal_level"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["items"],
+    "additionalProperties": False,
+}
+
+
+def wp7_text_json_schema_format() -> Dict[str, Any]:
+    """
+    Responses API text.format for the WP7 indexer output.
+
+    This is enforced at request-time (in addition to any Dashboard prompt settings) to prevent:
+    - invalid JSON (e.g., "Unterminated string ..." parse errors)
+    - partial/non-JSON outputs drifting into the batch output file
+    """
+    return {
+        "format": {
+            "type": "json_schema",
+            "name": "interaction_items",
+            "strict": True,
+            "schema": WP7_INTERACTION_ITEMS_SCHEMA_V1,
+        }
+    }
+
 
 def utc_now_iso() -> str:
     return _dt.datetime.utcnow().replace(tzinfo=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
@@ -295,7 +370,7 @@ def append_semantic_index_item(user_id: str, item: Dict[str, Any]) -> None:
 
     client = _get_append_blob_client(user_id, WP7_SEMANTIC_INDEX_BLOB_NAME)
     try:
-        _append_jsonl_line(client, line)
+        _append_jsonl_line(client, line, user_id=user_id, blob_label=WP7_SEMANTIC_INDEX_BLOB_NAME)
     except AzureError as e:
         logging.error(f"WP7 append_semantic_index_item failed: {e}")
         raise
@@ -313,6 +388,78 @@ def append_batch_audit_item(user_id: str, item: Dict[str, Any]) -> None:
     except AzureError as e:
         logging.error(f"WP7 append_batch_audit_item failed: {e}")
         raise
+
+
+def backfill_semantic_index_if_empty(
+    user_id: str,
+    *,
+    max_items: int = 250,
+) -> Dict[str, Any]:
+    """
+    One-time helper: if the per-user semantic index is empty (0 bytes) but semantic artifacts exist,
+    rebuild the index by appending entries derived from existing artifacts.
+
+    Safety:
+    - Runs only when index blob size is exactly 0.
+    - Limits work to `max_items` artifacts to avoid heavy scans.
+    """
+    if max_items <= 0:
+        return {"status": "skipped", "reason": "max_items<=0", "user_id": user_id, "indexed": 0}
+
+    index_bc = AzureBlobClient.get_blob_client(WP7_SEMANTIC_INDEX_BLOB_NAME, user_id)
+    try:
+        props = index_bc.get_blob_properties()
+        size = int(getattr(props, "size", 0) or 0)
+    except ResourceNotFoundError:
+        size = 0
+
+    if size != 0:
+        return {"status": "skipped", "reason": "index_not_empty", "user_id": user_id, "indexed": 0, "index_size": size}
+
+    try:
+        filenames = AzureBlobClient.list_user_blobs(user_id, prefix=WP7_SEMANTIC_PREFIX)
+    except Exception as e:
+        logging.warning("WP7 index backfill list failed user_id=%s: %s", user_id, e)
+        return {"status": "failed", "reason": "list_failed", "user_id": user_id, "indexed": 0}
+
+    semantic_files = [
+        name
+        for name in filenames
+        if isinstance(name, str)
+        and name.startswith(WP7_SEMANTIC_PREFIX)
+        and name[len(WP7_SEMANTIC_PREFIX) :].startswith("INT_")
+        and name.endswith(".json")
+    ]
+    if not semantic_files:
+        return {"status": "skipped", "reason": "no_semantic_files", "user_id": user_id, "indexed": 0}
+
+    semantic_files = sorted(semantic_files)[:max_items]
+    indexed = 0
+    for blob_name in semantic_files:
+        interaction_id = blob_name[len(WP7_SEMANTIC_PREFIX) : -len(".json")]
+        try:
+            bc = AzureBlobClient.get_blob_client(blob_name, user_id)
+            raw = bc.download_blob().readall()
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                continue
+            semantic_blob_path = f"users/{user_id}/{blob_name}"
+            append_semantic_index_item(
+                user_id,
+                build_semantic_index_item(
+                    payload,
+                    user_id=user_id,
+                    interaction_id=interaction_id,
+                    semantic_blob_path=semantic_blob_path,
+                ),
+            )
+            indexed += 1
+        except Exception as e:
+            logging.warning("WP7 index backfill item failed user_id=%s blob=%s: %s", user_id, blob_name, e)
+            continue
+
+    logging.info("WP7: semantic index backfilled user_id=%s indexed=%s (index was empty)", user_id, indexed)
+    return {"status": "backfilled", "user_id": user_id, "indexed": indexed, "max_items": max_items}
 
 
 def extract_tools_used(tool_calls: Any, *, max_items: int = 25) -> List[str]:
