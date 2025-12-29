@@ -496,7 +496,8 @@ def _wp6_build_or_reuse_context_pack(
 
     cb_kwargs: Dict[str, Any] = {
         "prompt": {"id": OPENAI_CONTEXT_BUILDER_PROMPT_ID},
-        "input": cb_input,
+        # Responses API requires `input` to be a string or array of input items; provide JSON as a string.
+        "input": json.dumps(cb_input, ensure_ascii=False),
         "max_output_tokens": min(WP6_DEEP_MAX_PACK_TOKENS, 8192),
         "metadata": {"user_id": str(user_id), "thread_id": str(thread_id), "runtime": "context_builder"},
     }
