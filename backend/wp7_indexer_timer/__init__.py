@@ -334,8 +334,10 @@ def _submit_openai_batch(
     member_to_rep: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
     input_text = _create_indexer_input(batch_items)
-    per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 180)
-    max_output_tokens = max(256, min(4096, 128 + (max(1, len(batch_items)) * max(60, per_item))))
+    # Guard against incomplete batch outputs (no output_text) when the model spends most of the
+    # budget on reasoning. Keep a sensible floor and allow env overrides.
+    per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 400)
+    max_output_tokens = max(1024, min(4096, 128 + (max(1, len(batch_items)) * max(60, per_item))))
 
     model = str(os.environ.get("OPENAI_INDEXER_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-5-mini").strip()
     body = {
@@ -367,12 +369,14 @@ def _submit_openai_batch(
             metadata={"kind": "wp7_indexer", "user_id": str(user_id)},
         )
         logging.info(
-            "WP7: batch_submitted user_id=%s batch_id=%s input_file_id=%s model=%s custom_id=%s",
+            "WP7: batch_submitted user_id=%s batch_id=%s input_file_id=%s model=%s custom_id=%s items=%s max_output_tokens=%s",
             user_id,
             getattr(batch, "id", None),
             getattr(file_obj, "id", None),
             model,
             custom_id,
+            len(batch_items),
+            max_output_tokens,
         )
         try:
             append_batch_audit_item(
@@ -629,8 +633,8 @@ def _resync_offset_to_newline(user_id: str, *, offset: int, lookback: int = 8192
 
 def _call_indexer_model(openai_client: OpenAI, prompt_id: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     input_text = _create_indexer_input(items)
-    per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 180)
-    max_output_tokens = max(256, min(4096, 128 + (max(1, len(items)) * max(60, per_item))))
+    per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 400)
+    max_output_tokens = max(1024, min(4096, 128 + (max(1, len(items)) * max(60, per_item))))
     resp = openai_client.responses.create(
         prompt={"id": prompt_id},
         input=input_text,
@@ -850,14 +854,17 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
             iid = str(it.get("interaction_id") or "").strip()
             if iid:
                 submitted_rep_ids.append(iid)
+        per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 400)
+        planned_max_output_tokens = max(1024, min(4096, 128 + (max(1, len(rep_items)) * max(60, per_item))))
         logging.info(
-            "WP7: batch_submit user_id=%s candidates=%s submitted=%s submitted_reps=%s tokens_sum=%s planned_advance_bytes=%s",
+            "WP7: batch_submit user_id=%s candidates=%s submitted=%s submitted_reps=%s tokens_sum=%s planned_advance_bytes=%s max_output_tokens=%s",
             user_id,
             len(candidate_ids),
             len(submitted_ids),
             len(submitted_rep_ids),
             token_sum,
             planned_advance,
+            planned_max_output_tokens,
         )
         return _submit_openai_batch(
             openai_client,

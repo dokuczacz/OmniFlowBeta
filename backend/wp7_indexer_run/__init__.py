@@ -152,8 +152,8 @@ def _call_indexer_model(openai_client: OpenAI, prompt_id: str, items: List[Dict[
     input_text = _create_indexer_input(items)
     # Output tokens are typically priced higher; keep a tight, per-item budget.
     # If the prompt is well-formed (strict JSON, short summaries), this cap should be sufficient.
-    per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 180)
-    max_output_tokens = max(256, min(4096, 128 + (max(1, len(items)) * max(60, per_item))))
+    per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 400)
+    max_output_tokens = max(1024, min(4096, 128 + (max(1, len(items)) * max(60, per_item))))
     resp = openai_client.responses.create(
         prompt={"id": prompt_id},
         input=input_text,
