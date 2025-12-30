@@ -3,6 +3,7 @@ import os
 import time
 import requests
 import azure.functions as func
+from shared.http_client import requests_get, requests_post
 
 # Helper to fetch function code with backward-compatible env names
 def _get_code(*env_names: str) -> str:
@@ -131,13 +132,22 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         if method == "GET":
             query_params = params.copy()
             query_params["code"] = code
-            res = requests.get(url, params=query_params, headers={"x-user-id": user_id}, timeout=10)
+            res = requests_get(
+                url,
+                params=query_params,
+                headers={"x-user-id": user_id},
+                timeout=10,
+                user_id=str(user_id),
+                code="proxy_router_get",
+            )
         elif method == "POST":
-            res = requests.post(
+            res = requests_post(
                 f"{url}?code={code}",
                 json=params,
                 headers={"x-user-id": user_id, "Content-Type": "application/json"},
                 timeout=10,
+                user_id=str(user_id),
+                code="proxy_router_post",
             )
         else:
             return func.HttpResponse("Unsupported method", status_code=400)

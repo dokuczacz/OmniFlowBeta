@@ -1,35 +1,55 @@
 # Deploying OmniFlow Beta
 
-This document captures the steps, env vars, and sanity checks to publish the version currently in GitHub to Azure and keep the Streamlit demo in sync.
+- Status: active
+- Audience: operator
+- Scope: backend (Azure Functions) + UI (Next.js); Streamlit is legacy
 
 ## Environment configuration
 
-- Copy `.env.example` to `.env.local` (or another ignored filename) and fill in the required secrets before running locally or deploying. The template lists every `OPENAI_*`, `FUNCTION_CODE_*`, and debug flag the handler reads.
-- When deploying to Azure, set the same key/value pairs in the Function App Configuration blade and in the Azure Static Web App/Streamlit deployment (or pass them via deployment scripts).
-- Keep function codes secret. Rotate them through the Azure Portal and update `FUNCTION_CODE_*` values on the target environment before publishing.
+- Copy `.env.example` to an ignored local file (e.g. `.env.local`) and fill secrets.
+- For Azure deployments, mirror the same key/value pairs in:
+  - Azure Function App configuration
+  - your UI hosting environment (Next.js)
+- Keep function codes secret (`FUNCTION_CODE_*`). Rotate them via Azure Portal when needed.
 
-## Publishing the backend
+## Publish the backend (Azure Functions)
 
-1. Authenticate with the Azure CLI and select your subscription.
-2. Build and test locally: `pip install -r requirements.txt`, `func start`, and run the smoke tests (e.g. `python -m pytest backend/tool_call_handler/test_*.py`).
-   - For a one-shot local runner (spawns separate PowerShell windows for Azurite, Functions, and Streamlit): `powershell -ExecutionPolicy Bypass -File scripts/run_local.ps1`
-3. Publish your function app:
-   ```bash
-   func azure functionapp publish <YOUR_FUNCTION_APP_NAME> --python
-   ```
-   The CLI will push the fresh source and restart the app. Use `--publish-local-settings` to upload `.env.local` values when prompted.
-4. Verify the deployed endpoints (`/api/tool_call_handler`, `/api/add_new_data`, etc.) respond with `200` and honor the `X-User-Id` header.
-5. If you rely on the Azure proxy router, keep `AZURE_PROXY_URL`/`FUNCTION_CODE_PROXY_ROUTER` in sync between the router and the Functions app.
+1. Install deps: `pip install -r backend/requirements.txt`
+2. Local smoke: `cd backend && func start`
+3. Publish:
+   - `cd backend`
+   - `func azure functionapp publish <YOUR_FUNCTION_APP_NAME> --python`
+4. Verify endpoints respond `200` and honor `X-User-Id`:
+   - `POST /api/tool_call_handler`
+   - `POST /api/save_interaction`
+   - `POST /api/read_many_blobs`
 
-## Connecting the Streamlit UI
+## Publish the UI (Next.js)
 
-- The public demo runs at `https://omniflowbeta-gjv5gjhezwbfg7pb7pucwe.streamlit.app/`. Keep the backend base URL (and any function codes) aligned with the production Function App when updating the UI.
-- To redeploy the frontend, publish your Streamlit app via Streamlit Community Cloud or another host and update `BACKEND_BASE_URL` + `FUNCTION_CODE_ADD_NEW_DATA` under the app’s secrets. The demo automatically points to the current API when the variables match.
+Primary UI lives in `ui_next/`.
 
-## Post-deploy checklist
+- Configure the backend base URL in your UI host (example: `OMNIFLOW_BACKEND_URL` if your UI proxy uses it).
+- Verify the UI sends `X-User-Id` and correctly persists `thread_id` per user.
 
-1. Confirm `tool_call_handler` logs show the expected `OPENAI_ASSISTANT_ID` and calls proceed without missing tool resources.
-2. Use the deployed demo link to exercise the UI and ensure user threads persist.
-3. Run the `docs/workflow/reports/agent_report_submit.py` script to capture the deployment milestone (e.g. assign the new report a “Azure publish” summary).
+## Legacy UI (Streamlit)
 
-Once the backend and UI are stable, update the GitHub README/demo section so the next visitor sees the latest working demo and instructions.
+Streamlit in `frontend/` is legacy/LAB. Use only if you still need the public Streamlit demo.
+
+## WP6/WP7 deployment notes (semantics + context)
+
+- WP6 Context Builder docs: `docs/workflow/wp6_context_builder/README.md`
+- WP7 Semantic Indexer docs: `docs/WP7_Indexer_Batch.md`
+
+Recommended verification in a deployed environment:
+
+- After a chat turn, `save_interaction` succeeds and the user’s namespace is updated.
+- WP7 produces semantic artifacts + manifest lines under:
+  - `users/{user_id}/interactions/semantic/`
+  - `users/{user_id}/interactions/semantic/index.jsonl`
+
+## Rollback paths (config-based)
+
+- Disable WP7 processing: set `WP7_ENABLED=0`
+- Disable WP6 deep routing: set `WP6_DEFAULT_CONTEXT_MODE=FAST` (or disable builder integration in your feature gate if present)
+- UI rollback: redeploy previous UI build only (no backend rollback needed if contracts unchanged)
+

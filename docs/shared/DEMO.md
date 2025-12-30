@@ -1,9 +1,21 @@
-# Live Streamlit Demo
+# Demo notes (legacy Streamlit)
 
-The current `main` branch is wired to a public Streamlit experience so reviewers can explore OmniFlow Beta without cloning or running azurite.
+- Status: active (legacy)
+- Audience: operator
 
-- **URL:** https://omniflowbeta-gjv5gjhezwbfg7pb7pucwe.streamlit.app/
-- **Backend target:** the same Azure Functions deployment described in `docs/shared/DEPLOYMENT.md`.
-- **Env vars:** ensure `BACKEND_BASE_URL` + `FUNCTION_CODE_ADD_NEW_DATA` (and other `FUNCTION_CODE_*` values) in the demo host match whatever you just pushed to Azure.
+The repo historically exposed a public Streamlit demo so reviewers could explore OmniFlow without local setup.
 
-When you publish a new version, update this document (or rerun `docs/workflow/reports/agent_report_submit.py` with a “demo redeploy” summary) so visitors always see the active demo link.
+- URL: https://omniflowbeta-gjv5gjhezwbfg7pb7pucwe.streamlit.app/
+- Backend target: the same Azure Functions deployment described in `docs/shared/DEPLOYMENT.md`
+
+## Config to keep in sync
+
+When you publish a new backend version, ensure the demo host points to the same backend:
+
+- `BACKEND_BASE_URL` (or equivalent backend base URL in the Streamlit host)
+- `FUNCTION_CODE_*` secrets (function keys)
+
+## Note
+
+Primary UI for Patch 2.0 is Next.js (`ui_next/`). Streamlit is maintained only as a LAB/demo surface.
+

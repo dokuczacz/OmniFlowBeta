@@ -42,6 +42,7 @@ from shared.wp7_indexer import (
     utc_now_iso,
     wp7_text_json_schema_format,
 )
+from shared.mock_agent import mock_enabled, mock_marker, mock_user_id
 
 
 WP7_BATCH_STATE_BLOB_NAME = "interactions/indexer_batch_state.json"
@@ -684,6 +685,8 @@ def _thresholds_from_env() -> QueueThresholds:
 
 
 def _wp7_log_verbose() -> bool:
+    if str(os.environ.get("OMNIFLOW_DEBUG", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on"):
+        return True
     return str(os.environ.get("WP7_LOG_VERBOSE", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on")
 
 
@@ -985,6 +988,10 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
 
 
 def main(timer: func.TimerRequest) -> None:
+    if mock_enabled():
+        user_id = mock_user_id()
+        logging.info("WP7: mock timer tick user_id=%s marker=%s", user_id, mock_marker("wp7"))
+        return
     if not _wp7_enabled():
         logging.info("WP7 indexer timer disabled (WP7_ENABLED=0)")
         return
@@ -1030,7 +1037,7 @@ def main(timer: func.TimerRequest) -> None:
         try:
             result = _run_for_user(openai_client, prompt_id, user_id, thresholds)
             if _wp7_log_verbose():
-                logging.info(f"WP7 indexer tick: {json.dumps(result, ensure_ascii=False)}")
+                logging.debug(f"WP7 indexer tick: {json.dumps(result, ensure_ascii=False)}")
         except AzureError as e:
             logging.error(f"WP7 indexer tick AzureError user_id={user_id}: {e}")
         except Exception as e:

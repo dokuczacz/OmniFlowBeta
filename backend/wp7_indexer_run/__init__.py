@@ -36,6 +36,7 @@ from shared.wp7_indexer import (
     utc_now_iso,
     wp7_text_json_schema_format,
 )
+from shared.mock_agent import mock_enabled, mock_marker, mock_user_id
 
 
 def _parse_bool(value: Any) -> bool:
@@ -43,6 +44,8 @@ def _parse_bool(value: Any) -> bool:
 
 
 def _wp7_log_verbose() -> bool:
+    if str(os.environ.get("OMNIFLOW_DEBUG", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on"):
+        return True
     return str(os.environ.get("WP7_LOG_VERBOSE", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on")
 
 
@@ -303,6 +306,17 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     - Writes semantic artifacts per interaction_id.
     - Advances byte offset only after successful processing (idempotent).
     """
+    if mock_enabled():
+        user_id = mock_user_id()
+        payload = {
+            "status": "success",
+            "mode": "mock",
+            "user_id": user_id,
+            "marker": mock_marker("wp7"),
+            "note": "WP7 indexer disabled (mock)",
+        }
+        return func.HttpResponse(json.dumps(payload, ensure_ascii=False), mimetype="application/json", status_code=200)
+
     user_id = extract_user_id(req) or "default"
     thresholds = _load_thresholds(req)
 

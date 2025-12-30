@@ -1,15 +1,18 @@
-# OmniFlow Beta — Public docs
+# Shared docs (contracts + runbooks)
 
-This folder contains the minimal public documentation kept in the repo.
+- Status: active
+- Audience: operator + developer
+
+This folder contains **shared** documentation used across the repo (deployment/runbooks + stable contracts/templates).
+
+Start here: `docs/README.md`
 
 ## Key docs
 
-- Deployment: `docs/shared/DEPLOYMENT.md`
+- Deployment (backend + Next UI): `docs/shared/DEPLOYMENT.md`
 - User isolation (namespacing): `docs/shared/USER_MANAGEMENT.md`
-- Demo notes: `docs/shared/DEMO.md`
-- GitHub Discussions templates: `docs/shared/GITHUB_DISCUSSIONS_TEMPLATES.md`
+- Demo notes (legacy Streamlit): `docs/shared/DEMO.md`
+- GitHub templates: `docs/shared/GITHUB_DISCUSSIONS_TEMPLATES.md`
+- Agent exchange contract (JSONL): `docs/shared/AGENT_EXCHANGE_TABLE.template.jsonl.md`
+- Docs standard: `docs/shared/DOCS_STANDARD.md`
 
-## UI roadmap
-
-- WP2 (Next.js MVP UI): `ai-chatbot/`
-- WP2 plan: `docs/shared/WP2_NEXT_UI_PLAN.md`

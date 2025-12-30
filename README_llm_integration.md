@@ -4,6 +4,13 @@
 
 OmniFlow Beta is designed to be integrated with Custom GPTs, LangChain agents, or any LLM-powered system that can make HTTP API calls. This document provides guidance on how to configure and use OmniFlow as a backend for your LLM applications.
 
+High-signal references (recommended to read first):
+
+- Semantics (WP7): `docs/WP7_Indexer_Batch.md`
+- Context Builder + cache (WP6): `docs/workflow/wp6_context_builder/README.md`
+- Tool call patterns (strict): `FUNCTION_CALLS_PLAYBOOK.md`
+- Doc index: `docs/README.md`
+
 ---
 
 ## Required Environment Variables
@@ -90,7 +97,7 @@ curl -X POST http://localhost:7071/api/add_new_data \
 - `DELETE /api/remove_data_entry` - Remove entries
 
 **Tool Discovery**:
-- `GET /api/custom_gpt_tools` - Return the catalog of callable functions along with their HTTP methods, URLs, and Azure function keys so your GPT can invoke them directly.
+- This repo includes an Actions OpenAPI file at `backend/custom_gpt_tools/actions_openapi.json`. If your deployment exposes a tool-catalog endpoint, keep it aligned with that schema.
 
 **Listing & Discovery**:
 - `GET /api/list_blobs` - List all blobs for a user
@@ -195,63 +202,8 @@ Mirror the same env var names from `.env.example` or your Azure app settings so 
 
 ---
 
-## Streamlit Demo Integration Ideas
+## UI clients (deployment note)
 
-The included Streamlit frontend (`frontend/`) demonstrates basic integration. You can extend it to:
-
-- **Multi-User Chat**: Allow multiple users to interact with their own data
-- **File Upload UI**: Drag-and-drop file uploads to blob storage
-- **Real-Time Logs**: Display audit logs and tool call history
-- **Admin Dashboard**: View usage stats, user activity, and system health
-- **Semantic Search UI**: Once vector search is implemented, add a search interface
-
-Example Streamlit snippet:
-
-```python
-import streamlit as st
-import requests
-
-st.title("OmniFlow Beta Demo")
-
-user_id = st.text_input("User ID")
-blob_name = st.text_input("Blob Name")
-
-if st.button("Read Blob"):
-    response = requests.get(
-        "http://localhost:7071/api/read_blob_file",
-        headers={"X-User-Id": user_id},
-        params={"blob_name": blob_name}
-    )
-    st.json(response.json())
-```
-
----
-
-## Low-Cost Demo Guidance
-
-To minimize costs during development and demos:
-
-1. **Use Azurite**: Local Azure Storage emulator (free)
-2. **Limit OpenAI Calls**: Cache responses or use smaller models (e.g., `gpt-3.5-turbo`)
-3. **Set Max Tokens**: Configure `max_tokens` to limit response length
-4. **Local Testing**: Test all logic locally before deploying to Azure
-5. **Free Tier**: Use Azure Functions Consumption Plan (first 1M executions free)
-
----
-
-## Next Steps
-
-1. **Configure Environment**: Copy `.env.example` to `.env` and fill in your keys
-2. **Start Azurite**: Run `azurite` for local storage emulation
-3. **Run Backend**: `cd backend && func start`
-4. **Test Endpoints**: Use `curl` or Postman to test API calls
-5. **Integrate with LLM**: Point your Custom GPT or LangChain agent to the API
-6. **Deploy**: Once tested, deploy to Azure Functions for production use
-
-For more details, see the main [README.md](README.md) and [docs/shared/README.md](docs/shared/README.md).
-
----
-
-## Support & Feedback
-
-For questions, issues, or feature requests, please open an issue on GitHub or contact the maintainer at dokuczacz@example.com.
+- Product UI (Next.js): `ui_next/`
+- AI chat template (reference): `ai-chatbot/`
+- Legacy Streamlit LAB UI: `frontend/`

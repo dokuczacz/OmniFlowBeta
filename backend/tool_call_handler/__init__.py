@@ -41,6 +41,8 @@ except Exception:
     # Best-effort import; if it fails, we will continue without file logging
     attach_file_handler = None
     detach_file_handler = None
+from shared.http_client import requests_get, requests_post
+from shared.mock_agent import build_mock_agent_response, mock_marker, mock_user_id
 
 # Config
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -55,6 +57,9 @@ PROXY_FUNCTION_KEY = os.environ.get("FUNCTION_CODE_PROXY_ROUTER", "")
 ENABLE_SAVE_INTERACTION = True  # Hardcoded to always enable saving for now
 VECTOR_STORE_ID = os.environ.get("OPENAI_VECTOR_STORE_ID", "")
 DEBUG_TOOL_CALL_HANDLER = os.environ.get("DEBUG_TOOL_CALL_HANDLER", "").lower() in ("1", "true", "yes")
+OMNIFLOW_DEBUG = os.environ.get("OMNIFLOW_DEBUG", "").lower() in ("1", "true", "yes")
+DEBUG_TOOL_CALL_HANDLER = bool(DEBUG_TOOL_CALL_HANDLER or OMNIFLOW_DEBUG)
+OMNIFLOW_MOCK_AGENT = os.environ.get("OMNIFLOW_MOCK_AGENT", "").lower() in ("1", "true", "yes")
 OPENAI_MAX_REQUESTS = int(os.environ.get("OPENAI_MAX_REQUESTS", "0") or 0)
 # WP6 routing: when UI does not send `context_mode`, fall back to this default.
 # Values: AUTO | FAST | DEEP
@@ -64,6 +69,7 @@ WP6_TOPIC_CHANGE_WINDOW_SECONDS = 0
 # runtime counter for outbound OpenAI HTTP calls (best-effort)
 _openai_lock = threading.Lock()
 _openai_count = 0
+CACHE_LOCK = threading.Lock()
 _handles_cache: Dict[str, Dict[str, Any]] = {}
 
 # WP6.M1: preferences cache (best-effort; no hard dependency)
@@ -89,6 +95,18 @@ WP6_CONTEXT_PACK_TTL_SECONDS = int(os.environ.get("WP6_CONTEXT_PACK_TTL_SECONDS"
 WP6_DEEP_COOLDOWN_SECONDS = int(os.environ.get("WP6_DEEP_COOLDOWN_SECONDS", "600") or 600)
 OPENAI_CONTEXT_BUILDER_PROMPT_ID = os.environ.get("OPENAI_CONTEXT_BUILDER_PROMPT_ID", "")
 
+def _best_effort_debug(code: str, *, user_id: str = "", thread_id: str = "", error: Exception | None = None, **ctx: Any) -> None:
+    logger = logging.getLogger()
+    if not (DEBUG_TOOL_CALL_HANDLER or logger.isEnabledFor(logging.DEBUG)):
+        return
+    try:
+        extras = " ".join([f"{k}={str(v)[:200]}" for k, v in (ctx or {}).items() if v is not None])
+        err = f"{type(error).__name__}: {error}" if error else ""
+        logging.debug(f"[BEST_EFFORT] code={code} user_id={user_id} thread_id={thread_id} {extras} error={err}".strip())
+    except Exception:
+        return
+
+
 def _inprocess_call_function_main(main_fn, user_id: str, *, params: Dict[str, Any] | None = None, body: Dict[str, Any] | None = None):
     """
     Call an Azure Functions `main(req)` handler in-process without going through `execute_tool_call()`.
@@ -113,7 +131,8 @@ def _inprocess_read_blob_file(user_id: str, file_name: str) -> Dict[str, Any]:
     try:
         body_text = resp.get_body().decode("utf-8") if hasattr(resp, "get_body") else str(resp)
         return json.loads(body_text) if body_text else {}
-    except Exception:
+    except Exception as exc:
+        _best_effort_debug("inprocess_read_blob_parse_failed", user_id=str(user_id), error=exc, file_name=file_name)
         return {}
 
 
@@ -127,7 +146,13 @@ def _inprocess_upload_data_or_file(user_id: str, target_blob_name: str, file_con
     try:
         body_text = resp.get_body().decode("utf-8") if hasattr(resp, "get_body") else str(resp)
         return json.loads(body_text) if body_text else {}
-    except Exception:
+    except Exception as exc:
+        _best_effort_debug(
+            "inprocess_upload_parse_failed",
+            user_id=str(user_id),
+            error=exc,
+            target_blob_name=target_blob_name,
+        )
         return {}
 
 
@@ -141,7 +166,8 @@ def _load_preferences(user_id: str) -> Dict[str, Any]:
     """
     uid = str(user_id or "default").strip() or "default"
     if PREFERENCES_CACHE_TTL_SECONDS > 0:
-        cached = _prefs_cache.get(uid)
+        with CACHE_LOCK:
+            cached = _prefs_cache.get(uid)
         if cached:
             age = time.time() - cached.get("ts", 0)
             if age <= PREFERENCES_CACHE_TTL_SECONDS:
@@ -154,11 +180,13 @@ def _load_preferences(user_id: str) -> Dict[str, Any]:
             if isinstance(prefs, str):
                 try:
                     prefs = json.loads(prefs)
-                except Exception:
+                except Exception as exc:
+                    _best_effort_debug("prefs_json_parse_failed", user_id=uid, error=exc)
                     prefs = {}
             if isinstance(prefs, dict):
                 if PREFERENCES_CACHE_TTL_SECONDS > 0:
-                    _prefs_cache[uid] = {"data": prefs, "ts": time.time()}
+                    with CACHE_LOCK:
+                        _prefs_cache[uid] = {"data": prefs, "ts": time.time()}
                 return prefs
 
         if WP6_PREFERENCES_AUTO_CREATE and isinstance(payload, dict) and payload.get("error"):
@@ -175,12 +203,14 @@ def _load_preferences(user_id: str) -> Dict[str, Any]:
                 try:
                     _inprocess_upload_data_or_file(uid, "semantics/preferences.json", default_prefs)
                     if PREFERENCES_CACHE_TTL_SECONDS > 0:
-                        _prefs_cache[uid] = {"data": default_prefs, "ts": time.time()}
+                        with CACHE_LOCK:
+                            _prefs_cache[uid] = {"data": default_prefs, "ts": time.time()}
                     return default_prefs
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _best_effort_debug("prefs_autocreate_failed", user_id=uid, error=exc)
         return {}
-    except Exception:
+    except Exception as exc:
+        _best_effort_debug("prefs_load_failed", user_id=uid, error=exc)
         return {}
     finally:
         try:
@@ -631,7 +661,8 @@ def _wp6_load_cached_pack_from_handles(state: Dict[str, Any], intent_key: str) -
             return "", False
         pack_path = str(pack.get("path") or "").strip()
         return pack_path, bool(pack_path)
-    except Exception:
+    except Exception as exc:
+        _best_effort_debug("context_pack_cache_read_failed", error=exc, intent_key=intent_key)
         return "", False
 
 
@@ -667,8 +698,14 @@ def _wp6_build_or_reuse_context_pack(
                     meta["pack_path"] = pack_path_cached
                     meta["pack_tokens_est"] = int(pack.get("pack_tokens_est") or 0)
                     return json.dumps(pack, ensure_ascii=False), meta
-        except Exception:
-            pass
+        except Exception as exc:
+            _best_effort_debug(
+                "context_pack_cache_fetch_failed",
+                user_id=str(user_id),
+                thread_id=str(thread_id),
+                error=exc,
+                pack_path=pack_path_cached,
+            )
 
     if not OPENAI_CONTEXT_BUILDER_PROMPT_ID:
         meta["error"] = "OPENAI_CONTEXT_BUILDER_PROMPT_ID not set"
@@ -696,7 +733,8 @@ def _wp6_build_or_reuse_context_pack(
     cb_text = getattr(cb_resp, "output_text", None) or ""
     try:
         pack = json.loads(cb_text) if cb_text else {}
-    except Exception:
+    except Exception as exc:
+        _best_effort_debug("context_pack_json_parse_failed", user_id=str(user_id), thread_id=str(thread_id), error=exc)
         pack = {}
     # Accept the configured schema (mode, summary, bullets, top_sources, pack_tokens_est, coverage, need_more_sources, created_utc)
     required_keys = ("mode", "summary", "bullets", "top_sources", "pack_tokens_est", "coverage", "need_more_sources", "created_utc")
@@ -718,10 +756,22 @@ def _wp6_build_or_reuse_context_pack(
                     "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
                 }
                 _save_handles(user_id, handles, async_save=True)
-        except Exception:
-            pass
-    except Exception:
-        pass
+        except Exception as exc:
+            _best_effort_debug(
+                "context_pack_handle_update_failed",
+                user_id=str(user_id),
+                thread_id=str(thread_id),
+                error=exc,
+                pack_path=pack_path,
+            )
+    except Exception as exc:
+        _best_effort_debug(
+            "context_pack_persist_failed",
+            user_id=str(user_id),
+            thread_id=str(thread_id),
+            error=exc,
+            intent_key=intent_key,
+        )
 
     return json.dumps(pack, ensure_ascii=False), meta
 
@@ -1045,19 +1095,20 @@ def _missing_env_vars_for_runtime(runtime: str) -> list:
 def _load_handles(user_id: str) -> Dict[str, Any]:
     """Load `handles.json` from the user's blob namespace (best-effort)."""
     if HANDLES_CACHE_TTL_SECONDS > 0:
-        cached = _handles_cache.get(str(user_id))
+        with CACHE_LOCK:
+            cached = _handles_cache.get(str(user_id))
         if cached:
             age = time.time() - cached.get("ts", 0)
             if age <= HANDLES_CACHE_TTL_SECONDS:
                 if DEBUG_TOOL_CALL_HANDLER:
-                    logging.info(f"[DEBUG] handles cache hit user_id={user_id} age_s={age:.2f}")
+                    logging.debug(f"[DEBUG] handles cache hit user_id={user_id} age_s={age:.2f}")
                 return cached.get("data", {}) or {}
             if DEBUG_TOOL_CALL_HANDLER:
-                logging.info(f"[DEBUG] handles cache expired user_id={user_id} age_s={age:.2f}")
+                logging.debug(f"[DEBUG] handles cache expired user_id={user_id} age_s={age:.2f}")
         elif DEBUG_TOOL_CALL_HANDLER:
-            logging.info(f"[DEBUG] handles cache miss user_id={user_id}")
+            logging.debug(f"[DEBUG] handles cache miss user_id={user_id}")
     elif DEBUG_TOOL_CALL_HANDLER:
-        logging.info("[DEBUG] handles cache disabled (TTL=0)")
+        logging.debug("[DEBUG] handles cache disabled (TTL=0)")
     try:
         result_str, _info = execute_tool_call("read_blob_file", {"file_name": "handles.json"}, user_id)
         payload = json.loads(result_str) if isinstance(result_str, str) else {}
@@ -1065,29 +1116,33 @@ def _load_handles(user_id: str) -> Dict[str, Any]:
             data = payload.get("data")
             if isinstance(data, dict):
                 if HANDLES_CACHE_TTL_SECONDS > 0:
-                    _handles_cache[str(user_id)] = {"data": data, "ts": time.time()}
+                    with CACHE_LOCK:
+                        _handles_cache[str(user_id)] = {"data": data, "ts": time.time()}
                     if DEBUG_TOOL_CALL_HANDLER:
-                        logging.info(f"[DEBUG] handles cache set user_id={user_id} entries={len(data)}")
+                        logging.debug(f"[DEBUG] handles cache set user_id={user_id} entries={len(data)}")
                 return data
             if isinstance(data, str):
                 try:
                     parsed = json.loads(data)
                     if isinstance(parsed, dict):
                         if HANDLES_CACHE_TTL_SECONDS > 0:
-                            _handles_cache[str(user_id)] = {"data": parsed, "ts": time.time()}
+                            with CACHE_LOCK:
+                                _handles_cache[str(user_id)] = {"data": parsed, "ts": time.time()}
                             if DEBUG_TOOL_CALL_HANDLER:
-                                logging.info(f"[DEBUG] handles cache set user_id={user_id} entries={len(parsed)}")
+                                logging.debug(f"[DEBUG] handles cache set user_id={user_id} entries={len(parsed)}")
                         return parsed
-                except Exception:
+                except Exception as exc:
+                    _best_effort_debug("handles_json_parse_failed", user_id=str(user_id), error=exc)
                     return {}
         if isinstance(payload, dict) and payload.get("error"):
             error_text = str(payload.get("error") or "")
             if "not found" in error_text.lower() or "blobnotfound" in error_text.lower():
                 if DEBUG_TOOL_CALL_HANDLER:
-                    logging.info(f"[DEBUG] handles.json missing; initializing user_id={user_id}")
+                    logging.debug(f"[DEBUG] handles.json missing; initializing user_id={user_id}")
                 _save_handles(user_id, {}, async_save=True)
         return {}
-    except Exception:
+    except Exception as exc:
+        _best_effort_debug("handles_load_failed", user_id=str(user_id), error=exc)
         return {}
 
 
@@ -1101,16 +1156,17 @@ def _save_handles(user_id: str, handles: Dict[str, Any], async_save: bool = Fals
                 user_id,
             )
             if HANDLES_CACHE_TTL_SECONDS > 0:
-                _handles_cache[str(user_id)] = {"data": handles or {}, "ts": time.time()}
+                with CACHE_LOCK:
+                    _handles_cache[str(user_id)] = {"data": handles or {}, "ts": time.time()}
             if DEBUG_TOOL_CALL_HANDLER:
-                logging.info(f"[DEBUG] handles async save done user_id={user_id}")
+                logging.debug(f"[DEBUG] handles async save done user_id={user_id}")
         except Exception as exc:
             if DEBUG_TOOL_CALL_HANDLER:
-                logging.info(f"[DEBUG] handles async save failed user_id={user_id} error={exc}")
+                logging.debug(f"[DEBUG] handles async save failed user_id={user_id} error={exc}")
 
     if async_save:
         if DEBUG_TOOL_CALL_HANDLER:
-            logging.info(f"[DEBUG] handles async save queued user_id={user_id}")
+            logging.debug(f"[DEBUG] handles async save queued user_id={user_id}")
         threading.Thread(target=_do_save, daemon=True).start()
         return
 
@@ -1451,7 +1507,15 @@ def restore_or_create_thread(openai_client: OpenAI, user_id: str, thread_id: str
                 use_rest_tr = False
             if use_rest_tr and VECTOR_STORE_ID:
                 payload["tool_resources"] = {"vector_store": VECTOR_STORE_ID}
-            resp = requests.post(create_url, json=payload, headers=headers, timeout=15)
+            resp = requests_post(
+                create_url,
+                json=payload,
+                headers=headers,
+                timeout=15,
+                user_id=str(user_id),
+                thread_id="",
+                code="openai_rest_create_thread",
+            )
             try:
                 resp.raise_for_status()
             except requests.RequestException as exc:
@@ -1506,8 +1570,16 @@ def append_user_message(openai_client: OpenAI, thread_id: str, user_message: str
             for msg_url in candidate_urls:
                 try:
                     if DEBUG_TOOL_CALL_HANDLER:
-                        logging.info(f"[DEBUG] REST POST {msg_url} headers={_redact_sensitive(dict(headers))} payload={_redact_sensitive(payload)}")
-                    resp_msg = requests.post(msg_url, json=payload, headers=headers, timeout=10)
+                        logging.debug(f"[DEBUG] REST POST {msg_url} headers={_redact_sensitive(dict(headers))} payload={_redact_sensitive(payload)}")
+                    resp_msg = requests_post(
+                        msg_url,
+                        json=payload,
+                        headers=headers,
+                        timeout=10,
+                        user_id="",
+                        thread_id=str(thread_id),
+                        code="openai_rest_post_message",
+                    )
                     resp_msg.raise_for_status()
                     logging.info(f"Posted user message to thread {thread_id} via REST; status={resp_msg.status_code} url={msg_url}")
                     success = True
@@ -1546,11 +1618,27 @@ def handle_direct_actions(req, body: Dict[str, Any], action: str, user_id: str):
         url = f"{url}?code={function_code}"
     try:
         if DEBUG_TOOL_CALL_HANDLER:
-            logging.info(f"[DEBUG] Direct call {action} URL={url} params={_redact_sensitive(dict(params))} headers={_redact_sensitive(dict(headers))}")
+            logging.debug(f"[DEBUG] Direct call {action} URL={url} params={_redact_sensitive(dict(params))} headers={_redact_sensitive(dict(headers))}")
         if action == "get_interaction_history":
-            resp = requests.get(url, params=params, headers=headers, timeout=45)
+            resp = requests_get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=45,
+                user_id=str(user_id_local),
+                thread_id=str(thread_id or ""),
+                code="direct_action_get_history",
+            )
         else:
-            resp = requests.post(url, json=params, headers=headers, timeout=45)
+            resp = requests_post(
+                url,
+                json=params,
+                headers=headers,
+                timeout=45,
+                user_id=str(user_id_local),
+                thread_id=str(thread_id or ""),
+                code="direct_action_post",
+            )
         resp.raise_for_status()
         try:
             result = resp.json()
@@ -1561,7 +1649,7 @@ def handle_direct_actions(req, body: Dict[str, Any], action: str, user_id: str):
                 snippet = result if isinstance(result, (dict, list)) else (resp.text[:1000] + "...[truncated]" if len(resp.text) > 1000 else resp.text)
             except Exception:
                 snippet = "<unserializable>"
-            logging.info(f"[DEBUG] Direct response status={resp.status_code} body={_redact_sensitive(snippet if isinstance(snippet, dict) else {'raw': snippet})}")
+            logging.debug(f"[DEBUG] Direct response status={resp.status_code} body={_redact_sensitive(snippet if isinstance(snippet, dict) else {'raw': snippet})}")
         return _make_response({"status": "success", "result": result}, status_code=resp.status_code)
     except requests.HTTPError as exc:
         if resp is not None:
@@ -1603,7 +1691,15 @@ def create_run_and_poll(openai_client: OpenAI, thread_id: str, user_id: str):
                 use_rest_tr = False
             if use_rest_tr and VECTOR_STORE_ID:
                 payload["tool_resources"] = {"vector_store": VECTOR_STORE_ID}
-            resp = requests.post(runs_url, json=payload, headers=headers, timeout=15)
+            resp = requests_post(
+                runs_url,
+                json=payload,
+                headers=headers,
+                timeout=15,
+                user_id=str(user_id),
+                thread_id=str(thread_id),
+                code="openai_rest_create_run",
+            )
             resp.raise_for_status()
             try:
                 run_json = resp.json()
@@ -1885,7 +1981,8 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
     start_time = time.time()
     normalized_args = normalize_tool_arguments(tool_name, tool_arguments)
     params_with_user = {**(normalized_args or {}), "user_id": user_id}
-    logging.debug(f"Dispatching tool={tool_name} with params={params_with_user}")
+    dispatch_args = params_with_user
+    logging.debug(f"Dispatching tool={tool_name} with params={dispatch_args}")
 
     # WP6.M1 preferences enforcement (best-effort).
     # Goal: reduce costly/history reads and prevent agent "browsing" beyond allowlisted files.
@@ -1898,22 +1995,24 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
                 duration_ms = (time.time() - start_time) * 1000
                 info = {
                     "tool_name": tool_name,
-                    "arguments": normalized_args,
+                    "arguments": dispatch_args,
                     "status": "failed",
                     "duration_ms": duration_ms,
                     "error": reason,
                     "code": "preferences_blocked",
                 }
                 return json.dumps({"error": reason, "code": "preferences_blocked"}), info
-    except Exception:
-        pass
+    except Exception as exc:
+        _best_effort_debug("preferences_enforcement_failed", user_id=str(user_id), error=exc, tool_name=tool_name)
 
     # Try in-process dispatch first
     try:
         from tools import dispatch_tool
-        result = dispatch_tool(tool_name, normalized_args, user_id)
+        inprocess_args = dict(dispatch_args or {})
+        inprocess_args.pop("user_id", None)
+        result = dispatch_tool(tool_name, inprocess_args, user_id)
         duration_ms = (time.time() - start_time) * 1000
-        info = {"tool_name": tool_name, "arguments": normalized_args, "result": result, "status": "success", "duration_ms": duration_ms}
+        info = {"tool_name": tool_name, "arguments": dispatch_args, "result": result, "status": "success", "duration_ms": duration_ms}
         logging.info(f"Tool {tool_name} OK in-process in {duration_ms:.1f}ms")
         return json.dumps(result), info
     except ImportError as e:
@@ -1948,31 +2047,33 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
         if include_user_id:
             filtered_args["user_id"] = user_id
 
-        logging.debug(f"Dispatching tool={tool_name} with params={filtered_args}")
+        dispatch_args = filtered_args if "filtered_args" in locals() else params_with_user
+        logging.debug(f"Dispatching tool={tool_name} with params={dispatch_args}")
+    dispatch_args = filtered_args if "filtered_args" in locals() else params_with_user
     headers = {"X-User-Id": user_id, "Content-Type": "application/json"}
     if PROXY_FUNCTION_KEY:
         headers["x-functions-key"] = PROXY_FUNCTION_KEY
 
     # Hard validation for manage_files to avoid bad requests
     if tool_name == "manage_files":
-        op = params_with_user.get("operation")
-        src = params_with_user.get("source_name")
-        tgt = params_with_user.get("target_name")
+        op = dispatch_args.get("operation")
+        src = dispatch_args.get("source_name")
+        tgt = dispatch_args.get("target_name")
         if op is None:
             err = "manage_files requires 'operation' (rename/delete)"
-            info = {"tool_name": tool_name, "arguments": normalized_args, "error": err, "status": "failed", "duration_ms": 0}
+            info = {"tool_name": tool_name, "arguments": dispatch_args, "error": err, "status": "failed", "duration_ms": 0}
             return json.dumps({"error": err}), info
         if op not in ["rename", "delete"]:
             err = f"manage_files operation '{op}' is not supported. Use list_blobs for listing."
-            info = {"tool_name": tool_name, "arguments": normalized_args, "error": err, "status": "failed", "duration_ms": 0}
+            info = {"tool_name": tool_name, "arguments": dispatch_args, "error": err, "status": "failed", "duration_ms": 0}
             return json.dumps({"error": err}), info
         if not src:
             err = "manage_files requires 'source_name'"
-            info = {"tool_name": tool_name, "arguments": normalized_args, "error": err, "status": "failed", "duration_ms": 0}
+            info = {"tool_name": tool_name, "arguments": dispatch_args, "error": err, "status": "failed", "duration_ms": 0}
             return json.dumps({"error": err}), info
         if op == "rename" and not tgt:
             err = "manage_files rename requires 'target_name'"
-            info = {"tool_name": tool_name, "arguments": normalized_args, "error": err, "status": "failed", "duration_ms": 0}
+            info = {"tool_name": tool_name, "arguments": dispatch_args, "error": err, "status": "failed", "duration_ms": 0}
             return json.dumps({"error": err}), info
 
     try:
@@ -1985,11 +2086,17 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
             function_base = os.getenv("FUNCTION_URL_BASE", "http://localhost:7071").rstrip("/")
             func_url = f"{function_base}/api/{tool_name}"
             if DEBUG_TOOL_CALL_HANDLER:
-                logging.info(f"[DEBUG] GET {func_url} params={_redact_sensitive(dict(filtered_args if 'filtered_args' in locals() else params_with_user))} headers={_redact_sensitive(dict(headers))}")
+                logging.debug(f"[DEBUG] GET {func_url} params={_redact_sensitive(dict(dispatch_args))} headers={_redact_sensitive(dict(headers))}")
             try:
-                # Use filtered_args to avoid sending assistant-supplied extras when available
-                get_params = filtered_args if 'filtered_args' in locals() else params_with_user
-                resp = requests.get(func_url, params=get_params, headers=headers, timeout=45)
+                resp = requests_get(
+                    func_url,
+                    params=dispatch_args,
+                    headers=headers,
+                    timeout=45,
+                    user_id=str(user_id),
+                    thread_id="",
+                    code="execute_tool_call_get_history",
+                )
                 resp.raise_for_status()
                 try:
                     result = resp.json()
@@ -1998,27 +2105,35 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
             except requests.RequestException as e:
                 duration_ms = (time.time() - start_time) * 1000
                 logging.warning(f"GET {func_url} failed: {e}")
-                info = {"tool_name": tool_name, "arguments": normalized_args, "error": str(e), "status": "failed", "duration_ms": duration_ms}
+                info = {"tool_name": tool_name, "arguments": dispatch_args, "error": str(e), "status": "failed", "duration_ms": duration_ms}
                 return json.dumps({"error": str(e)}), info
         else:
             if not PROXY_URL:
                 err = "AZURE_PROXY_URL not configured"
                 duration_ms = (time.time() - start_time) * 1000
-                info = {"tool_name": tool_name, "arguments": normalized_args, "error": err, "status": "failed", "duration_ms": duration_ms}
+                info = {"tool_name": tool_name, "arguments": dispatch_args, "error": err, "status": "failed", "duration_ms": duration_ms}
                 logging.error(err)
                 return json.dumps({"error": err}), info
             # When dispatching via proxy, prefer the filtered argument set constructed
             # above to avoid leaking assistant-supplied or extraneous fields.
-            payload = {"action": tool_name, "params": filtered_args if 'filtered_args' in locals() else params_with_user}
+            payload = {"action": tool_name, "params": dispatch_args}
             if DEBUG_TOOL_CALL_HANDLER:
-                logging.info(f"[DEBUG] POST {PROXY_URL} json={_redact_sensitive(payload)} headers={_redact_sensitive(dict(headers))}")
+                logging.debug(f"[DEBUG] POST {PROXY_URL} json={_redact_sensitive(payload)} headers={_redact_sensitive(dict(headers))}")
             try:
-                resp = requests.post(PROXY_URL, json=payload, headers=headers, timeout=45)
+                resp = requests_post(
+                    PROXY_URL,
+                    json=payload,
+                    headers=headers,
+                    timeout=45,
+                    user_id=str(user_id),
+                    thread_id="",
+                    code="execute_tool_call_proxy_post",
+                )
                 resp.raise_for_status()
             except requests.RequestException as e:
                 duration_ms = (time.time() - start_time) * 1000
                 logging.warning(f"POST to proxy failed: {e}")
-                info = {"tool_name": tool_name, "arguments": normalized_args, "error": str(e), "status": "failed", "duration_ms": duration_ms}
+                info = {"tool_name": tool_name, "arguments": dispatch_args, "error": str(e), "status": "failed", "duration_ms": duration_ms}
                 # Include response body if available
                 body_text = None
                 try:
@@ -2039,9 +2154,9 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
                 body_snippet = result if isinstance(result, (dict, list)) else (resp.text[:2000] + "...[truncated]" if len(resp.text) > 2000 else resp.text)
             except Exception:
                 body_snippet = "<unserializable>"
-            logging.info(f"[DEBUG] Response status={getattr(resp, 'status_code', 'n/a')} body={_redact_sensitive(body_snippet if isinstance(body_snippet, dict) else {'raw': body_snippet})}")
+            logging.debug(f"[DEBUG] Response status={getattr(resp, 'status_code', 'n/a')} body={_redact_sensitive(body_snippet if isinstance(body_snippet, dict) else {'raw': body_snippet})}")
         duration_ms = (time.time() - start_time) * 1000
-        info = {"tool_name": tool_name, "arguments": normalized_args, "result": result, "status": "success", "duration_ms": duration_ms}
+        info = {"tool_name": tool_name, "arguments": dispatch_args, "result": result, "status": "success", "duration_ms": duration_ms}
         logging.info(f"Tool {tool_name} OK via proxy_router in {duration_ms:.1f}ms")
         return json.dumps(result), info
     except Exception as e:
@@ -2050,7 +2165,7 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
             logging.exception(f"Tool {tool_name} failed in {duration_ms:.1f}ms: {e}")
         else:
             logging.error(f"Tool {tool_name} failed in {duration_ms:.1f}ms: {e}")
-        info = {"tool_name": tool_name, "arguments": normalized_args, "error": str(e), "status": "failed", "duration_ms": duration_ms}
+        info = {"tool_name": tool_name, "arguments": dispatch_args, "error": str(e), "status": "failed", "duration_ms": duration_ms}
         return json.dumps({"error": str(e)}), info
 
 def save_interaction_log(user_id: str, user_message: str, assistant_response: str, thread_id: str, tool_calls_info: list):
@@ -2090,7 +2205,7 @@ def save_interaction_log(user_id: str, user_message: str, assistant_response: st
                         body_text = resp.get_body().decode("utf-8") if hasattr(resp, "get_body") else str(resp)
                     except Exception:
                         body_text = "<unreadable>"
-                    logging.info(f"[DEBUG] save_interaction in-process done body={body_text[:500]}")
+                    logging.debug(f"[DEBUG] save_interaction in-process done body={body_text[:500]}")
                 try:
                     body_text = resp.get_body().decode("utf-8") if hasattr(resp, "get_body") else ""
                     parsed = json.loads(body_text) if body_text else {}
@@ -2101,7 +2216,7 @@ def save_interaction_log(user_id: str, user_message: str, assistant_response: st
                 return
             except Exception as inproc_exc:
                 if DEBUG_TOOL_CALL_HANDLER:
-                    logging.warning(f"[DEBUG] save_interaction in-process failed: {inproc_exc}; falling back to HTTP")
+                    logging.warning(f"save_interaction in-process failed: {inproc_exc}; falling back to HTTP")
 
         if not base or not code:
             return
@@ -2117,13 +2232,21 @@ def save_interaction_log(user_id: str, user_message: str, assistant_response: st
         headers = {"Content-Type": "application/json", "X-User-Id": user_id}
         def _fire_and_forget():
             try:
-                r = requests.post(url, json=payload, headers=headers, timeout=(1, 10))
+                r = requests_post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=(1, 10),
+                    user_id=str(user_id),
+                    thread_id=str(thread_id or ""),
+                    code="save_interaction_fire_and_forget",
+                )
                 if DEBUG_TOOL_CALL_HANDLER:
                     try:
                         snippet = (r.text or "")[:500]
                     except Exception:
                         snippet = "<unreadable>"
-                    logging.info(f"[DEBUG] save_interaction http status={getattr(r,'status_code','n/a')} body={snippet}")
+                    logging.debug(f"[DEBUG] save_interaction http status={getattr(r,'status_code','n/a')} body={snippet}")
             except Exception as post_exc:
                 logging.warning(f"save_interaction_log failed: {post_exc}")
 
@@ -2161,6 +2284,18 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             resp_direct = handle_direct_actions(req, body, action, user_id)
             if resp_direct is not None:
                 return resp_direct
+
+        if OMNIFLOW_MOCK_AGENT:
+            forced_user_id = mock_user_id()
+            mock_thread_id = str(thread_id or "mock_thread")
+            body_mock = build_mock_agent_response(
+                agent="wp6",
+                user_id=str(forced_user_id),
+                thread_id=mock_thread_id,
+                user_message=str(user_message or ""),
+                marker=mock_marker("wp6"),
+            )
+            return _make_response(body_mock, status_code=200)
 
         # Runtime selection (dual runtime: assistants|responses|auto)
         try:
@@ -2510,9 +2645,17 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     restore_url = f"{restore_url}?code={function_code_env}"
                 headers = {"X-User-Id": str(user_id), "Content-Type": "application/json"}
                 if DEBUG_TOOL_CALL_HANDLER:
-                    logging.info(f"[DEBUG] Calling restore_session {restore_url} user_id={user_id}")
+                    logging.debug(f"[DEBUG] Calling restore_session {restore_url} user_id={user_id}")
                 try:
-                    r = requests.post(restore_url, json={"user_id": user_id, "thread_id": thread_id}, headers=headers, timeout=30)
+                    r = requests_post(
+                        restore_url,
+                        json={"user_id": user_id, "thread_id": thread_id},
+                        headers=headers,
+                        timeout=30,
+                        user_id=str(user_id),
+                        thread_id=str(thread_id),
+                        code="restore_session_post",
+                    )
                     r.raise_for_status()
                     try:
                         restore_result = r.json()
