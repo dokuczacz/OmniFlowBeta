@@ -15,8 +15,10 @@ Design goals:
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -46,6 +48,20 @@ WP7_SEMANTIC_SCHEMA_V1 = "omniflow.wp7.semantic.v1"
 WP7_SEMANTIC_INDEX_SCHEMA_V1 = "omniflow.wp7.semantic_index.v1"
 WP7_UNCATEGORIZED_SCHEMA_V1 = "omniflow.wp7.uncategorized.v1"
 WP7_BATCH_AUDIT_SCHEMA_V1 = "omniflow.wp7.batch_audit.v1"
+
+# WP7 semantic index burst-dedup (reduces noise in index.jsonl; does not modify raw interaction logs).
+# Dedup key is computed from: category + summary_short (normalized) + tags (sorted).
+WP7_SEMANTIC_DEDUP_ENABLED = str(os.environ.get("WP7_SEMANTIC_DEDUP_ENABLED") or "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+)
+WP7_SEMANTIC_DEDUP_WINDOW_SECONDS = int(os.environ.get("WP7_SEMANTIC_DEDUP_WINDOW_SECONDS", "300") or 300)
+WP7_SEMANTIC_DEDUP_TAIL_BYTES = int(os.environ.get("WP7_SEMANTIC_DEDUP_TAIL_BYTES", "65536") or 65536)
+WP7_SEMANTIC_DEDUP_MAX_LINES = int(os.environ.get("WP7_SEMANTIC_DEDUP_MAX_LINES", "200") or 200)
+WP7_SEMANTIC_DEDUP_MAX_MATCHES = int(os.environ.get("WP7_SEMANTIC_DEDUP_MAX_MATCHES", "50") or 50)
 
 WP7_INTERACTION_ITEMS_SCHEMA_V1 = {
     "type": "object",
@@ -139,6 +155,49 @@ def _truncate(text: str, max_chars: int) -> str:
     return value[: max_chars - 3] + "..."
 
 
+def _try_parse_ts_utc(ts: Any) -> float:
+    """
+    Best-effort parse for `timestamp_utc` used in index.jsonl entries.
+    Returns epoch seconds (UTC) or 0.0 if unknown.
+    """
+    if not ts:
+        return 0.0
+    s = str(ts).strip()
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = _dt.datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_dt.timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _download_blob_tail_bytes(user_id: str, blob_name: str, *, tail_bytes: int) -> bytes:
+    bc = AzureBlobClient.get_blob_client(blob_name, user_id)
+    try:
+        props = bc.get_blob_properties()
+        total = int(getattr(props, "size", 0) or 0)
+    except ResourceNotFoundError:
+        return b""
+    except Exception:
+        return b""
+
+    if total <= 0:
+        return b""
+    if tail_bytes <= 0:
+        tail_bytes = 1
+    offset = max(0, total - tail_bytes)
+    try:
+        return bc.download_blob(offset=offset).readall()
+    except Exception:
+        try:
+            return bc.download_blob().readall()
+        except Exception:
+            return b""
+
+
 _INTENT_RE_TS = re.compile(
     r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?\b",
     re.IGNORECASE,
@@ -148,6 +207,42 @@ _INTENT_RE_TOKEN_WITH_8DIGITS = re.compile(r"\b(?=\w*\d{8,})\w+\b", re.IGNORECAS
 _INTENT_RE_DOTTED_ID = re.compile(r"\b[a-z]{1,6}\.\d{1,6}\.[a-z0-9]{6,24}\b", re.IGNORECASE)
 _INTENT_RE_NONWORD = re.compile(r"[^\w]+", re.UNICODE)
 _INTENT_RE_WS = re.compile(r"\s+")
+
+
+def _norm_summary_for_dedup(summary: str) -> str:
+    s = str(summary or "").strip().lower()
+    s = _INTENT_RE_WS.sub(" ", s)
+    return s[:400]
+
+
+def _semantic_index_dedup_key(item: Dict[str, Any]) -> str:
+    cat = str((item or {}).get("category") or "").strip().upper()
+    summ = _norm_summary_for_dedup(str((item or {}).get("summary_short") or ""))
+    tags = (item or {}).get("tags") if isinstance((item or {}).get("tags"), list) else []
+    tags_clean = sorted([str(t).strip().lower() for t in tags if str(t).strip()])[:12]
+    payload = f"{cat}|{summ}|{','.join(tags_clean)}"
+    return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _recent_semantic_index_items(user_id: str) -> List[Dict[str, Any]]:
+    raw = _download_blob_tail_bytes(user_id, WP7_SEMANTIC_INDEX_BLOB_NAME, tail_bytes=WP7_SEMANTIC_DEDUP_TAIL_BYTES)
+    if not raw:
+        return []
+    text = raw.decode("utf-8", errors="ignore")
+    out: List[Dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and obj.get("schema_version") == WP7_SEMANTIC_INDEX_SCHEMA_V1:
+            out.append(obj)
+    if WP7_SEMANTIC_DEDUP_MAX_LINES > 0 and len(out) > WP7_SEMANTIC_DEDUP_MAX_LINES:
+        out = out[-WP7_SEMANTIC_DEDUP_MAX_LINES :]
+    return out
 
 
 def normalize_intent(text: Any, *, max_len: int = 280) -> str:
@@ -348,7 +443,7 @@ def build_semantic_index_item(
             tags_clean.append(t.strip())
     summary = str(artifact.get("summary") or "").strip()
     summary_short = summary[:400]
-    return {
+    item: Dict[str, Any] = {
         "schema_version": WP7_SEMANTIC_INDEX_SCHEMA_V1,
         "timestamp_utc": str(artifact.get("timestamp_utc") or utc_now_iso()),
         "user_id": str(user_id),
@@ -360,10 +455,43 @@ def build_semantic_index_item(
         "summary_short": summary_short,
         "semantic_blob_path": semantic_blob_path,
     }
+    item["dedup_key"] = _semantic_index_dedup_key(item)
+    return item
 
 
 def append_semantic_index_item(user_id: str, item: Dict[str, Any]) -> None:
     """Append a single JSONL line to the per-user semantic manifest index.jsonl."""
+    if WP7_SEMANTIC_DEDUP_ENABLED and WP7_SEMANTIC_DEDUP_WINDOW_SECONDS > 0:
+        try:
+            now_ts = _try_parse_ts_utc(item.get("timestamp_utc")) or _dt.datetime.now(_dt.timezone.utc).timestamp()
+            key = str(item.get("dedup_key") or _semantic_index_dedup_key(item))
+            matches = 0
+            rep_interaction_id = ""
+            for recent in reversed(_recent_semantic_index_items(user_id)):
+                rkey = str(recent.get("dedup_key") or _semantic_index_dedup_key(recent))
+                if rkey != key:
+                    continue
+                rts = _try_parse_ts_utc(recent.get("timestamp_utc"))
+                if rts and abs(now_ts - rts) <= float(WP7_SEMANTIC_DEDUP_WINDOW_SECONDS):
+                    matches += 1
+                    if not rep_interaction_id:
+                        rep_interaction_id = str(recent.get("interaction_id") or "")
+                if matches >= WP7_SEMANTIC_DEDUP_MAX_MATCHES:
+                    break
+            if matches >= 1:
+                logging.info(
+                    "WP7: semantic_index_dedup_skip user_id=%s rep=%s new=%s matches_in_window=%d window_s=%d",
+                    user_id,
+                    rep_interaction_id or "unknown",
+                    str(item.get("interaction_id") or ""),
+                    matches + 1,
+                    int(WP7_SEMANTIC_DEDUP_WINDOW_SECONDS),
+                )
+                return
+        except Exception:
+            # Dedup must never break indexing; fall back to plain append.
+            pass
+
     line = json.dumps(item, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     if not line.endswith("\n"):
         line += "\n"
