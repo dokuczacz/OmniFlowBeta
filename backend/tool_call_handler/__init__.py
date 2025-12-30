@@ -66,6 +66,11 @@ OPENAI_MAX_REQUESTS = int(os.environ.get("OPENAI_MAX_REQUESTS", "0") or 0)
 WP6_DEFAULT_CONTEXT_MODE = (os.environ.get("WP6_DEFAULT_CONTEXT_MODE", "AUTO") or "AUTO").strip().upper()
 WP6_TOPIC_CHANGE_ENABLED = False
 WP6_TOPIC_CHANGE_WINDOW_SECONDS = 0
+WP6_RESPONSES_STATELESS = os.environ.get("WP6_RESPONSES_STATELESS", "").lower() in ("1", "true", "yes")
+WP6_RECENT_TURNS_MAX = int(os.environ.get("WP6_RECENT_TURNS_MAX", "8") or 8)
+WP6_RECENT_TURNS_MAX_CHARS = int(os.environ.get("WP6_RECENT_TURNS_MAX_CHARS", "320") or 320)
+WP6_FAST_AUDIT_ENABLED = str(os.environ.get("WP6_FAST_AUDIT_ENABLED", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+WP6_FAST_AUDIT_MAX_CHARS = int(os.environ.get("WP6_FAST_AUDIT_MAX_CHARS", "16000") or 16000)
 # runtime counter for outbound OpenAI HTTP calls (best-effort)
 _openai_lock = threading.Lock()
 _openai_count = 0
@@ -590,7 +595,19 @@ def _wp6_fast_context_from_wp7_semantic(user_id: str, max_sources: int, max_char
         sl = str((x or {}).get("signal_level") or "").lower()
         return 3 if sl == "high" else (2 if sl == "medium" else 1)
 
-    items_data.sort(key=_sig_rank, reverse=True)
+    def _ts_rank(x: dict) -> float:
+        ts = str((x or {}).get("timestamp_utc") or "").strip()
+        if not ts:
+            return 0.0
+        try:
+            if ts.endswith("Z"):
+                ts = ts[:-1] + "+00:00"
+            return datetime.datetime.fromisoformat(ts).timestamp()
+        except Exception:
+            return 0.0
+
+    # Prefer higher signal; within that, prefer most recent.
+    items_data.sort(key=lambda x: (_sig_rank(x), _ts_rank(x)), reverse=True)
     out_lines: list[str] = []
     used = 0
     for it in items_data:
@@ -624,6 +641,86 @@ def _wp6_fast_context_from_wp7_semantic(user_id: str, max_sources: int, max_char
 
     ctx = "WP7 semantic context (recent, prioritized):\n" + "\n".join(out_lines)
     return ctx, meta
+
+
+def _wp6_format_recent_turns(turns: list[str]) -> str:
+    safe = [str(t or "").strip() for t in (turns or []) if str(t or "").strip()]
+    if not safe or int(WP6_RECENT_TURNS_MAX or 0) <= 0:
+        return ""
+    # Most recent first for routing clarity.
+    safe = safe[::-1]
+    lines = [f"- {t}" for t in safe[: max(1, int(WP6_RECENT_TURNS_MAX or 0))]]
+    return "[RECENT_USER_TURNS]\n" + "\n".join(lines)
+
+
+def _wp6_update_recent_user_turns(user_id: str, thread_id: str, user_message: str) -> list[str]:
+    """
+    Maintain a bounded ring buffer of recent raw user turns in handles.json.
+
+    Stored under: handles[thread_id]["wp6_recent_user_turns"] = [{"ts_utc": "...", "text": "..."}, ...]
+    """
+    if int(WP6_RECENT_TURNS_MAX or 0) <= 0:
+        return []
+    if not thread_id:
+        return []
+    try:
+        msg = str(user_message or "").strip()
+        if not msg:
+            return []
+        if int(WP6_RECENT_TURNS_MAX_CHARS or 0) > 0:
+            msg = msg[: int(WP6_RECENT_TURNS_MAX_CHARS)]
+
+        handles = _load_handles(user_id)
+        if not isinstance(handles, dict):
+            return []
+        state = handles.get(thread_id, {}) if isinstance(handles.get(thread_id), dict) else {}
+        turns_raw = state.get("wp6_recent_user_turns")
+        turns: list[dict] = []
+        if isinstance(turns_raw, list):
+            for t in turns_raw:
+                if isinstance(t, dict) and t.get("text"):
+                    turns.append({"ts_utc": str(t.get("ts_utc") or ""), "text": str(t.get("text") or "")})
+
+        turns.append({"ts_utc": datetime.datetime.utcnow().isoformat() + "Z", "text": msg})
+        turns = turns[-max(1, int(WP6_RECENT_TURNS_MAX)) :]
+
+        handles[thread_id] = {
+            **state,
+            "wp6_recent_user_turns": turns,
+            "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+        }
+        _save_handles(user_id, handles, async_save=True)
+        return [str(t.get("text") or "") for t in turns if str(t.get("text") or "").strip()]
+    except Exception as exc:
+        _best_effort_debug("wp6_recent_turns_update_failed", user_id=str(user_id), thread_id=str(thread_id), error=exc)
+        return []
+
+
+def _wp6_write_fast_audit(
+    user_id: str,
+    thread_id: str,
+    *,
+    audit_id: str,
+    kind: str,
+    payload: Dict[str, Any],
+) -> str:
+    if not WP6_FAST_AUDIT_ENABLED:
+        return ""
+    try:
+        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        suffix = uuid.uuid4().hex[:8]
+        path = f"semantics/wp6_fast_audit/{str(thread_id)}/{ts}_{audit_id}_{kind}_{suffix}.json"
+        execute_tool_call("upload_data_or_file", {"target_blob_name": path, "file_content": payload}, user_id)
+        return path
+    except Exception as exc:
+        _best_effort_debug(
+            "wp6_fast_audit_write_failed",
+            user_id=str(user_id),
+            thread_id=str(thread_id),
+            error=exc,
+            kind=kind,
+        )
+        return ""
 
 
 def _wp6_route_context_mode(body: Dict[str, Any], user_message: str) -> Tuple[str, str, Dict[str, Any]]:
@@ -1208,6 +1305,8 @@ def _coerce_conversation_id(value: Any) -> str:
 
 def _persist_responses_state(user_id: str, thread_id: str, conversation_id: str, response_id: str) -> None:
     """Persist Responses continuation pointers (best-effort)."""
+    if WP6_RESPONSES_STATELESS:
+        return
     try:
         handles = _load_handles(user_id)
         if not isinstance(handles, dict) or not thread_id:
@@ -1240,8 +1339,11 @@ def run_responses(
     handles = _load_handles(user_id)
     state = handles.get(thread_id, {}) if isinstance(handles, dict) else {}
 
-    conversation_id = _coerce_conversation_id(state.get("responses_conversation_id"))
-    previous_response_id = str(state.get("responses_last_response_id") or "").strip()
+    conversation_id = ""
+    previous_response_id = ""
+    if not WP6_RESPONSES_STATELESS:
+        conversation_id = _coerce_conversation_id(state.get("responses_conversation_id"))
+        previous_response_id = str(state.get("responses_last_response_id") or "").strip()
 
     all_tool_calls = []
     current_input: Any = user_message or ""
@@ -1261,9 +1363,9 @@ def run_responses(
             "max_output_tokens": responses_max_output_tokens,
             "metadata": {"user_id": str(user_id), "thread_id": str(thread_id), "runtime": "responses"},
         }
-        if conversation_id:
+        if (not WP6_RESPONSES_STATELESS) and conversation_id:
             create_kwargs["conversation"] = conversation_id
-        if previous_response_id:
+        if (not WP6_RESPONSES_STATELESS) and previous_response_id:
             create_kwargs["previous_response_id"] = previous_response_id
 
         try:
@@ -1331,19 +1433,20 @@ def run_responses(
                     f"user_id={user_id} thread_id={thread_id}"
                 )
                 previous_response_id = ""
-                # Best-effort: clear persisted last_response_id to avoid repeated failures on next calls.
-                try:
-                    if isinstance(handles, dict):
-                        handles[thread_id] = {
-                            **(state if isinstance(state, dict) else {}),
-                            "responses_conversation_id": conversation_id,
-                            "responses_last_response_id": "",
-                            "active_runtime": "responses",
-                            "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
-                        }
-                        _save_handles(user_id, handles, async_save=True)
-                except Exception:
-                    pass
+                if not WP6_RESPONSES_STATELESS:
+                    # Best-effort: clear persisted last_response_id to avoid repeated failures on next calls.
+                    try:
+                        if isinstance(handles, dict):
+                            handles[thread_id] = {
+                                **(state if isinstance(state, dict) else {}),
+                                "responses_conversation_id": conversation_id,
+                                "responses_last_response_id": "",
+                                "active_runtime": "responses",
+                                "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+                            }
+                            _save_handles(user_id, handles, async_save=True)
+                    except Exception:
+                        pass
                 continue
             raise
         previous_response_id = str(getattr(response, "id", "") or previous_response_id)
@@ -1357,7 +1460,7 @@ def run_responses(
             meta = {"responses_conversation_id": conversation_id, "responses_last_response_id": previous_response_id}
             # Persist only after reaching a "final" response to avoid saving a response id with pending tool calls.
             try:
-                if persist_handles and isinstance(handles, dict):
+                if (not WP6_RESPONSES_STATELESS) and persist_handles and isinstance(handles, dict):
                     handles[thread_id] = {
                         **(state if isinstance(state, dict) else {}),
                         "responses_conversation_id": conversation_id,
@@ -2332,6 +2435,18 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             request_start = time.time()
             try:
                 wp6_meta: Dict[str, Any] = {}
+                if not thread_id:
+                    thread_id = f"handle_{uuid.uuid4().hex[:12]}"
+
+                recent_turns = _wp6_update_recent_user_turns(user_id, str(thread_id), user_message)
+                recent_block = _wp6_format_recent_turns(recent_turns)
+                wp6_meta["recent_user_turns_count"] = int(len(recent_turns or []))
+                wp6_meta["recent_user_turns_chars"] = int(sum(len(str(t or "")) for t in (recent_turns or [])))
+
+                audit_id = uuid.uuid4().hex[:12] if WP6_FAST_AUDIT_ENABLED else ""
+                audit_in_path = ""
+                audit_out_path = ""
+
                 routed_mode, route_reason, route_meta = _wp6_route_context_mode(body, user_message)
 
                 # Build bounded FAST semantic context (used also as an input for DEEP builder).
@@ -2341,6 +2456,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     max_chars=min(WP6_FAST_MAX_RAW_BYTES, WP6_FAST_MAX_INPUT_TOKENS * 4),
                 )
                 wp6_meta = {**route_meta, **fast_meta}
+                try:
+                    wp6_meta["recent_user_turns_count"] = int(len(recent_turns or []))
+                    wp6_meta["recent_user_turns_chars"] = int(sum(len(str(t or "")) for t in (recent_turns or [])))
+                except Exception:
+                    pass
 
                 handles_for_thread = _load_handles(user_id)
                 state_for_thread = (
@@ -2379,6 +2499,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 fast_input_message = user_message
                 if fast_ctx:
                     fast_input_message = f"[FAST_CONTEXT]\n{fast_ctx}\n\n[USER_MESSAGE]\n{user_message}"
+                if recent_block:
+                    fast_input_message = f"{recent_block}\n\n{fast_input_message}"
 
                 # Routing: AUTO defaults to FAST; DEEP can be entered:
                 # - deterministically (e.g., FAST context empty) before first call, or
@@ -2405,6 +2527,40 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     "reason_initial": reason_initial,
                     "deep_allowed": bool(deep_allowed),
                 }
+
+                if audit_id:
+                    try:
+                        fast_ctx_trunc = str(fast_ctx or "")
+                        if int(WP6_FAST_AUDIT_MAX_CHARS or 0) > 0:
+                            fast_ctx_trunc = fast_ctx_trunc[: int(WP6_FAST_AUDIT_MAX_CHARS)]
+                        payload_in = {
+                            "schema_version": "omniflow.wp6.fast_audit.v1",
+                            "kind": "fast_in",
+                            "audit_id": audit_id,
+                            "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
+                            "user_id": str(user_id),
+                            "thread_id": str(thread_id),
+                            "stateless": bool(WP6_RESPONSES_STATELESS),
+                            "intent_key": str(intent_key),
+                            "routing": dict(wp6_meta.get("routing") or {}),
+                            "recent_user_turns": list(recent_turns or []),
+                            "fast_ctx": fast_ctx_trunc,
+                            "fast_meta": {
+                                "semantic_candidates_count": int((fast_meta or {}).get("semantic_candidates_count") or 0),
+                                "selected_sources_count": int((fast_meta or {}).get("selected_sources_count") or 0),
+                                "raw_bytes_read": int((fast_meta or {}).get("raw_bytes_read") or 0),
+                                "candidate_sources": list((fast_meta or {}).get("candidate_sources") or []),
+                            },
+                        }
+                        audit_in_path = _wp6_write_fast_audit(
+                            user_id,
+                            str(thread_id),
+                            audit_id=audit_id,
+                            kind="fast_in",
+                            payload=payload_in,
+                        )
+                    except Exception as exc:
+                        _best_effort_debug("wp6_fast_audit_in_failed", user_id=str(user_id), thread_id=str(thread_id), error=exc)
 
                 # For AUTO we delay persisting response continuation until we know if we escalate to DEEP.
                 persist_in_run = not auto_mode
@@ -2580,6 +2736,36 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 return _make_response({"error": "Internal server error", "details": str(exc), "runtime": "responses"}, status_code=500)
 
             total_ms = (time.time() - request_start) * 1000
+            if audit_id:
+                try:
+                    resp_snip = str(assistant_response or "")
+                    resp_len = len(resp_snip)
+                    resp_snip = resp_snip[:2000]
+                    payload_out = {
+                        "schema_version": "omniflow.wp6.fast_audit.v1",
+                        "kind": "fast_out",
+                        "audit_id": audit_id,
+                        "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
+                        "user_id": str(user_id),
+                        "thread_id": str(thread_id),
+                        "stateless": bool(WP6_RESPONSES_STATELESS),
+                        "audit_in_path": str(audit_in_path or ""),
+                        "assistant_response_len": int(resp_len),
+                        "assistant_response_snip": resp_snip,
+                        "wp6": wp6_meta,
+                    }
+                    audit_out_path = _wp6_write_fast_audit(
+                        user_id,
+                        str(thread_id),
+                        audit_id=audit_id,
+                        kind="fast_out",
+                        payload=payload_out,
+                    )
+                    if isinstance(responses_meta, dict):
+                        responses_meta["wp6_fast_audit_in_path"] = str(audit_in_path or "")
+                        responses_meta["wp6_fast_audit_out_path"] = str(audit_out_path or "")
+                except Exception as exc:
+                    _best_effort_debug("wp6_fast_audit_out_failed", user_id=str(user_id), thread_id=str(thread_id), error=exc)
             try:
                 if isinstance(responses_meta, dict):
                     responses_meta["wp6"] = wp6_meta

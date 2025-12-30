@@ -43,6 +43,7 @@ htmlcov/
 **/.mypy_cache/
 tools/pretty_interactions.py
 tools/pretty_wp7_outputs.py
+tools/out/
 
 # OS
 .DS_Store

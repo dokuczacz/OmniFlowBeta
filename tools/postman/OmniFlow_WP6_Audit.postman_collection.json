@@ -1,0 +1,62 @@
+{
+  "info": {
+    "_postman_id": "7d0831cd-0e7c-4f47-8c32-7a0a09be33e8",
+    "name": "OmniFlow - WP6 Auditor (OpenAI Responses)",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "WP6 Auditor - Evaluate 10 FAST packs",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{OPENAI_API_KEY}}",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"model\": \"{{OPENAI_MODEL}}\",\n  \"max_output_tokens\": {{OPENAI_MAX_OUTPUT_TOKENS}},\n  \"text\": {\n    \"format\": {\n      \"type\": \"json_object\"\n    }\n  },\n  \"input\": [\n    {\n      \"role\": \"system\",\n      \"content\": [\n        {\n          \"type\": \"input_text\",\n          \"text\": \"{{WP6_AUDIT_SYSTEM_PROMPT}}\"\n        }\n      ]\n    },\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\n          \"type\": \"input_text\",\n          \"text\": \"{{WP6_AUDIT_INPUT_JSON}}\"\n        }\n      ]\n    }\n  ]\n}\n",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{OPENAI_BASE_URL}}/v1/responses",
+          "host": [
+            "{{OPENAI_BASE_URL}}"
+          ],
+          "path": [
+            "v1",
+            "responses"
+          ]
+        }
+      },
+      "response": []
+    }
+  ],
+  "variable": [
+    {
+      "key": "OPENAI_BASE_URL",
+      "value": "https://api.openai.com"
+    },
+    {
+      "key": "OPENAI_MODEL",
+      "value": "gpt-5-mini"
+    },
+    {
+      "key": "OPENAI_MAX_OUTPUT_TOKENS",
+      "value": "4096"
+    }
+  ]
+}
+
