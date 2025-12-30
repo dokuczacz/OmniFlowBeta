@@ -15,8 +15,11 @@ Design goals:
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
 import logging
+import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,6 +49,95 @@ WP7_SEMANTIC_INDEX_SCHEMA_V1 = "omniflow.wp7.semantic_index.v1"
 WP7_UNCATEGORIZED_SCHEMA_V1 = "omniflow.wp7.uncategorized.v1"
 WP7_BATCH_AUDIT_SCHEMA_V1 = "omniflow.wp7.batch_audit.v1"
 
+# WP7 semantic index burst-dedup (reduces noise in index.jsonl; does not modify raw interaction logs).
+# Dedup key is computed from: category + summary_short (normalized) + tags (sorted).
+WP7_SEMANTIC_DEDUP_ENABLED = str(os.environ.get("WP7_SEMANTIC_DEDUP_ENABLED") or "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+)
+WP7_SEMANTIC_DEDUP_WINDOW_SECONDS = int(os.environ.get("WP7_SEMANTIC_DEDUP_WINDOW_SECONDS", "300") or 300)
+WP7_SEMANTIC_DEDUP_TAIL_BYTES = int(os.environ.get("WP7_SEMANTIC_DEDUP_TAIL_BYTES", "65536") or 65536)
+WP7_SEMANTIC_DEDUP_MAX_LINES = int(os.environ.get("WP7_SEMANTIC_DEDUP_MAX_LINES", "200") or 200)
+WP7_SEMANTIC_DEDUP_MAX_MATCHES = int(os.environ.get("WP7_SEMANTIC_DEDUP_MAX_MATCHES", "50") or 50)
+
+WP7_INTERACTION_ITEMS_SCHEMA_V1 = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "description": "A list of interaction item objects.",
+            "maxItems": 25,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "interaction_id": {
+                        "type": "string",
+                        "description": "Unique identifier starting with 'INT_'.",
+                        "pattern": "^INT_.*",
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Interaction category: PE, UI, ML, LO, PS, TM, SYS, GEN, or ID.",
+                        "enum": ["PE", "UI", "ML", "LO", "PS", "TM", "SYS", "GEN", "ID"],
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Concise summary in the format: Intent; Action(tool); Result (Scope). 1–2 sentences, max 220 characters.",
+                        "maxLength": 220,
+                    },
+                    "tags": {
+                        "type": "array",
+                        "description": "3–6 stable lowercase-kebab-case tags.",
+                        "minItems": 3,
+                        "maxItems": 6,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                        },
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "description": "Confidence score (float between 0.0 and 1.0).",
+                        "minimum": 0,
+                        "maximum": 1,
+                    },
+                    "signal_level": {
+                        "type": "string",
+                        "description": "Strength of the signal: low, medium, or high.",
+                        "enum": ["low", "medium", "high"],
+                    },
+                },
+                "required": ["interaction_id", "category", "summary", "tags", "confidence", "signal_level"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["items"],
+    "additionalProperties": False,
+}
+
+
+def wp7_text_json_schema_format() -> Dict[str, Any]:
+    """
+    Responses API text.format for the WP7 indexer output.
+
+    This is enforced at request-time (in addition to any Dashboard prompt settings) to prevent:
+    - invalid JSON (e.g., "Unterminated string ..." parse errors)
+    - partial/non-JSON outputs drifting into the batch output file
+    """
+    return {
+        "format": {
+            "type": "json_schema",
+            "name": "interaction_items",
+            "strict": True,
+            "schema": WP7_INTERACTION_ITEMS_SCHEMA_V1,
+        }
+    }
+
 
 def utc_now_iso() -> str:
     return _dt.datetime.utcnow().replace(tzinfo=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
@@ -61,6 +153,159 @@ def _truncate(text: str, max_chars: int) -> str:
     if max_chars <= 3:
         return value[:max_chars]
     return value[: max_chars - 3] + "..."
+
+
+def _try_parse_ts_utc(ts: Any) -> float:
+    """
+    Best-effort parse for `timestamp_utc` used in index.jsonl entries.
+    Returns epoch seconds (UTC) or 0.0 if unknown.
+    """
+    if not ts:
+        return 0.0
+    s = str(ts).strip()
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = _dt.datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_dt.timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _download_blob_tail_bytes(user_id: str, blob_name: str, *, tail_bytes: int) -> bytes:
+    bc = AzureBlobClient.get_blob_client(blob_name, user_id)
+    try:
+        props = bc.get_blob_properties()
+        total = int(getattr(props, "size", 0) or 0)
+    except ResourceNotFoundError:
+        return b""
+    except Exception:
+        return b""
+
+    if total <= 0:
+        return b""
+    if tail_bytes <= 0:
+        tail_bytes = 1
+    offset = max(0, total - tail_bytes)
+    try:
+        return bc.download_blob(offset=offset).readall()
+    except Exception:
+        try:
+            return bc.download_blob().readall()
+        except Exception:
+            return b""
+
+
+_INTENT_RE_TS = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?\b",
+    re.IGNORECASE,
+)
+_INTENT_RE_LONGNUM = re.compile(r"\b\d{6,}\b")
+_INTENT_RE_TOKEN_WITH_8DIGITS = re.compile(r"\b(?=\w*\d{8,})\w+\b", re.IGNORECASE)
+_INTENT_RE_DOTTED_ID = re.compile(r"\b[a-z]{1,6}\.\d{1,6}\.[a-z0-9]{6,24}\b", re.IGNORECASE)
+_INTENT_RE_NONWORD = re.compile(r"[^\w]+", re.UNICODE)
+_INTENT_RE_WS = re.compile(r"\s+")
+
+
+def _norm_summary_for_dedup(summary: str) -> str:
+    s = str(summary or "").strip().lower()
+    s = _INTENT_RE_WS.sub(" ", s)
+    return s[:400]
+
+
+def _semantic_index_dedup_key(item: Dict[str, Any]) -> str:
+    cat = str((item or {}).get("category") or "").strip().upper()
+    summ = _norm_summary_for_dedup(str((item or {}).get("summary_short") or ""))
+    tags = (item or {}).get("tags") if isinstance((item or {}).get("tags"), list) else []
+    tags_clean = sorted([str(t).strip().lower() for t in tags if str(t).strip()])[:12]
+    payload = f"{cat}|{summ}|{','.join(tags_clean)}"
+    return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _recent_semantic_index_items(user_id: str) -> List[Dict[str, Any]]:
+    raw = _download_blob_tail_bytes(user_id, WP7_SEMANTIC_INDEX_BLOB_NAME, tail_bytes=WP7_SEMANTIC_DEDUP_TAIL_BYTES)
+    if not raw:
+        return []
+    text = raw.decode("utf-8", errors="ignore")
+    out: List[Dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and obj.get("schema_version") == WP7_SEMANTIC_INDEX_SCHEMA_V1:
+            out.append(obj)
+    if WP7_SEMANTIC_DEDUP_MAX_LINES > 0 and len(out) > WP7_SEMANTIC_DEDUP_MAX_LINES:
+        out = out[-WP7_SEMANTIC_DEDUP_MAX_LINES :]
+    return out
+
+
+def normalize_intent(text: Any, *, max_len: int = 280) -> str:
+    """
+    Deterministic normalization for "same intent" deduplication.
+
+    Goal: remove volatile tokens (timestamps, IDs, long numbers) and collapse the text to a stable key.
+    """
+    s = str(text or "").strip().lower()
+    if not s:
+        return ""
+    s = _INTENT_RE_TS.sub(" ", s)
+    s = _INTENT_RE_DOTTED_ID.sub(" ", s)
+    s = _INTENT_RE_LONGNUM.sub(" ", s)
+    s = _INTENT_RE_TOKEN_WITH_8DIGITS.sub(" ", s)
+    s = _INTENT_RE_NONWORD.sub(" ", s)
+    s = _INTENT_RE_WS.sub(" ", s).strip()
+    if max_len and len(s) > max_len:
+        s = s[:max_len].rstrip()
+    return s
+
+
+def dedup_items_by_intent_norm(
+    items: List[Dict[str, Any]],
+    *,
+    text_key: str = "user_message",
+) -> Tuple[List[Dict[str, Any]], Dict[str, str], int]:
+    """
+    Returns:
+      - rep_items: list of representative items (stable order: first seen wins)
+      - member_to_rep: mapping interaction_id -> representative interaction_id
+      - distinct_intents: count of distinct intent_norm buckets (excluding empty intents)
+    """
+    rep_items: List[Dict[str, Any]] = []
+    member_to_rep: Dict[str, str] = {}
+    rep_by_intent: Dict[str, str] = {}
+    distinct = 0
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        iid = str(item.get("interaction_id") or "").strip()
+        if not iid:
+            continue
+
+        raw = item.get(text_key) or item.get("assistant_response") or ""
+        intent = normalize_intent(raw)
+        if not intent:
+            # Empty intent: treat as unique to avoid collapsing unrelated items.
+            rep_items.append(item)
+            member_to_rep[iid] = iid
+            continue
+
+        rep_iid = rep_by_intent.get(intent)
+        if not rep_iid:
+            rep_by_intent[intent] = iid
+            rep_iid = iid
+            rep_items.append(item)
+            distinct += 1
+
+        member_to_rep[iid] = rep_iid
+
+    return rep_items, member_to_rep, distinct
 
 
 def build_batch_audit_item(
@@ -198,7 +443,7 @@ def build_semantic_index_item(
             tags_clean.append(t.strip())
     summary = str(artifact.get("summary") or "").strip()
     summary_short = summary[:400]
-    return {
+    item: Dict[str, Any] = {
         "schema_version": WP7_SEMANTIC_INDEX_SCHEMA_V1,
         "timestamp_utc": str(artifact.get("timestamp_utc") or utc_now_iso()),
         "user_id": str(user_id),
@@ -210,17 +455,50 @@ def build_semantic_index_item(
         "summary_short": summary_short,
         "semantic_blob_path": semantic_blob_path,
     }
+    item["dedup_key"] = _semantic_index_dedup_key(item)
+    return item
 
 
 def append_semantic_index_item(user_id: str, item: Dict[str, Any]) -> None:
     """Append a single JSONL line to the per-user semantic manifest index.jsonl."""
+    if WP7_SEMANTIC_DEDUP_ENABLED and WP7_SEMANTIC_DEDUP_WINDOW_SECONDS > 0:
+        try:
+            now_ts = _try_parse_ts_utc(item.get("timestamp_utc")) or _dt.datetime.now(_dt.timezone.utc).timestamp()
+            key = str(item.get("dedup_key") or _semantic_index_dedup_key(item))
+            matches = 0
+            rep_interaction_id = ""
+            for recent in reversed(_recent_semantic_index_items(user_id)):
+                rkey = str(recent.get("dedup_key") or _semantic_index_dedup_key(recent))
+                if rkey != key:
+                    continue
+                rts = _try_parse_ts_utc(recent.get("timestamp_utc"))
+                if rts and abs(now_ts - rts) <= float(WP7_SEMANTIC_DEDUP_WINDOW_SECONDS):
+                    matches += 1
+                    if not rep_interaction_id:
+                        rep_interaction_id = str(recent.get("interaction_id") or "")
+                if matches >= WP7_SEMANTIC_DEDUP_MAX_MATCHES:
+                    break
+            if matches >= 1:
+                logging.info(
+                    "WP7: semantic_index_dedup_skip user_id=%s rep=%s new=%s matches_in_window=%d window_s=%d",
+                    user_id,
+                    rep_interaction_id or "unknown",
+                    str(item.get("interaction_id") or ""),
+                    matches + 1,
+                    int(WP7_SEMANTIC_DEDUP_WINDOW_SECONDS),
+                )
+                return
+        except Exception:
+            # Dedup must never break indexing; fall back to plain append.
+            pass
+
     line = json.dumps(item, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     if not line.endswith("\n"):
         line += "\n"
 
     client = _get_append_blob_client(user_id, WP7_SEMANTIC_INDEX_BLOB_NAME)
     try:
-        _append_jsonl_line(client, line)
+        _append_jsonl_line(client, line, user_id=user_id, blob_label=WP7_SEMANTIC_INDEX_BLOB_NAME)
     except AzureError as e:
         logging.error(f"WP7 append_semantic_index_item failed: {e}")
         raise
@@ -234,10 +512,194 @@ def append_batch_audit_item(user_id: str, item: Dict[str, Any]) -> None:
 
     client = _get_append_blob_client(user_id, WP7_BATCH_AUDIT_BLOB_NAME)
     try:
-        _append_jsonl_line(client, line)
+        _append_jsonl_line(client, line, user_id=user_id, blob_label=WP7_BATCH_AUDIT_BLOB_NAME)
     except AzureError as e:
         logging.error(f"WP7 append_batch_audit_item failed: {e}")
         raise
+
+
+def backfill_semantic_index_if_empty(
+    user_id: str,
+    *,
+    max_items: int = 250,
+) -> Dict[str, Any]:
+    """
+    One-time helper: if the per-user semantic index is empty (0 bytes) but semantic artifacts exist,
+    rebuild the index by appending entries derived from existing artifacts.
+
+    Safety:
+    - Runs only when index blob size is exactly 0.
+    - Limits work to `max_items` artifacts to avoid heavy scans.
+    """
+    if max_items <= 0:
+        return {"status": "skipped", "reason": "max_items<=0", "user_id": user_id, "indexed": 0}
+
+    index_bc = AzureBlobClient.get_blob_client(WP7_SEMANTIC_INDEX_BLOB_NAME, user_id)
+    try:
+        props = index_bc.get_blob_properties()
+        size = int(getattr(props, "size", 0) or 0)
+    except ResourceNotFoundError:
+        size = 0
+
+    if size != 0:
+        return {"status": "skipped", "reason": "index_not_empty", "user_id": user_id, "indexed": 0, "index_size": size}
+
+    try:
+        filenames = AzureBlobClient.list_user_blobs(user_id, prefix=WP7_SEMANTIC_PREFIX)
+    except Exception as e:
+        logging.warning("WP7 index backfill list failed user_id=%s: %s", user_id, e)
+        return {"status": "failed", "reason": "list_failed", "user_id": user_id, "indexed": 0}
+
+    semantic_files = [
+        name
+        for name in filenames
+        if isinstance(name, str)
+        and name.startswith(WP7_SEMANTIC_PREFIX)
+        and name[len(WP7_SEMANTIC_PREFIX) :].startswith("INT_")
+        and name.endswith(".json")
+    ]
+    if not semantic_files:
+        return {"status": "skipped", "reason": "no_semantic_files", "user_id": user_id, "indexed": 0}
+
+    semantic_files = sorted(semantic_files)[:max_items]
+    indexed = 0
+    for blob_name in semantic_files:
+        interaction_id = blob_name[len(WP7_SEMANTIC_PREFIX) : -len(".json")]
+        try:
+            bc = AzureBlobClient.get_blob_client(blob_name, user_id)
+            raw = bc.download_blob().readall()
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                continue
+            semantic_blob_path = f"users/{user_id}/{blob_name}"
+            append_semantic_index_item(
+                user_id,
+                build_semantic_index_item(
+                    payload,
+                    user_id=user_id,
+                    interaction_id=interaction_id,
+                    semantic_blob_path=semantic_blob_path,
+                ),
+            )
+            indexed += 1
+        except Exception as e:
+            logging.warning("WP7 index backfill item failed user_id=%s blob=%s: %s", user_id, blob_name, e)
+            continue
+
+    logging.info("WP7: semantic index backfilled user_id=%s indexed=%s (index was empty)", user_id, indexed)
+    return {"status": "backfilled", "user_id": user_id, "indexed": indexed, "max_items": max_items}
+
+
+def reconcile_semantic_index_missing(
+    user_id: str,
+    *,
+    max_items: int = 250,
+) -> Dict[str, Any]:
+    """
+    Reconcile a partially filled semantic index by appending missing entries for existing artifacts.
+
+    This is useful after:
+    - a previous bug prevented index appends while artifacts were written
+    - manual wipes/restore left artifacts present but index incomplete
+
+    Safety:
+    - Only appends; never edits existing lines.
+    - Limits scan+append to `max_items` semantic artifacts.
+    """
+    if max_items <= 0:
+        return {"status": "skipped", "reason": "max_items<=0", "user_id": user_id, "appended": 0}
+
+    # Load existing index IDs (if index is missing, treat as empty).
+    index_ids: set[str] = set()
+    index_bc = AzureBlobClient.get_blob_client(WP7_SEMANTIC_INDEX_BLOB_NAME, user_id)
+    try:
+        raw = index_bc.download_blob().readall()
+        for ln in raw.decode("utf-8", errors="replace").splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                obj = json.loads(ln)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                iid = str(obj.get("interaction_id") or "").strip()
+                if iid:
+                    index_ids.add(iid)
+    except ResourceNotFoundError:
+        index_ids = set()
+    except Exception as e:
+        logging.warning("WP7 index reconcile: failed to read index user_id=%s: %s", user_id, e)
+        return {"status": "failed", "reason": "index_read_failed", "user_id": user_id, "appended": 0}
+
+    # Iterate semantic artifacts (bounded).
+    try:
+        container = AzureBlobClient.get_container_client()
+        user_prefix = f"users/{user_id}/"
+        full_prefix = f"{user_prefix}{WP7_SEMANTIC_PREFIX}INT_"
+        semantic_names: list[str] = []
+        for blob in container.list_blobs(name_starts_with=full_prefix):
+            name = getattr(blob, "name", None)
+            if not isinstance(name, str):
+                continue
+            if not name.endswith(".json"):
+                continue
+            rel = name[len(user_prefix) :] if name.startswith(user_prefix) else name
+            semantic_names.append(rel)
+            if len(semantic_names) >= max_items:
+                break
+    except Exception as e:
+        logging.warning("WP7 index reconcile: list semantic failed user_id=%s: %s", user_id, e)
+        return {"status": "failed", "reason": "list_failed", "user_id": user_id, "appended": 0}
+
+    missing_blob_names: list[str] = []
+    for rel in sorted(semantic_names):
+        iid = rel[len(WP7_SEMANTIC_PREFIX) : -len(".json")]
+        if iid and iid not in index_ids:
+            missing_blob_names.append(rel)
+
+    if not missing_blob_names:
+        return {"status": "ok", "user_id": user_id, "appended": 0, "scanned": len(semantic_names)}
+
+    appended = 0
+    for blob_name in missing_blob_names:
+        interaction_id = blob_name[len(WP7_SEMANTIC_PREFIX) : -len(".json")]
+        try:
+            bc = AzureBlobClient.get_blob_client(blob_name, user_id)
+            payload_raw = bc.download_blob().readall()
+            payload = json.loads(payload_raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                continue
+            semantic_blob_path = f"users/{user_id}/{blob_name}"
+            append_semantic_index_item(
+                user_id,
+                build_semantic_index_item(
+                    payload,
+                    user_id=user_id,
+                    interaction_id=interaction_id,
+                    semantic_blob_path=semantic_blob_path,
+                ),
+            )
+            appended += 1
+        except Exception as e:
+            logging.warning("WP7 index reconcile item failed user_id=%s blob=%s: %s", user_id, blob_name, e)
+            continue
+
+    logging.info(
+        "WP7: semantic index reconciled user_id=%s appended=%s missing_before=%s scanned=%s",
+        user_id,
+        appended,
+        len(missing_blob_names),
+        len(semantic_names),
+    )
+    return {
+        "status": "reconciled",
+        "user_id": user_id,
+        "appended": appended,
+        "missing_before": len(missing_blob_names),
+        "scanned": len(semantic_names),
+        "max_items": max_items,
+    }
 
 
 def extract_tools_used(tool_calls: Any, *, max_items: int = 25) -> List[str]:
@@ -329,7 +791,7 @@ def append_queue_item(user_id: str, item: Dict[str, Any]) -> None:
 
     client = _get_append_blob_client(user_id, WP7_QUEUE_BLOB_NAME)
     try:
-        _append_jsonl_line(client, line)
+        _append_jsonl_line(client, line, user_id=user_id, blob_label=WP7_QUEUE_BLOB_NAME)
     except AzureError as e:
         logging.error(f"WP7 append_queue_item failed: {e}")
         raise
@@ -343,33 +805,72 @@ def append_uncategorized_portfolio_item(user_id: str, item: Dict[str, Any]) -> N
 
     client = _get_append_blob_client(user_id, WP7_UNCATEGORIZED_PORTFOLIO_BLOB_NAME)
     try:
-        _append_jsonl_line(client, line)
+        _append_jsonl_line(client, line, user_id=user_id, blob_label=WP7_UNCATEGORIZED_PORTFOLIO_BLOB_NAME)
     except AzureError as e:
         logging.error(f"WP7 append_uncategorized_portfolio_item failed: {e}")
         raise
 
 
-def _append_jsonl_line(client: BlobClient, line: str) -> None:
-    """Append a JSONL line using Append Blob operations; migrate if blob exists as Block Blob."""
-    data = line.encode("utf-8")
-
-    # Create append blob if missing
+def _ensure_append_blob(client: BlobClient, *, user_id: str, blob_label: str) -> None:
+    """Ensure the target blob is an Append Blob, migrating if needed."""
     try:
-        client.get_blob_properties()
+        props = client.get_blob_properties()
     except ResourceNotFoundError:
         try:
             client.create_append_blob()
         except ResourceExistsError:
             pass
+        return
+
+    blob_type = getattr(props, "blob_type", "").lower()
+    if blob_type == "appendblob":
+        return
+
+    existing = b""
+    try:
+        existing = client.download_blob().readall()
+    except AzureError:
+        existing = b""
+
+    client.delete_blob()
+    try:
+        client.create_append_blob()
+    except ResourceExistsError:
+        pass
+    if existing:
+        client.upload_blob(existing, overwrite=True)
+    logging.warning(
+        "WP7: recreated %s for user_id=%s as AppendBlob (preserved %d bytes).",
+        blob_label,
+        user_id,
+        len(existing),
+    )
+
+
+def _append_jsonl_line(client: BlobClient, line: str, *, user_id: str, blob_label: str) -> None:
+    """Append a JSONL line using Append Blob operations; migrate if blob exists as Block Blob."""
+    data = line.encode("utf-8")
+
+    _ensure_append_blob(client, user_id=user_id, blob_label=blob_label)
 
     try:
         client.append_block(data)
         return
     except HttpResponseError as e:
-        # If the blob exists but is not an append blob (e.g. created earlier via upload_blob),
-        # fall back to overwrite-with-appended-text once (migration path).
-        msg = str(getattr(e, "message", "") or str(e))
-        if "AppendBlob" not in msg and "append" not in msg.lower():
+        err_msg = str(getattr(e, "message", "") or e)
+        err_code = str(getattr(e, "error_code", "") or "").lower()
+        if "invalidblobtype" in err_code or "invalidblobtype" in err_msg.lower():
+            _ensure_append_blob(client, user_id=user_id, blob_label=blob_label)
+            merged = data
+            existing = b""
+            try:
+                existing = client.download_blob().readall()
+            except ResourceNotFoundError:
+                existing = b""
+            merged = existing + data
+            client.upload_blob(merged, overwrite=True)
+            return
+        if "appendblob" not in err_msg.lower() and "append" not in err_msg.lower():
             raise
 
     existing = b""

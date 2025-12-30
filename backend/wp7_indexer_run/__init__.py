@@ -24,18 +24,30 @@ from shared.wp7_indexer import (
     WP7_UNCATEGORIZED_SCHEMA_V1,
     append_semantic_index_item,
     append_uncategorized_portfolio_item,
+    backfill_semantic_index_if_empty,
+    reconcile_semantic_index_missing,
     build_semantic_index_item,
     compact_indexer_items,
+    dedup_items_by_intent_norm,
     derive_signal_level,
     download_queue_tail,
     load_indexer_state,
     save_indexer_state,
     utc_now_iso,
+    wp7_text_json_schema_format,
 )
 
 
 def _parse_bool(value: Any) -> bool:
     return str(value or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _wp7_log_verbose() -> bool:
+    return str(os.environ.get("WP7_LOG_VERBOSE", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _wp7_enabled() -> bool:
+    return str(os.environ.get("WP7_ENABLED", "1") or "").strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _safe_int(value: Any, default: int) -> int:
@@ -104,11 +116,28 @@ def _load_thresholds(req: func.HttpRequest) -> QueueThresholds:
         body = req.get_json() if req.method.lower() == "post" else {}
     except Exception:
         body = {}
+    batch_mult = _safe_int(body.get("batch_size_multiplier") or os.environ.get("WP7_BATCH_SIZE_MULTIPLIER"), 9)
+    batch_mult = max(1, batch_mult)
+    if _wp7_log_verbose():
+        base_target = _safe_int(body.get("target_tokens") or os.environ.get("WP7_TARGET_BATCH_TOKENS"), 1000)
+        base_hard = _safe_int(body.get("hard_min_tokens") or os.environ.get("WP7_HARD_MIN_BATCH_TOKENS"), 600)
+        max_wait = _safe_int(body.get("max_wait_seconds") or os.environ.get("WP7_MAX_WAIT_SECONDS"), 300)
+        max_items = min(_safe_int(body.get("max_items_per_run") or os.environ.get("WP7_MAX_ITEMS_PER_RUN"), 25), 25)
+        logging.info(
+            "WP7(run): thresholds multiplier=%s target_tokens_eff=%s hard_min_eff=%s (base_target=%s base_hard_min=%s) max_wait_s=%s max_items=%s",
+            batch_mult,
+            base_target * batch_mult,
+            base_hard * batch_mult,
+            base_target,
+            base_hard,
+            max_wait,
+            max_items,
+        )
     return QueueThresholds(
-        target_tokens=_safe_int(body.get("target_tokens") or os.environ.get("WP7_TARGET_BATCH_TOKENS"), 1000),
-        hard_min_tokens=_safe_int(body.get("hard_min_tokens") or os.environ.get("WP7_HARD_MIN_BATCH_TOKENS"), 600),
+        target_tokens=_safe_int(body.get("target_tokens") or os.environ.get("WP7_TARGET_BATCH_TOKENS"), 1000) * batch_mult,
+        hard_min_tokens=_safe_int(body.get("hard_min_tokens") or os.environ.get("WP7_HARD_MIN_BATCH_TOKENS"), 600) * batch_mult,
         max_wait_seconds=_safe_int(body.get("max_wait_seconds") or os.environ.get("WP7_MAX_WAIT_SECONDS"), 300),
-        max_items_per_run=_safe_int(body.get("max_items_per_run") or os.environ.get("WP7_MAX_ITEMS_PER_RUN"), 25),
+        max_items_per_run=min(_safe_int(body.get("max_items_per_run") or os.environ.get("WP7_MAX_ITEMS_PER_RUN"), 25), 25),
         max_user_chars=_safe_int(os.environ.get("WP7_MAX_USER_CHARS"), 2000),
         max_assistant_chars=_safe_int(os.environ.get("WP7_MAX_ASSISTANT_CHARS"), 4000),
     )
@@ -147,13 +176,15 @@ def _call_indexer_model(openai_client: OpenAI, prompt_id: str, items: List[Dict[
     input_text = _create_indexer_input(items)
     # Output tokens are typically priced higher; keep a tight, per-item budget.
     # If the prompt is well-formed (strict JSON, short summaries), this cap should be sufficient.
-    per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 180)
-    max_output_tokens = max(256, min(4096, 128 + (max(1, len(items)) * max(60, per_item))))
+    per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 400)
+    max_output_tokens = max(1024, min(4096, 128 + (max(1, len(items)) * max(60, per_item))))
     resp = openai_client.responses.create(
         prompt={"id": prompt_id},
         input=input_text,
         tool_choice="none",
         parallel_tool_calls=False,
+        text=wp7_text_json_schema_format(),
+        reasoning={"effort": "minimal"},
         max_output_tokens=max_output_tokens,
         store=False,
         metadata={"runtime": "wp7_indexer"},
@@ -274,6 +305,21 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     """
     user_id = extract_user_id(req) or "default"
     thresholds = _load_thresholds(req)
+
+    if not _wp7_enabled():
+        return func.HttpResponse(
+            json.dumps({"status": "disabled", "user_id": user_id, "reason": "WP7_ENABLED=0"}, ensure_ascii=False),
+            mimetype="application/json",
+            status_code=503,
+        )
+
+    try:
+        max_backfill = _safe_int(os.environ.get("WP7_INDEX_BACKFILL_MAX_ITEMS"), 250)
+        backfill_semantic_index_if_empty(user_id, max_items=max_backfill)
+        if str(os.environ.get("WP7_INDEX_RECONCILE_MISSING", "1") or "").strip().lower() in ("1", "true", "yes", "y", "on"):
+            reconcile_semantic_index_missing(user_id, max_items=max_backfill)
+    except Exception as e:
+        logging.warning("WP7 semantic index backfill failed user_id=%s: %s", user_id, e)
 
     try:
         body = req.get_json() if req.method.lower() == "post" else {}
@@ -402,6 +448,15 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         if item.get("_skip"):
             continue
         batch_items.append(item)
+    rep_items, member_to_rep, distinct_intents = dedup_items_by_intent_norm(batch_items)
+    if batch_items and len(rep_items) != len(batch_items):
+        logging.info(
+            "WP7: dedup user_id=%s candidates=%s reps=%s distinct_intents=%s",
+            user_id,
+            len(batch_items),
+            len(rep_items),
+            distinct_intents,
+        )
 
     if dry_run:
         return func.HttpResponse(
@@ -431,7 +486,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     openai_client = OpenAI(api_key=openai_key)
 
     try:
-        artifacts = _call_indexer_model(openai_client, prompt_id, batch_items)
+        artifacts = _call_indexer_model(openai_client, prompt_id, rep_items)
     except Exception as e:
         logging.error(f"WP7 indexer call failed: {e}")
         # keep first_pending_at_utc to measure waiting window, do not advance offset
@@ -464,21 +519,23 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         iid = str(item.get("interaction_id") or "").strip()
         if not iid:
             continue
-        art = by_id.get(iid)
+        rep_iid = str(member_to_rep.get(iid) or iid).strip()
+        art = by_id.get(rep_iid)
         if art is None:
             # Do not advance offset past an item we didn't get an output for.
             missing += 1
             break
         try:
             semantic_blob_path = f"users/{user_id}/{WP7_SEMANTIC_PREFIX}{iid}.json"
-            _write_semantic_artifact(user_id, iid, art)
+            payload = dict(art or {})
+            payload["interaction_id"] = iid
+            _write_semantic_artifact(user_id, iid, payload)
             should_portfolio, reasons = _should_portfolio_uncategorized(art)
             if should_portfolio:
                 try:
-                    art = dict(art or {})
-                    art.setdefault("interaction_id", iid)
-                    art["portfolio_reasons"] = reasons
-                    _enqueue_uncategorized_portfolio(user_id, art, semantic_blob_path)
+                    p = dict(payload or {})
+                    p["portfolio_reasons"] = reasons
+                    _enqueue_uncategorized_portfolio(user_id, p, semantic_blob_path)
                 except Exception as pe:
                     logging.warning(f"WP7 uncategorized portfolio append failed for {iid}: {pe}")
             indexed += 1

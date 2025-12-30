@@ -29,14 +29,18 @@ from shared.wp7_indexer import (
     append_batch_audit_item,
     append_semantic_index_item,
     append_uncategorized_portfolio_item,
+    backfill_semantic_index_if_empty,
+    reconcile_semantic_index_missing,
     build_batch_audit_item,
     build_semantic_index_item,
     compact_indexer_items,
+    dedup_items_by_intent_norm,
     derive_signal_level,
     download_queue_tail,
     load_indexer_state,
     save_indexer_state,
     utc_now_iso,
+    wp7_text_json_schema_format,
 )
 
 
@@ -101,6 +105,10 @@ def _iter_jsonl_lines(data: bytes) -> List[Tuple[int, str]]:
 
 def _wp7_mode() -> str:
     return str(os.environ.get("WP7_INDEXER_MODE") or "sync").strip().lower()
+
+
+def _wp7_enabled() -> bool:
+    return str(os.environ.get("WP7_ENABLED", "1") or "").strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _discover_user_ids_with_queue() -> list[str]:
@@ -323,12 +331,16 @@ def _submit_openai_batch(
     offset_start: int,
     candidates_count: int,
     submitted_ids: List[str],
+    submitted_rep_ids: List[str] | None = None,
     candidate_ids: List[str],
     planned_advance_bytes: int,
+    member_to_rep: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
     input_text = _create_indexer_input(batch_items)
-    per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 180)
-    max_output_tokens = max(256, min(4096, 128 + (max(1, len(batch_items)) * max(60, per_item))))
+    # Guard against incomplete batch outputs (no output_text) when the model spends most of the
+    # budget on reasoning. Keep a sensible floor and allow env overrides.
+    per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 400)
+    max_output_tokens = max(1024, min(4096, 128 + (max(1, len(batch_items)) * max(60, per_item))))
 
     model = str(os.environ.get("OPENAI_INDEXER_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-5-mini").strip()
     body = {
@@ -337,6 +349,10 @@ def _submit_openai_batch(
         "input": input_text,
         "tool_choice": "none",
         "parallel_tool_calls": False,
+        # Enforce strict output at request-time (not only in Dashboard prompt settings).
+        "text": wp7_text_json_schema_format(),
+        # Keep reasoning minimal to avoid "completed but no output_text" / incomplete outputs.
+        "reasoning": {"effort": "minimal"},
         "max_output_tokens": max_output_tokens,
         # Avoid storing the response on OpenAI side unless explicitly needed.
         "store": False,
@@ -360,12 +376,14 @@ def _submit_openai_batch(
             metadata={"kind": "wp7_indexer", "user_id": str(user_id)},
         )
         logging.info(
-            "WP7: batch_submitted user_id=%s batch_id=%s input_file_id=%s model=%s custom_id=%s",
+            "WP7: batch_submitted user_id=%s batch_id=%s input_file_id=%s model=%s custom_id=%s items=%s max_output_tokens=%s",
             user_id,
             getattr(batch, "id", None),
             getattr(file_obj, "id", None),
             model,
             custom_id,
+            len(batch_items),
+            max_output_tokens,
         )
         try:
             append_batch_audit_item(
@@ -402,6 +420,8 @@ def _submit_openai_batch(
         "candidate_count": int(candidates_count),
         "candidate_interaction_ids": candidate_ids,
         "submitted_interaction_ids": submitted_ids,
+        "submitted_rep_interaction_ids": submitted_rep_ids or [],
+        "dedup_member_to_rep": member_to_rep or {},
     }
     _save_batch_state(user_id, state)
     return {
@@ -413,6 +433,7 @@ def _submit_openai_batch(
         "planned_advance_bytes": planned_advance_bytes,
         "candidate_count": candidates_count,
         "submitted_items": len(submitted_ids),
+        "submitted_rep_items": len(submitted_rep_ids or []),
         "custom_id": custom_id,
     }
 
@@ -496,6 +517,9 @@ def _ingest_batch_output(
     lines = _iter_jsonl_lines(data)
 
     submitted_ids = set(batch_state.get("submitted_interaction_ids") or [])
+    member_to_rep = batch_state.get("dedup_member_to_rep") or {}
+    if not isinstance(member_to_rep, dict):
+        member_to_rep = {}
     advanced_bytes = 0
     indexed = 0
     skipped_existing = 0
@@ -525,19 +549,21 @@ def _ingest_batch_output(
             # Stop: we cannot safely advance beyond an unsubmitted, unindexed item.
             break
 
-        art = by_id.get(iid)
+        rep_iid = str(member_to_rep.get(iid) or iid).strip()
+        art = by_id.get(rep_iid)
         if art is None:
             missing += 1
             break
         semantic_blob_path = f"users/{user_id}/{WP7_SEMANTIC_PREFIX}{iid}.json"
-        _write_semantic_artifact(user_id, iid, art)
+        payload = dict(art or {})
+        payload["interaction_id"] = iid
+        _write_semantic_artifact(user_id, iid, payload)
         should_portfolio, reasons = _should_portfolio_uncategorized(art)
         if should_portfolio:
             try:
-                art = dict(art or {})
-                art.setdefault("interaction_id", iid)
-                art["portfolio_reasons"] = reasons
-                _enqueue_uncategorized_portfolio(user_id, art, semantic_blob_path)
+                p = dict(payload or {})
+                p["portfolio_reasons"] = reasons
+                _enqueue_uncategorized_portfolio(user_id, p, semantic_blob_path)
             except Exception as pe:
                 logging.warning(f"WP7 uncategorized portfolio append failed for {iid}: {pe}")
         indexed += 1
@@ -614,8 +640,8 @@ def _resync_offset_to_newline(user_id: str, *, offset: int, lookback: int = 8192
 
 def _call_indexer_model(openai_client: OpenAI, prompt_id: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     input_text = _create_indexer_input(items)
-    per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 180)
-    max_output_tokens = max(256, min(4096, 128 + (max(1, len(items)) * max(60, per_item))))
+    per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 400)
+    max_output_tokens = max(1024, min(4096, 128 + (max(1, len(items)) * max(60, per_item))))
     resp = openai_client.responses.create(
         prompt={"id": prompt_id},
         input=input_text,
@@ -643,19 +669,35 @@ def _call_indexer_model(openai_client: OpenAI, prompt_id: str, items: List[Dict[
 
 
 def _thresholds_from_env() -> QueueThresholds:
+    # Reduce daily organization usage by sending larger batches less often.
+    # Multiplier affects only thresholds (when to run), not output schema limits (maxItems=25).
+    batch_mult = _safe_int(os.environ.get("WP7_BATCH_SIZE_MULTIPLIER"), 9)
+    batch_mult = max(1, batch_mult)
     return QueueThresholds(
-        target_tokens=_safe_int(os.environ.get("WP7_TARGET_BATCH_TOKENS"), 1000),
-        hard_min_tokens=_safe_int(os.environ.get("WP7_HARD_MIN_BATCH_TOKENS"), 600),
+        target_tokens=_safe_int(os.environ.get("WP7_TARGET_BATCH_TOKENS"), 1000) * batch_mult,
+        hard_min_tokens=_safe_int(os.environ.get("WP7_HARD_MIN_BATCH_TOKENS"), 600) * batch_mult,
         max_wait_seconds=_safe_int(os.environ.get("WP7_MAX_WAIT_SECONDS"), 300),
-        max_items_per_run=_safe_int(os.environ.get("WP7_MAX_ITEMS_PER_RUN"), 25),
+        max_items_per_run=min(_safe_int(os.environ.get("WP7_MAX_ITEMS_PER_RUN"), 25), 25),
         max_user_chars=_safe_int(os.environ.get("WP7_MAX_USER_CHARS"), 2000),
         max_assistant_chars=_safe_int(os.environ.get("WP7_MAX_ASSISTANT_CHARS"), 4000),
     )
 
 
+def _wp7_log_verbose() -> bool:
+    return str(os.environ.get("WP7_LOG_VERBOSE", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, thresholds: QueueThresholds) -> Dict[str, Any]:
     mode = _wp7_mode()
-    logging.info(f"WP7: tick user_id={user_id} mode={mode}")
+    if _wp7_log_verbose():
+        logging.info(f"WP7: tick user_id={user_id} mode={mode}")
+    try:
+        max_backfill = _safe_int(os.environ.get("WP7_INDEX_BACKFILL_MAX_ITEMS"), 250)
+        backfill_semantic_index_if_empty(user_id, max_items=max_backfill)
+        if str(os.environ.get("WP7_INDEX_RECONCILE_MISSING", "1") or "").strip().lower() in ("1", "true", "yes", "y", "on"):
+            reconcile_semantic_index_missing(user_id, max_items=max_backfill)
+    except Exception as e:
+        logging.warning("WP7 semantic index backfill failed user_id=%s: %s", user_id, e)
     if mode == "batch":
         bs = _load_batch_state(user_id)
         if _is_active_batch_state(bs):
@@ -750,7 +792,8 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
     if not lines:
         state["first_pending_at_utc"] = None
         save_indexer_state(user_id, state)
-        logging.info(f"WP7: idle user_id={user_id} mode={mode} queue_size_bytes={total} byte_offset={offset}")
+        if _wp7_log_verbose():
+            logging.info(f"WP7: idle user_id={user_id} mode={mode} queue_size_bytes={total} byte_offset={offset}")
         return {"status": "idle", "user_id": user_id, "byte_offset": offset, "queue_size_bytes": total}
 
     candidates: List[Tuple[int, Dict[str, Any]]] = []
@@ -785,17 +828,28 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
     should_run = token_sum >= thresholds.target_tokens or (
         elapsed_s >= thresholds.max_wait_seconds and token_sum >= thresholds.hard_min_tokens
     )
-    logging.info(
-        "WP7: queue_check user_id=%s mode=%s queue_size_bytes=%s byte_offset=%s candidates=%s tokens_sum=%s elapsed_s=%s should_run=%s",
-        user_id,
-        mode,
-        total,
-        offset,
-        len(candidates),
-        token_sum,
-        elapsed_s,
-        should_run,
-    )
+    if _wp7_log_verbose():
+        logging.info(
+            "WP7: queue_check user_id=%s mode=%s queue_size_bytes=%s byte_offset=%s candidates=%s tokens_sum=%s elapsed_s=%s should_run=%s",
+            user_id,
+            mode,
+            total,
+            offset,
+            len(candidates),
+            token_sum,
+            elapsed_s,
+            should_run,
+        )
+    elif should_run:
+        logging.info(
+            "WP7: run_trigger user_id=%s mode=%s candidates=%s tokens_sum=%s queue_size_bytes=%s byte_offset=%s",
+            user_id,
+            mode,
+            len(candidates),
+            token_sum,
+            total,
+            offset,
+        )
     if not should_run:
         save_indexer_state(user_id, state)
         return {
@@ -809,10 +863,20 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
         }
 
     batch_items: List[Dict[str, Any]] = [it for _, it in candidates if not it.get("_skip")]
+    rep_items, member_to_rep, distinct_intents = dedup_items_by_intent_norm(batch_items)
+    if batch_items and len(rep_items) != len(batch_items):
+        logging.info(
+            "WP7: dedup user_id=%s candidates=%s reps=%s distinct_intents=%s",
+            user_id,
+            len(batch_items),
+            len(rep_items),
+            distinct_intents,
+        )
 
     if mode == "batch":
         candidate_ids: List[str] = []
         submitted_ids: List[str] = []
+        submitted_rep_ids: List[str] = []
         planned_advance = 0
         for line_len, item in candidates:
             planned_advance += line_len
@@ -821,27 +885,37 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
                 candidate_ids.append(iid)
             if not item.get("_skip") and iid:
                 submitted_ids.append(iid)
+        for it in rep_items:
+            iid = str(it.get("interaction_id") or "").strip()
+            if iid:
+                submitted_rep_ids.append(iid)
+        per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 400)
+        planned_max_output_tokens = max(1024, min(4096, 128 + (max(1, len(rep_items)) * max(60, per_item))))
         logging.info(
-            "WP7: batch_submit user_id=%s candidates=%s submitted=%s tokens_sum=%s planned_advance_bytes=%s",
+            "WP7: batch_submit user_id=%s candidates=%s submitted=%s submitted_reps=%s tokens_sum=%s planned_advance_bytes=%s max_output_tokens=%s",
             user_id,
             len(candidate_ids),
             len(submitted_ids),
+            len(submitted_rep_ids),
             token_sum,
             planned_advance,
+            planned_max_output_tokens,
         )
         return _submit_openai_batch(
             openai_client,
             prompt_id=prompt_id,
             user_id=user_id,
-            batch_items=batch_items,
+            batch_items=rep_items,
             offset_start=offset,
             candidates_count=len(candidates),
             submitted_ids=submitted_ids,
+            submitted_rep_ids=submitted_rep_ids,
             candidate_ids=candidate_ids,
             planned_advance_bytes=planned_advance,
+            member_to_rep=member_to_rep,
         )
 
-    artifacts = _call_indexer_model(openai_client, prompt_id, batch_items)
+    artifacts = _call_indexer_model(openai_client, prompt_id, rep_items)
 
     by_id: Dict[str, Dict[str, Any]] = {}
     for art in artifacts:
@@ -863,19 +937,21 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
         iid = str(item.get("interaction_id") or "").strip()
         if not iid:
             continue
-        art = by_id.get(iid)
+        rep_iid = str(member_to_rep.get(iid) or iid).strip()
+        art = by_id.get(rep_iid)
         if art is None:
             missing += 1
             break
         semantic_blob_path = f"users/{user_id}/{WP7_SEMANTIC_PREFIX}{iid}.json"
-        _write_semantic_artifact(user_id, iid, art)
+        payload = dict(art or {})
+        payload["interaction_id"] = iid
+        _write_semantic_artifact(user_id, iid, payload)
         should_portfolio, reasons = _should_portfolio_uncategorized(art)
         if should_portfolio:
             try:
-                art = dict(art or {})
-                art.setdefault("interaction_id", iid)
-                art["portfolio_reasons"] = reasons
-                _enqueue_uncategorized_portfolio(user_id, art, semantic_blob_path)
+                p = dict(payload or {})
+                p["portfolio_reasons"] = reasons
+                _enqueue_uncategorized_portfolio(user_id, p, semantic_blob_path)
             except Exception as pe:
                 logging.warning(f"WP7 uncategorized portfolio append failed for {iid}: {pe}")
         indexed += 1
@@ -909,15 +985,20 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
 
 
 def main(timer: func.TimerRequest) -> None:
+    if not _wp7_enabled():
+        logging.info("WP7 indexer timer disabled (WP7_ENABLED=0)")
+        return
     user_ids_env = str(os.environ.get("WP7_INDEXER_USER_IDS", "default") or "").strip()
     if user_ids_env.lower() in ("auto", "*"):
         user_ids = _discover_user_ids_with_queue()
+        user_ids = [u for u in user_ids if str(u).strip() and str(u).strip().lower() not in ("none", "null")]
         if not user_ids:
             # No queues present; avoid doing any work.
             logging.info("WP7: timer_start user_ids=none (auto)")
             return
     else:
         user_ids = [u.strip() for u in user_ids_env.split(",") if u.strip()]
+        user_ids = [u for u in user_ids if u.strip().lower() not in ("none", "null")]
         if not user_ids:
             user_ids = ["default"]
 
@@ -929,12 +1010,18 @@ def main(timer: func.TimerRequest) -> None:
 
     thresholds = _thresholds_from_env()
     openai_client = OpenAI(api_key=openai_key)
+    batch_mult = max(1, _safe_int(os.environ.get("WP7_BATCH_SIZE_MULTIPLIER"), 9))
+    base_target = _safe_int(os.environ.get("WP7_TARGET_BATCH_TOKENS"), 1000)
+    base_hard_min = _safe_int(os.environ.get("WP7_HARD_MIN_BATCH_TOKENS"), 600)
     logging.info(
-        "WP7: timer_start user_ids=%s mode=%s target_tokens=%s hard_min_tokens=%s max_wait_s=%s max_items=%s",
+        "WP7: timer_start user_ids=%s mode=%s multiplier=%s target_tokens_eff=%s hard_min_eff=%s (base_target=%s base_hard_min=%s) max_wait_s=%s max_items=%s",
         ",".join(user_ids),
         _wp7_mode(),
+        batch_mult,
         thresholds.target_tokens,
         thresholds.hard_min_tokens,
+        base_target,
+        base_hard_min,
         thresholds.max_wait_seconds,
         thresholds.max_items_per_run,
     )
@@ -942,7 +1029,8 @@ def main(timer: func.TimerRequest) -> None:
     for user_id in user_ids:
         try:
             result = _run_for_user(openai_client, prompt_id, user_id, thresholds)
-            logging.info(f"WP7 indexer tick: {json.dumps(result, ensure_ascii=False)}")
+            if _wp7_log_verbose():
+                logging.info(f"WP7 indexer tick: {json.dumps(result, ensure_ascii=False)}")
         except AzureError as e:
             logging.error(f"WP7 indexer tick AzureError user_id={user_id}: {e}")
         except Exception as e:

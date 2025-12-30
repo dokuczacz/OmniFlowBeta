@@ -1,0 +1,3 @@
+{
+  "admin": "pbkdf2_sha256$260000$<salt>$<hash>"
+}

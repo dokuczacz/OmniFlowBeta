@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import time
+import hashlib
 from typing import Dict, Any, Tuple
 import uuid
 
@@ -46,17 +47,683 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 ASSISTANT_ID = os.environ.get("OPENAI_ASSISTANT_ID", "")
 OPENAI_PROMPT_ID = os.environ.get("OPENAI_PROMPT_ID", "")
 LLM_RUNTIME_DEFAULT = os.environ.get("LLM_RUNTIME", "assistants")
-HANDLES_CACHE_TTL_SECONDS = int(os.environ.get("HANDLES_CACHE_TTL_SECONDS", "60") or 60)
+# Cache `handles.json` in-memory to avoid repeated blob reads.
+# Default TTL is 10 minutes to tolerate long responses/tool loops without frequent cache refresh.
+HANDLES_CACHE_TTL_SECONDS = int(os.environ.get("HANDLES_CACHE_TTL_SECONDS", "600") or 600)
 PROXY_URL = os.environ.get("AZURE_PROXY_URL", "")
 PROXY_FUNCTION_KEY = os.environ.get("FUNCTION_CODE_PROXY_ROUTER", "")
 ENABLE_SAVE_INTERACTION = True  # Hardcoded to always enable saving for now
 VECTOR_STORE_ID = os.environ.get("OPENAI_VECTOR_STORE_ID", "")
 DEBUG_TOOL_CALL_HANDLER = os.environ.get("DEBUG_TOOL_CALL_HANDLER", "").lower() in ("1", "true", "yes")
 OPENAI_MAX_REQUESTS = int(os.environ.get("OPENAI_MAX_REQUESTS", "0") or 0)
+# WP6 routing: when UI does not send `context_mode`, fall back to this default.
+# Values: AUTO | FAST | DEEP
+WP6_DEFAULT_CONTEXT_MODE = (os.environ.get("WP6_DEFAULT_CONTEXT_MODE", "AUTO") or "AUTO").strip().upper()
+WP6_TOPIC_CHANGE_ENABLED = False
+WP6_TOPIC_CHANGE_WINDOW_SECONDS = 0
 # runtime counter for outbound OpenAI HTTP calls (best-effort)
 _openai_lock = threading.Lock()
 _openai_count = 0
 _handles_cache: Dict[str, Dict[str, Any]] = {}
+
+# WP6.M1: preferences cache (best-effort; no hard dependency)
+_prefs_cache: Dict[str, Dict[str, Any]] = {}
+PREFERENCES_CACHE_TTL_SECONDS = int(os.environ.get("PREFERENCES_CACHE_TTL_SECONDS", "600") or 600)
+WP6_PREFERENCES_AUTO_CREATE = str(os.environ.get("WP6_PREFERENCES_AUTO_CREATE", "1") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+)
+_prefs_loading = threading.local()
+
+WP6_FAST_MAX_INPUT_TOKENS = int(os.environ.get("WP6_FAST_MAX_INPUT_TOKENS", "2000") or 2000)
+WP6_FAST_MAX_SOURCES = int(os.environ.get("WP6_FAST_MAX_SOURCES", "4") or 4)
+WP6_FAST_MAX_RAW_BYTES = int(os.environ.get("WP6_FAST_MAX_RAW_BYTES", "64000") or 64000)
+WP6_DEEP_MAX_PACK_TOKENS = int(os.environ.get("WP6_DEEP_MAX_PACK_TOKENS", "16000") or 16000)
+WP6_DEEP_MAX_CANDIDATE_SOURCES = int(os.environ.get("WP6_DEEP_MAX_CANDIDATE_SOURCES", "12") or 12)
+WP6_DEEP_MIN_SEMANTIC_SELECTED = int(os.environ.get("WP6_DEEP_MIN_SEMANTIC_SELECTED", "3") or 3)
+WP6_DEEP_MIN_SEMANTIC_CANDIDATES = int(os.environ.get("WP6_DEEP_MIN_SEMANTIC_CANDIDATES", "6") or 6)
+WP6_CONTEXT_PACK_TTL_SECONDS = int(os.environ.get("WP6_CONTEXT_PACK_TTL_SECONDS", "300") or 300)
+WP6_DEEP_COOLDOWN_SECONDS = int(os.environ.get("WP6_DEEP_COOLDOWN_SECONDS", "600") or 600)
+OPENAI_CONTEXT_BUILDER_PROMPT_ID = os.environ.get("OPENAI_CONTEXT_BUILDER_PROMPT_ID", "")
+
+def _inprocess_call_function_main(main_fn, user_id: str, *, params: Dict[str, Any] | None = None, body: Dict[str, Any] | None = None):
+    """
+    Call an Azure Functions `main(req)` handler in-process without going through `execute_tool_call()`.
+
+    Purpose: avoid recursion (e.g. preferences loading calling execute_tool_call calling preferences loading).
+    """
+    class _Req:
+        def __init__(self, _params: Dict[str, Any] | None, _body: Dict[str, Any] | None, _user_id: str):
+            self.headers = {"x-user-id": str(_user_id), "X-User-Id": str(_user_id)}
+            self.params = dict(_params or {})
+            self._body = dict(_body or {})
+
+        def get_json(self):
+            return dict(self._body)
+
+    return main_fn(_Req(params, body, user_id))
+
+
+def _inprocess_read_blob_file(user_id: str, file_name: str) -> Dict[str, Any]:
+    from read_blob_file import main as read_blob_file_main
+    resp = _inprocess_call_function_main(read_blob_file_main, user_id, params={"file_name": file_name})
+    try:
+        body_text = resp.get_body().decode("utf-8") if hasattr(resp, "get_body") else str(resp)
+        return json.loads(body_text) if body_text else {}
+    except Exception:
+        return {}
+
+
+def _inprocess_upload_data_or_file(user_id: str, target_blob_name: str, file_content: Any) -> Dict[str, Any]:
+    from upload_data_or_file import main as upload_main
+    resp = _inprocess_call_function_main(
+        upload_main,
+        user_id,
+        body={"target_blob_name": target_blob_name, "file_content": file_content, "user_id": user_id},
+    )
+    try:
+        body_text = resp.get_body().decode("utf-8") if hasattr(resp, "get_body") else str(resp)
+        return json.loads(body_text) if body_text else {}
+    except Exception:
+        return {}
+
+
+def _load_preferences(user_id: str) -> Dict[str, Any]:
+    """
+    Load users/{user_id}/semantics/preferences.json (best-effort).
+
+    Behavior:
+    - If missing/invalid, returns {}.
+    - Cached in-memory for PREFERENCES_CACHE_TTL_SECONDS.
+    """
+    uid = str(user_id or "default").strip() or "default"
+    if PREFERENCES_CACHE_TTL_SECONDS > 0:
+        cached = _prefs_cache.get(uid)
+        if cached:
+            age = time.time() - cached.get("ts", 0)
+            if age <= PREFERENCES_CACHE_TTL_SECONDS:
+                return cached.get("data", {}) or {}
+    try:
+        setattr(_prefs_loading, "active", True)
+        payload = _inprocess_read_blob_file(uid, "semantics/preferences.json")
+        if isinstance(payload, dict) and payload.get("status") == "success":
+            prefs = payload.get("data")
+            if isinstance(prefs, str):
+                try:
+                    prefs = json.loads(prefs)
+                except Exception:
+                    prefs = {}
+            if isinstance(prefs, dict):
+                if PREFERENCES_CACHE_TTL_SECONDS > 0:
+                    _prefs_cache[uid] = {"data": prefs, "ts": time.time()}
+                return prefs
+
+        if WP6_PREFERENCES_AUTO_CREATE and isinstance(payload, dict) and payload.get("error"):
+            err_text = str(payload.get("error") or "").lower()
+            if "not found" in err_text or "blobnotfound" in err_text:
+                default_prefs = {
+                    "schema_version": "omniflow.wp6.preferences.v1",
+                    "updated_utc": datetime.datetime.utcnow().isoformat() + "Z",
+                    "brevity": "medium",
+                    "fast_mode": False,
+                    "allowed_reads": [],
+                    "disable_history_reads": False,
+                }
+                try:
+                    _inprocess_upload_data_or_file(uid, "semantics/preferences.json", default_prefs)
+                    if PREFERENCES_CACHE_TTL_SECONDS > 0:
+                        _prefs_cache[uid] = {"data": default_prefs, "ts": time.time()}
+                    return default_prefs
+                except Exception:
+                    pass
+        return {}
+    except Exception:
+        return {}
+    finally:
+        try:
+            setattr(_prefs_loading, "active", False)
+        except Exception:
+            pass
+
+
+def _bool_pref(prefs: Dict[str, Any], key: str, default: bool = False) -> bool:
+    try:
+        if key in (prefs or {}):
+            return str(prefs.get(key) or "").strip().lower() in ("1", "true", "yes", "y", "on")
+    except Exception:
+        pass
+    return default
+
+
+def _list_pref(prefs: Dict[str, Any], key: str) -> list:
+    v = (prefs or {}).get(key)
+    if isinstance(v, list):
+        out = []
+        for item in v:
+            s = str(item or "").strip()
+            if s:
+                out.append(s)
+        return out
+    return []
+
+
+def _wp6_is_history_path(file_name: str) -> bool:
+    fn = str(file_name or "").strip().lower()
+    return fn == "interaction_logs.json" or fn.startswith("interactions/")
+
+
+def _wp6_is_semantic_ok(file_name: str) -> bool:
+    fn = str(file_name or "").strip().lower()
+    # WP7 semantic artifacts are the intended source for cheap context rebuild.
+    return fn.startswith("interactions/semantic/") or fn.startswith("interactions/portfolio/")
+
+
+def _wp6_allowed_to_read(tool_name: str, normalized_args: Dict[str, Any], prefs: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Enforce WP6.M1 preferences on read-style tools.
+
+    - disable_history_reads blocks: get_interaction_history and interaction_logs/interactions reads (except semantic/portfolio).
+    - allowed_reads (if non-empty) restricts read targets to the allowlist (plus always-needed system files).
+    """
+    tool = str(tool_name or "").strip()
+    args = dict(normalized_args or {})
+
+    disable_history = _bool_pref(prefs, "disable_history_reads", False)
+    allowed_reads = set([s.strip() for s in _list_pref(prefs, "allowed_reads") if str(s).strip()])
+
+    always_allowed_files = {
+        "handles.json",
+        "current_thread.json",
+        "semantics/preferences.json",
+        "agent_exchange/agent_exchange.jsonl",
+    }
+
+    # If allowlist is active, block list_blobs to prevent broad browsing.
+    if tool == "list_blobs" and allowed_reads:
+        return False, "Blocked by preferences: allowed_reads is set; prefer read_blob_file/read_many_blobs on allowlisted files."
+
+    if tool == "get_interaction_history" and disable_history:
+        return False, "Blocked by preferences: disable_history_reads=true (use semantic index instead)."
+
+    # Determine read targets by tool
+    targets: list[str] = []
+    if tool == "read_blob_file":
+        targets = [str(args.get("file_name") or "").strip()]
+    elif tool == "read_many_blobs":
+        files = args.get("files")
+        if isinstance(files, list):
+            targets = [str(x or "").strip() for x in files]
+    elif tool == "get_filtered_data":
+        targets = [str(args.get("target_blob_name") or "").strip()]
+
+    targets = [t for t in targets if t]
+    if not targets:
+        return True, ""
+
+    # History gating
+    if disable_history:
+        for t in targets:
+            if _wp6_is_history_path(t) and not _wp6_is_semantic_ok(t):
+                return False, f"Blocked by preferences: disable_history_reads=true (target={t})."
+
+    # Allowlist gating (if present)
+    if allowed_reads:
+        for t in targets:
+            if t in always_allowed_files:
+                continue
+            if _wp6_is_semantic_ok(t):
+                continue
+            if t not in allowed_reads:
+                return False, f"Blocked by preferences: target not in allowed_reads (target={t})."
+
+    return True, ""
+
+
+def _wp6_est_tokens_from_text(text: str) -> int:
+    return int((len(text or "") + 3) // 4)
+
+
+def _wp6_norm_intent_key(user_message: str) -> str:
+    raw = str(user_message or "").strip().lower()
+    raw = " ".join(raw.split())
+    raw = raw[:256]
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _wp6_parse_need_deep_signal(text: str) -> Tuple[Dict[str, Any], str]:
+    """
+    Parse the WP6 "need_deep" signal from a FAST response.
+
+    Preferred contract: the first line is a single-line JSON object:
+      {"need_deep":false,"missing":[],"why":"","confidence":0.0,"deep_plan":[]}
+
+    Fallback contract: if the JSON is missing/unparseable, treat the presence of
+    "__ROUTE_DEEP__" anywhere in the text as need_deep=True.
+
+    Returns: (signal, cleaned_text) where cleaned_text has the first-line JSON stripped
+    when successfully parsed via JSON.
+    """
+
+    signal: Dict[str, Any] = {
+        "need_deep": False,
+        "missing": [],
+        "why": "",
+        "confidence": 0.0,
+        "deep_plan": [],
+        "parse_status": "none",
+    }
+    if not text:
+        return signal, text
+
+    raw_lines = str(text).splitlines()
+    first_line = raw_lines[0].strip() if raw_lines else ""
+
+    if first_line.startswith("{") and first_line.endswith("}"):
+        try:
+            obj = json.loads(first_line)
+            if isinstance(obj, dict) and ("need_deep" in obj):
+                signal["need_deep"] = bool(obj.get("need_deep"))
+                missing = obj.get("missing")
+                if isinstance(missing, list):
+                    signal["missing"] = [str(x)[:200] for x in missing if str(x).strip()][:10]
+                signal["why"] = str(obj.get("why") or "")[:300]
+                try:
+                    signal["confidence"] = float(obj.get("confidence") or 0.0)
+                except Exception:
+                    signal["confidence"] = 0.0
+                deep_plan = obj.get("deep_plan")
+                if isinstance(deep_plan, list):
+                    signal["deep_plan"] = [str(x)[:200] for x in deep_plan if str(x).strip()][:10]
+                signal["parse_status"] = "json"
+                cleaned = "\n".join(raw_lines[1:]).lstrip("\n")
+                return signal, cleaned
+        except Exception:
+            pass
+
+    if "__ROUTE_DEEP__" in str(text):
+        signal["need_deep"] = True
+        signal["parse_status"] = "token"
+        return signal, text
+
+    return signal, text
+
+
+def _wp6_detect_topic_change(intent_key: str, state: Dict[str, Any]) -> Tuple[bool, str]:
+    return False, "disabled"
+
+
+def _wp6_deep_cooldown_allowed(state: Dict[str, Any]) -> Tuple[bool, str]:
+    try:
+        last_ts = float((state or {}).get("wp6_last_deep_at") or 0.0)
+        if not last_ts:
+            return True, "cooldown_pass"
+        age = time.time() - last_ts
+        if age >= float(WP6_DEEP_COOLDOWN_SECONDS):
+            return True, "cooldown_pass"
+        return False, "cooldown_active"
+    except Exception:
+        return True, "cooldown_error"
+
+
+def _wp6_extract_semantic_ids_from_index(index_jsonl_text: str, max_ids: int) -> list[str]:
+    """
+    Extract recent interaction ids from the semantic index.
+
+    Important: older index.jsonl may contain many near-duplicate entries (same summary/tags).
+    To avoid re-reading almost the same blobs (esp. for DEEP candidate_sources), we keep only one id per
+    dedup group where possible.
+    """
+
+    if max_ids <= 0:
+        return []
+
+    # Parse most-recent-first.
+    raw_items: list[dict] = []
+    for line in (index_jsonl_text or "").splitlines()[::-1]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            raw_items.append(obj)
+        if len(raw_items) >= max_ids * 6:
+            break
+
+    def _ts_key(x: dict) -> float:
+        ts = str((x or {}).get("timestamp_utc") or "").strip()
+        if not ts:
+            return 0.0
+        try:
+            if ts.endswith("Z"):
+                ts = ts[:-1] + "+00:00"
+            return datetime.datetime.fromisoformat(ts).timestamp()
+        except Exception:
+            return 0.0
+
+    # Prefer the newest entry per dedup_key (if present); otherwise fall back to interaction_id.
+    by_key: dict[str, tuple[float, str]] = {}
+    for obj in raw_items:
+        iid = str(obj.get("interaction_id") or "").strip()
+        if not iid:
+            continue
+        key = str(obj.get("dedup_key") or iid).strip()
+        ts = _ts_key(obj)
+        prev = by_key.get(key)
+        if not prev or ts >= prev[0]:
+            by_key[key] = (ts, iid)
+
+    # Return newest-first, unique.
+    unique = sorted(by_key.values(), key=lambda t: t[0], reverse=True)
+    out: list[str] = []
+    for _, iid in unique:
+        if iid not in out:
+            out.append(iid)
+        if len(out) >= max_ids:
+            break
+    return out
+
+
+def _wp6_core_candidate_sources_tm_lo_ps(user_id: str) -> Tuple[list[dict], Dict[str, Any]]:
+    """
+    Provide short snippets for core PA files so Context Builder (no tools) can answer
+    TM/LO/PS-related questions without needing additional reads.
+    """
+
+    meta: Dict[str, Any] = {"core_snippets_count": 0, "core_snippets_bytes": 0, "core_files": []}
+    core_files = ["TM.json", "LO.json", "PS.json"]
+
+    try:
+        raw_str, _ = execute_tool_call(
+            "read_many_blobs",
+            {
+                "files": core_files,
+                "tail_lines": 80,
+                "tail_bytes": 16384,
+                "max_bytes_per_file": 12000,
+                "parse_json": False,
+                "max_files": len(core_files),
+            },
+            user_id,
+        )
+        payload = json.loads(raw_str) if isinstance(raw_str, str) else {}
+    except Exception:
+        payload = {}
+
+    out: list[dict] = []
+    if isinstance(payload, dict) and payload.get("status") == "success":
+        for it in (payload.get("items") or []):
+            if not isinstance(it, dict):
+                continue
+            path = str(it.get("path") or it.get("name") or "").strip()
+            data = it.get("data")
+            if not path or not isinstance(data, str):
+                continue
+            snippet = data.strip()
+            if not snippet:
+                continue
+            out.append({"path": path, "excerpt_or_snippet": snippet[:4000]})
+            meta["core_snippets_count"] += 1
+            meta["core_snippets_bytes"] += int(it.get("bytes") or 0)
+            meta["core_files"].append(path)
+
+    return out, meta
+
+
+def _wp6_sum_candidates(fast_meta: Dict[str, Any], core_meta: Dict[str, Any]) -> Tuple[int, int]:
+    selected = int((fast_meta or {}).get("selected_sources_count") or 0)
+    candidates = int((fast_meta or {}).get("semantic_candidates_count") or 0)
+    core = int((core_meta or {}).get("core_snippets_count") or 0)
+    return selected, candidates, core
+
+
+def _wp6_can_run_deep(fast_meta: Dict[str, Any], core_meta: Dict[str, Any], handles_state: Dict[str, Any]) -> Tuple[bool, str]:
+    selected, candidates, core = _wp6_sum_candidates(fast_meta, core_meta)
+    if selected >= 3 or candidates >= 6 or core >= 3:
+        allowed, reason = _wp6_deep_cooldown_allowed(handles_state)
+        if allowed:
+            return True, "inputs_ok"
+        return False, reason
+    return False, "insufficient_inputs"
+
+
+def _wp6_fast_context_from_wp7_semantic(user_id: str, max_sources: int, max_chars: int) -> Tuple[str, Dict[str, Any]]:
+    meta: Dict[str, Any] = {
+        "semantic_candidates_count": 0,
+        "selected_sources_count": 0,
+        "raw_bytes_read": 0,
+        "candidate_sources": [],
+    }
+
+    # Tail the semantic index
+    idx_str, _ = execute_tool_call(
+        "read_many_blobs",
+        {
+            "files": ["interactions/semantic/index.jsonl"],
+            "tail_lines": 200,
+            "tail_bytes": 65536,
+            "max_bytes_per_file": 48000,
+            "parse_json": False,
+            "max_files": 1,
+        },
+        user_id,
+    )
+    try:
+        idx_payload = json.loads(idx_str) if isinstance(idx_str, str) else {}
+    except Exception:
+        idx_payload = {}
+
+    index_text = ""
+    if isinstance(idx_payload, dict) and idx_payload.get("status") == "success":
+        items = idx_payload.get("items") or []
+        if isinstance(items, list) and items and isinstance(items[0], dict):
+            index_text = str(items[0].get("data") or "")
+            meta["raw_bytes_read"] += int(items[0].get("bytes") or 0)
+
+    interaction_ids = _wp6_extract_semantic_ids_from_index(index_text, max(1, max_sources) * 2)
+    meta["semantic_candidates_count"] = len(interaction_ids)
+    if not interaction_ids:
+        return "", meta
+
+    semantic_files = [f"interactions/semantic/{iid}.json" for iid in interaction_ids[: max(1, max_sources) * 2]]
+    sem_str, _ = execute_tool_call(
+        "read_many_blobs",
+        {
+            "files": semantic_files,
+            "max_bytes_per_file": max(2048, max_chars),
+            "parse_json": True,
+            "max_files": max(1, max_sources) * 2,
+        },
+        user_id,
+    )
+    try:
+        sem_payload = json.loads(sem_str) if isinstance(sem_str, str) else {}
+    except Exception:
+        sem_payload = {}
+
+    items_data: list[dict] = []
+    if isinstance(sem_payload, dict) and sem_payload.get("status") == "success":
+        for it in (sem_payload.get("items") or []):
+            if not isinstance(it, dict):
+                continue
+            meta["raw_bytes_read"] += int(it.get("bytes") or 0)
+            data = it.get("data")
+            if isinstance(data, dict):
+                items_data.append(data)
+
+    def _sig_rank(x: dict) -> int:
+        sl = str((x or {}).get("signal_level") or "").lower()
+        return 3 if sl == "high" else (2 if sl == "medium" else 1)
+
+    items_data.sort(key=_sig_rank, reverse=True)
+    out_lines: list[str] = []
+    used = 0
+    for it in items_data:
+        if used >= max_sources:
+            break
+        iid = str(it.get("interaction_id") or "").strip()
+        cat = str(it.get("category") or "").strip()
+        summ = str(it.get("summary") or "").strip()
+        tags = it.get("tags") if isinstance(it.get("tags"), list) else []
+        tags_s = ",".join([str(t) for t in tags[:6] if str(t).strip()])
+        if not iid or not summ:
+            continue
+        line = f"- [{cat}] {summ} (id={iid}{';tags='+tags_s if tags_s else ''})"
+        if (sum(len(x) + 1 for x in out_lines) + len(line)) > max_chars:
+            break
+        out_lines.append(line)
+        try:
+            meta["candidate_sources"].append(
+                {
+                    "path": f"interactions/semantic/{iid}.json",
+                    "excerpt_or_snippet": summ[:400],
+                }
+            )
+        except Exception:
+            pass
+        used += 1
+
+    meta["selected_sources_count"] = used
+    if not out_lines:
+        return "", meta
+
+    ctx = "WP7 semantic context (recent, prioritized):\n" + "\n".join(out_lines)
+    return ctx, meta
+
+
+def _wp6_route_context_mode(body: Dict[str, Any], user_message: str) -> Tuple[str, str, Dict[str, Any]]:
+    requested_raw = str(body.get("context_mode") or body.get("context") or "").strip().upper()
+    requested = requested_raw or WP6_DEFAULT_CONTEXT_MODE
+    if requested not in ("AUTO", "FAST", "DEEP"):
+        requested = "AUTO"
+
+    est_prompt_tokens = _wp6_est_tokens_from_text(user_message or "")
+    meta = {
+        "context_mode_requested": requested,
+        "context_mode_source": ("request" if requested_raw else "env_default"),
+        "prompt_chars": len(user_message or ""),
+        "prompt_tokens_est": est_prompt_tokens,
+    }
+
+    if requested == "DEEP":
+        return "DEEP", "explicit", meta
+    if requested == "FAST":
+        return "FAST", "explicit", meta
+
+    # AUTO is always FAST (for now).
+    return "FAST", "auto_fast", meta
+
+
+def _wp6_load_cached_pack_from_handles(state: Dict[str, Any], intent_key: str) -> Tuple[str, bool]:
+    try:
+        pack = (state or {}).get("context_pack")
+        if not isinstance(pack, dict):
+            return "", False
+        if str(pack.get("intent_key") or "") != str(intent_key):
+            return "", False
+        created_ts = float(pack.get("created_ts") or 0.0)
+        if not created_ts or (time.time() - created_ts) > WP6_CONTEXT_PACK_TTL_SECONDS:
+            return "", False
+        pack_path = str(pack.get("path") or "").strip()
+        return pack_path, bool(pack_path)
+    except Exception:
+        return "", False
+
+
+def _wp6_save_pack_to_blob(user_id: str, pack: Dict[str, Any]) -> str:
+    pack_id = f"pack_{uuid.uuid4().hex[:12]}"
+    path = f"semantics/context_packs/{pack_id}.json"
+    execute_tool_call("upload_data_or_file", {"target_blob_name": path, "file_content": pack}, user_id)
+    return path
+
+
+def _wp6_build_or_reuse_context_pack(
+    openai_client: OpenAI,
+    user_id: str,
+    thread_id: str,
+    user_message: str,
+    state: Dict[str, Any],
+    fast_ctx: str,
+    intent_key: str,
+    candidate_sources: list[dict] | None = None,
+    max_candidates: int | None = None,
+) -> Tuple[str, Dict[str, Any]]:
+    meta: Dict[str, Any] = {"intent_key": intent_key, "pack_reused": False, "pack_path": "", "pack_tokens_est": 0}
+
+    pack_path_cached, ok = _wp6_load_cached_pack_from_handles(state, intent_key)
+    if ok:
+        try:
+            pack_str, _ = execute_tool_call("read_blob_file", {"file_name": pack_path_cached}, user_id)
+            pack_payload = json.loads(pack_str) if isinstance(pack_str, str) else {}
+            if isinstance(pack_payload, dict) and pack_payload.get("status") == "success":
+                pack = pack_payload.get("data")
+                if isinstance(pack, dict):
+                    meta["pack_reused"] = True
+                    meta["pack_path"] = pack_path_cached
+                    meta["pack_tokens_est"] = int(pack.get("pack_tokens_est") or 0)
+                    return json.dumps(pack, ensure_ascii=False), meta
+        except Exception:
+            pass
+
+    if not OPENAI_CONTEXT_BUILDER_PROMPT_ID:
+        meta["error"] = "OPENAI_CONTEXT_BUILDER_PROMPT_ID not set"
+        return "", meta
+
+    # Contract: {request, candidate_sources[], constraints}
+    cand = list(candidate_sources or [])
+    if not cand:
+        cand = [{"path": "interactions/semantic/index.jsonl", "excerpt_or_snippet": str(fast_ctx or "")[:1200]}]
+
+    cb_input = {
+        "request": {"user_prompt": str(user_message or "")},
+        "candidate_sources": cand[: max(1, int(max_candidates or WP6_DEEP_MAX_CANDIDATE_SOURCES))],
+        "constraints": {"max_pack_tokens": WP6_DEEP_MAX_PACK_TOKENS, "max_bullets": 6, "max_top_sources": 5},
+    }
+
+    cb_kwargs: Dict[str, Any] = {
+        "prompt": {"id": OPENAI_CONTEXT_BUILDER_PROMPT_ID},
+        # Responses API requires `input` to be a string or array of input items; provide JSON as a string.
+        "input": json.dumps(cb_input, ensure_ascii=False),
+        "max_output_tokens": min(WP6_DEEP_MAX_PACK_TOKENS, 8192),
+        "metadata": {"user_id": str(user_id), "thread_id": str(thread_id), "runtime": "context_builder"},
+    }
+    cb_resp = _openai_call(openai_client.responses.create, **cb_kwargs)
+    cb_text = getattr(cb_resp, "output_text", None) or ""
+    try:
+        pack = json.loads(cb_text) if cb_text else {}
+    except Exception:
+        pack = {}
+    # Accept the configured schema (mode, summary, bullets, top_sources, pack_tokens_est, coverage, need_more_sources, created_utc)
+    required_keys = ("mode", "summary", "bullets", "top_sources", "pack_tokens_est", "coverage", "need_more_sources", "created_utc")
+    if not isinstance(pack, dict) or any(k not in pack for k in required_keys):
+        meta["error"] = "invalid_context_pack_output_schema"
+        return "", meta
+
+    try:
+        pack_path = _wp6_save_pack_to_blob(user_id, pack)
+        meta["pack_path"] = pack_path
+        meta["pack_tokens_est"] = int(pack.get("pack_tokens_est") or 0)
+        try:
+            handles = _load_handles(user_id)
+            if isinstance(handles, dict):
+                thread_state = handles.get(thread_id, {}) if isinstance(handles.get(thread_id), dict) else {}
+                handles[thread_id] = {
+                    **thread_state,
+                    "context_pack": {"path": pack_path, "intent_key": intent_key, "created_ts": time.time()},
+                    "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+                }
+                _save_handles(user_id, handles, async_save=True)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    return json.dumps(pack, ensure_ascii=False), meta
 
 # Optional global (cross-process) limit for tests. If set (>0), this will be
 # enforced by a simple file-based counter in `backend/logs/openai_global_counter.json`.
@@ -173,8 +840,13 @@ def normalize_tool_arguments(tool_name: str, tool_arguments: Dict[str, Any]) -> 
     if tool_name == "read_blob_file":
         file_name = pop_first("file_name", "target_blob_name", "blob_name", "name")
         if file_name:
-            if "/" in file_name:
-                file_name = file_name.split("/")[-1]
+            # Preserve user-relative paths (e.g. "interactions/semantic/index.jsonl").
+            # If the assistant passes "users/<id>/<path>", normalize to "<path>".
+            parts = [p for p in str(file_name).strip().split("/") if p]
+            if len(parts) >= 3 and parts[0].lower() == "users":
+                file_name = "/".join(parts[2:])
+            else:
+                file_name = "/".join(parts)
             args["file_name"] = file_name
 
     elif tool_name == "get_filtered_data":
@@ -478,7 +1150,33 @@ def _coerce_conversation_id(value: Any) -> str:
         return ""
 
 
-def run_responses(openai_client: OpenAI, user_id: str, user_message: str, thread_id: str) -> Tuple[str, list, Dict[str, Any], str]:
+def _persist_responses_state(user_id: str, thread_id: str, conversation_id: str, response_id: str) -> None:
+    """Persist Responses continuation pointers (best-effort)."""
+    try:
+        handles = _load_handles(user_id)
+        if not isinstance(handles, dict) or not thread_id:
+            return
+        prev = handles.get(thread_id, {}) if isinstance(handles.get(thread_id), dict) else {}
+        handles[thread_id] = {
+            **prev,
+            "responses_conversation_id": str(conversation_id or ""),
+            "responses_last_response_id": str(response_id or ""),
+            "active_runtime": "responses",
+            "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+        }
+        _save_handles(user_id, handles, async_save=True)
+    except Exception:
+        return
+
+
+def run_responses(
+    openai_client: OpenAI,
+    user_id: str,
+    user_message: str,
+    thread_id: str,
+    *,
+    persist_handles: bool = True,
+) -> Tuple[str, list, Dict[str, Any], str]:
     """Responses API deterministic tool loop using a Prompt ID (dual-runtime mode)."""
     if not thread_id:
         thread_id = f"handle_{uuid.uuid4().hex[:12]}"
@@ -492,6 +1190,9 @@ def run_responses(openai_client: OpenAI, user_id: str, user_message: str, thread
     all_tool_calls = []
     current_input: Any = user_message or ""
     retried_without_previous = False
+    responses_max_output_tokens = int(os.environ.get("RESPONSES_MAX_OUTPUT_TOKENS", "4096") or 4096)
+    retried_with_smaller_output = False
+    retried_after_tpm_reset = False
 
     for _ in range(25):
         create_kwargs: Dict[str, Any] = {
@@ -499,6 +1200,9 @@ def run_responses(openai_client: OpenAI, user_id: str, user_message: str, thread
             "input": current_input,
             "tool_choice": "auto",
             "parallel_tool_calls": False,
+            # Important: without an explicit cap, the Prompt/model defaults may request very large output budgets,
+            # which can blow TPM limits even for tiny user prompts (because conversation history is server-side).
+            "max_output_tokens": responses_max_output_tokens,
             "metadata": {"user_id": str(user_id), "thread_id": str(thread_id), "runtime": "responses"},
         }
         if conversation_id:
@@ -509,11 +1213,56 @@ def run_responses(openai_client: OpenAI, user_id: str, user_message: str, thread
         try:
             response = _openai_call(openai_client.responses.create, **create_kwargs)
         except Exception as exc:
+            msg = str(exc)
+            # If the request exceeds TPM due to a large server-side conversation context + large output budget,
+            # retry once with a much smaller max_output_tokens.
+            if (
+                (not retried_with_smaller_output)
+                and responses_max_output_tokens > 1024
+                and ("Request too large" in msg or "tokens per min" in msg or "TPM" in msg)
+            ):
+                retried_with_smaller_output = True
+                old = responses_max_output_tokens
+                responses_max_output_tokens = 1024
+                logging.warning(
+                    "Responses request hit TPM size limit; retrying with smaller max_output_tokens "
+                    f"user_id={user_id} thread_id={thread_id} old={old} new={responses_max_output_tokens}"
+                )
+                continue
+
+            # If shrinking output isn't enough, the server-side conversation history itself can exceed TPM.
+            # Self-heal by resetting persisted continuation pointers for this thread, then retry once.
+            if (
+                (not retried_after_tpm_reset)
+                and ("Request too large" in msg or "tokens per min" in msg or "TPM" in msg)
+                and (previous_response_id or conversation_id)
+                and isinstance(current_input, (str, bytes))
+            ):
+                retried_after_tpm_reset = True
+                logging.warning(
+                    "Responses request hit TPM size limit; resetting conversation continuation (previous_response_id + conversation) "
+                    f"user_id={user_id} thread_id={thread_id}"
+                )
+                previous_response_id = ""
+                conversation_id = ""
+                # Persist cleared continuation so subsequent calls don't keep failing.
+                try:
+                    if isinstance(handles, dict):
+                        handles[thread_id] = {
+                            **(state if isinstance(state, dict) else {}),
+                            "responses_conversation_id": "",
+                            "responses_last_response_id": "",
+                            "active_runtime": "responses",
+                            "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+                        }
+                        _save_handles(user_id, handles, async_save=True)
+                except Exception:
+                    pass
+                continue
             # If the last persisted `previous_response_id` points to a response that had pending tool calls
             # (e.g., crash before tool outputs were submitted), OpenAI rejects new input with:
             # "No tool output found for function call call_...". We can safely self-heal by retrying once
             # without previous_response_id (conversation id may still be kept).
-            msg = str(exc)
             if (
                 (not retried_without_previous)
                 and previous_response_id
@@ -552,7 +1301,7 @@ def run_responses(openai_client: OpenAI, user_id: str, user_message: str, thread
             meta = {"responses_conversation_id": conversation_id, "responses_last_response_id": previous_response_id}
             # Persist only after reaching a "final" response to avoid saving a response id with pending tool calls.
             try:
-                if isinstance(handles, dict):
+                if persist_handles and isinstance(handles, dict):
                     handles[thread_id] = {
                         **(state if isinstance(state, dict) else {}),
                         "responses_conversation_id": conversation_id,
@@ -1138,6 +1887,27 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
     params_with_user = {**(normalized_args or {}), "user_id": user_id}
     logging.debug(f"Dispatching tool={tool_name} with params={params_with_user}")
 
+    # WP6.M1 preferences enforcement (best-effort).
+    # Goal: reduce costly/history reads and prevent agent "browsing" beyond allowlisted files.
+    try:
+        # Prevent recursion while loading preferences.
+        if not getattr(_prefs_loading, "active", False):
+            prefs = _load_preferences(user_id)
+            allowed, reason = _wp6_allowed_to_read(tool_name, normalized_args, prefs)
+            if not allowed:
+                duration_ms = (time.time() - start_time) * 1000
+                info = {
+                    "tool_name": tool_name,
+                    "arguments": normalized_args,
+                    "status": "failed",
+                    "duration_ms": duration_ms,
+                    "error": reason,
+                    "code": "preferences_blocked",
+                }
+                return json.dumps({"error": reason, "code": "preferences_blocked"}), info
+    except Exception:
+        pass
+
     # Try in-process dispatch first
     try:
         from tools import dispatch_tool
@@ -1426,11 +2196,247 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         if runtime_used == "responses":
             request_start = time.time()
             try:
+                wp6_meta: Dict[str, Any] = {}
+                routed_mode, route_reason, route_meta = _wp6_route_context_mode(body, user_message)
+
+                # Build bounded FAST semantic context (used also as an input for DEEP builder).
+                fast_ctx, fast_meta = _wp6_fast_context_from_wp7_semantic(
+                    user_id=user_id,
+                    max_sources=min(WP6_FAST_MAX_SOURCES, 10),
+                    max_chars=min(WP6_FAST_MAX_RAW_BYTES, WP6_FAST_MAX_INPUT_TOKENS * 4),
+                )
+                wp6_meta = {**route_meta, **fast_meta}
+
+                handles_for_thread = _load_handles(user_id)
+                state_for_thread = (
+                    handles_for_thread.get(thread_id, {}) if (thread_id and isinstance(handles_for_thread, dict)) else {}
+                )
+                intent_key = _wp6_norm_intent_key(user_message)
+                wp6_meta["intent_key"] = intent_key
+
+                # Minimum input evidence for DEEP builder (Context Builder has no tools).
+                core_sources, core_meta = _wp6_core_candidate_sources_tm_lo_ps(user_id)
+                wp6_meta["core_snippets_count"] = int((core_meta or {}).get("core_snippets_count") or 0)
+                wp6_meta["core_snippets_bytes"] = int((core_meta or {}).get("core_snippets_bytes") or 0)
+
+                semantic_selected = int((fast_meta or {}).get("selected_sources_count") or 0)
+                semantic_candidates = int((fast_meta or {}).get("semantic_candidates_count") or 0)
+                deep_allowed_inputs = (
+                    semantic_selected >= int(WP6_DEEP_MIN_SEMANTIC_SELECTED)
+                    or semantic_candidates >= int(WP6_DEEP_MIN_SEMANTIC_CANDIDATES)
+                    or int(wp6_meta.get("core_snippets_count") or 0) >= 3
+                )
+                wp6_meta["deep_allowed_inputs"] = bool(deep_allowed_inputs)
+                wp6_meta["deep_allowed_inputs_semantic_selected"] = semantic_selected
+                wp6_meta["deep_allowed_inputs_semantic_candidates"] = semantic_candidates
+
+                # Cooldown is applied only for AUTO-mode escalations to avoid repeated costly DEEP runs.
+                cooldown_ok, cooldown_reason = _wp6_deep_cooldown_allowed(state_for_thread if isinstance(state_for_thread, dict) else {})
+                wp6_meta["deep_cooldown_ok"] = bool(cooldown_ok)
+                wp6_meta["deep_cooldown_reason"] = cooldown_reason
+
+                requested_mode = str(route_meta.get("context_mode_requested") or "AUTO").upper()
+                auto_mode = requested_mode == "AUTO"
+                deep_allowed = bool(deep_allowed_inputs) and (bool(cooldown_ok) if auto_mode else True)
+                wp6_meta["deep_allowed"] = bool(deep_allowed)
+
+                # FAST input (evidence-lite) is always built; used both for FAST run and as seed for DEEP builder.
+                fast_input_message = user_message
+                if fast_ctx:
+                    fast_input_message = f"[FAST_CONTEXT]\n{fast_ctx}\n\n[USER_MESSAGE]\n{user_message}"
+
+                # Routing: AUTO defaults to FAST; DEEP can be entered:
+                # - deterministically (e.g., FAST context empty) before first call, or
+                # - agent-driven after FAST via need_deep/__ROUTE_DEEP__ signal.
+                mode_initial = "FAST"
+                reason_initial = route_reason
+                if requested_mode == "DEEP":
+                    mode_initial = "DEEP"
+                    reason_initial = "explicit"
+                elif requested_mode == "FAST":
+                    mode_initial = "FAST"
+                    reason_initial = "explicit"
+                else:
+                    if deep_allowed and not str(fast_ctx or "").strip():
+                        mode_initial = "DEEP"
+                        reason_initial = "fast_context_empty"
+                    else:
+                        mode_initial = "FAST"
+                        reason_initial = "auto_fast"
+
+                wp6_meta["routing"] = {
+                    "mode_requested": requested_mode,
+                    "mode_initial": mode_initial,
+                    "reason_initial": reason_initial,
+                    "deep_allowed": bool(deep_allowed),
+                }
+
+                # For AUTO we delay persisting response continuation until we know if we escalate to DEEP.
+                persist_in_run = not auto_mode
+                escalations_used = 0
+
+                mode_used = mode_initial
+                mode_reason = reason_initial
+
+                # Helper: build Context Builder pack input and return model input message (or "" on failure).
+                def _build_deep_input_message() -> Tuple[str, Dict[str, Any]]:
+                    # Merge core snippets (TM/LO/PS) with semantic sources; keep order and dedupe by path.
+                    merged_sources: list[dict] = []
+                    seen_paths: set[str] = set()
+                    for src in (core_sources or []) + list((fast_meta or {}).get("candidate_sources") or []):
+                        if not isinstance(src, dict):
+                            continue
+                        pth = str(src.get("path") or "").strip()
+                        if not pth or pth in seen_paths:
+                            continue
+                        merged_sources.append(src)
+                        seen_paths.add(pth)
+
+                    max_candidates_eff = WP6_DEEP_MAX_CANDIDATE_SOURCES + (
+                        2 if int(wp6_meta.get("core_snippets_count") or 0) >= 3 else 0
+                    )
+                    wp6_meta["deep_max_candidates_eff"] = int(max_candidates_eff)
+                    wp6_meta["deep_candidate_sources_count"] = int(len(merged_sources))
+
+                    pack_text, pack_meta = _wp6_build_or_reuse_context_pack(
+                        openai_client=openai_client,
+                        user_id=user_id,
+                        thread_id=str(thread_id or ""),
+                        user_message=user_message,
+                        state=state_for_thread if isinstance(state_for_thread, dict) else {},
+                        fast_ctx=fast_ctx,
+                        intent_key=intent_key,
+                        candidate_sources=merged_sources,
+                        max_candidates=max_candidates_eff,
+                    )
+                    return (f"[CONTEXT_PACK_JSON]\n{pack_text}\n\n[USER_MESSAGE]\n{user_message}" if pack_text else ""), pack_meta
+
+                # Run phase 1 (FAST by default, or DEEP deterministically).
+                model_input_message = fast_input_message
+                if mode_initial == "DEEP":
+                    if deep_allowed_inputs:
+                        deep_input_message, pack_meta = _build_deep_input_message()
+                        wp6_meta.update(pack_meta)
+                        if deep_input_message:
+                            model_input_message = deep_input_message
+                            mode_used = "DEEP"
+                            mode_reason = reason_initial
+                        else:
+                            mode_used = "FAST"
+                            mode_reason = f"deep_fallback:{pack_meta.get('error') or 'no_pack'}"
+                            model_input_message = fast_input_message
+                    else:
+                        mode_used = "FAST"
+                        mode_reason = "deep_skipped_insufficient_inputs"
+                        model_input_message = fast_input_message
+
                 assistant_response, all_tool_calls, responses_meta, thread_id = run_responses(
                     openai_client=openai_client,
                     user_id=user_id,
-                    user_message=user_message,
+                    user_message=model_input_message,
                     thread_id=thread_id,
+                    persist_handles=persist_in_run,
+                )
+
+                # Phase 2 (AUTO only): parse FAST response signal and optionally escalate to DEEP once.
+                if auto_mode and mode_used == "FAST":
+                    signal, cleaned = _wp6_parse_need_deep_signal(assistant_response or "")
+                    wp6_meta["need_deep_signal"] = signal
+                    assistant_response = cleaned
+
+                    if bool(signal.get("need_deep")):
+                        wp6_meta["routing"]["need_deep_from_model"] = True
+                        wp6_meta["routing"]["parse_status"] = str(signal.get("parse_status") or "none")
+                        wp6_meta["routing"]["escalations_used"] = escalations_used
+
+                        if deep_allowed and escalations_used == 0:
+                            escalations_used = 1
+                            deep_input_message, pack_meta = _build_deep_input_message()
+                            wp6_meta.update(pack_meta)
+                            if deep_input_message:
+                                mode_used = "DEEP"
+                                mode_reason = "agent_need_deep"
+                                wp6_meta["routing"]["escalated"] = True
+                                wp6_meta["routing"]["escalations_used"] = escalations_used
+                                deep_resp, deep_calls, deep_meta, thread_id = run_responses(
+                                    openai_client=openai_client,
+                                    user_id=user_id,
+                                    user_message=deep_input_message,
+                                    thread_id=thread_id,
+                                    persist_handles=persist_in_run,
+                                )
+                                deep_signal, deep_cleaned = _wp6_parse_need_deep_signal(deep_resp or "")
+                                wp6_meta["need_deep_signal_deep"] = deep_signal
+                                assistant_response = deep_cleaned
+                                all_tool_calls = list(all_tool_calls or []) + list(deep_calls or [])
+                                responses_meta = deep_meta
+                            else:
+                                wp6_meta["routing"]["escalated"] = False
+                                wp6_meta["routing"]["escalation_block_reason"] = "no_context_pack"
+                        else:
+                            wp6_meta["routing"]["escalated"] = False
+                            wp6_meta["routing"]["escalation_block_reason"] = (
+                                "deep_disallowed" if not deep_allowed else "already_escalated"
+                            )
+                            missing = signal.get("missing") or []
+                            why = str(signal.get("why") or "").strip()
+                            if missing or why:
+                                note = "DEEP blocked"
+                                if why:
+                                    note += f": {why}"
+                                if missing:
+                                    note += f" (missing: {', '.join([str(x) for x in missing][:5])})"
+                                assistant_response = (assistant_response or "").rstrip() + "\n\n" + note
+                    else:
+                        wp6_meta["routing"]["need_deep_from_model"] = False
+                        wp6_meta["routing"]["parse_status"] = str(signal.get("parse_status") or "none")
+                        wp6_meta["routing"]["escalated"] = False
+
+                try:
+                    if isinstance(wp6_meta.get("routing"), dict):
+                        wp6_meta["routing"]["mode_used"] = mode_used
+                        wp6_meta["routing"]["reason_used"] = mode_reason
+                        wp6_meta["routing"]["escalations_used"] = int(escalations_used or 0)
+                except Exception:
+                    pass
+
+                # Persist continuation pointers for AUTO after deciding whether we escalated.
+                if auto_mode and isinstance(responses_meta, dict):
+                    _persist_responses_state(
+                        user_id=user_id,
+                        thread_id=str(thread_id or ""),
+                        conversation_id=str(responses_meta.get("responses_conversation_id") or ""),
+                        response_id=str(responses_meta.get("responses_last_response_id") or ""),
+                    )
+
+                # Persist last intent for deterministic topic-change routing (best-effort).
+                try:
+                    if isinstance(handles_for_thread, dict) and thread_id:
+                        thread_state = handles_for_thread.get(thread_id, {}) if isinstance(handles_for_thread.get(thread_id), dict) else {}
+                        handles_for_thread[thread_id] = {
+                            **thread_state,
+                            "wp6_last_intent_key": intent_key,
+                            "wp6_last_intent_ts": time.time(),
+                            "wp6_last_deep_at": (time.time() if mode_used == "DEEP" else float(thread_state.get("wp6_last_deep_at") or 0.0)),
+                            "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+                        }
+                        _save_handles(user_id, handles_for_thread, async_save=True)
+                except Exception:
+                    pass
+
+                wp6_meta["context_mode_used"] = mode_used
+                wp6_meta["context_mode_reason"] = mode_reason
+                wp6_meta["fast_ctx_tokens_est"] = _wp6_est_tokens_from_text(fast_ctx or "")
+                wp6_meta["fast_ctx_chars"] = len(fast_ctx or "")
+
+                logging.info(
+                    "WP6 route user_id=%s mode=%s reason=%s prompt_tokens_est=%s selected_sources=%s raw_bytes=%s",
+                    user_id,
+                    mode_used,
+                    mode_reason,
+                    wp6_meta.get("prompt_tokens_est"),
+                    wp6_meta.get("selected_sources_count"),
+                    wp6_meta.get("raw_bytes_read"),
                 )
             except RuntimeError as rexc:
                 return _make_response({"error": str(rexc), "runtime": "responses"}, status_code=500)
@@ -1439,6 +2445,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 return _make_response({"error": "Internal server error", "details": str(exc), "runtime": "responses"}, status_code=500)
 
             total_ms = (time.time() - request_start) * 1000
+            try:
+                if isinstance(responses_meta, dict):
+                    responses_meta["wp6"] = wp6_meta
+            except Exception:
+                pass
             return finalize_response(
                 openai_client=openai_client,
                 thread_id=thread_id,

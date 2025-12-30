@@ -28,6 +28,40 @@ See `.env.example` for a complete list of configuration options.
 
 ---
 
+## WP6 AUTO Routing (FAST + optional DEEP escalation)
+
+The Responses runtime supports a bounded "context routing" flow:
+
+- `AUTO` (default): starts in `FAST` using a small semantic context snippet.
+- `DEEP`: uses a Context Builder Prompt to generate a `context_pack` (JSON) based on candidate snippets.
+
+### Agent signal for DEEP (FAST → DEEP)
+
+In `AUTO` mode the first model call runs in `FAST`. The model can request one DEEP escalation by emitting a signal:
+
+1) Preferred (first line JSON, single line):
+```json
+{"need_deep":false,"missing":[],"why":"","confidence":0.0,"deep_plan":[]}
+```
+
+2) Fallback token (if JSON is missing/unparseable):
+```
+__ROUTE_DEEP__
+```
+
+The backend will perform **at most one** DEEP escalation per user message. If DEEP is blocked (e.g., cooldown, insufficient inputs), the backend returns the FAST answer plus a short note.
+
+### WP6 tuning env vars (local + Azure app settings)
+
+- `WP6_DEFAULT_CONTEXT_MODE`: `AUTO|FAST|DEEP`
+- `WP6_FAST_MAX_SOURCES`, `WP6_FAST_MAX_INPUT_TOKENS`, `WP6_FAST_MAX_RAW_BYTES`
+- `WP6_DEEP_MAX_PACK_TOKENS`, `WP6_DEEP_MAX_CANDIDATE_SOURCES`
+- `WP6_DEEP_MIN_SEMANTIC_SELECTED`, `WP6_DEEP_MIN_SEMANTIC_CANDIDATES`
+- `WP6_DEEP_COOLDOWN_SECONDS`
+- `OPENAI_CONTEXT_BUILDER_PROMPT_ID`
+
+---
+
 ## Minimal Usage Pattern
 
 ### 1. Authentication
