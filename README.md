@@ -71,8 +71,6 @@ OmniFlowBeta/
 4) Start Next UI: `cd ui_next && npm install && npm run dev`
 5) (Optional) Start Streamlit UI: `cd frontend && streamlit run app.py`
 
-If this saved you time, star the repo.
-
 ---
 
 ## Docs
@@ -83,7 +81,6 @@ If this saved you time, star the repo.
 - Context Builder (WP6): `docs/workflow/wp6_context_builder/README.md`
 - Deployment: `docs/shared/DEPLOYMENT.md`
 - Tool usage playbook: `FUNCTION_CALLS_PLAYBOOK.md`
-- Changelog: `CHANGELOG.md`
 
 ---
 
