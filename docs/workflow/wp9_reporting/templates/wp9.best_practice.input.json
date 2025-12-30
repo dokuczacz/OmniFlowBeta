@@ -1,0 +1,47 @@
+﻿{
+  "entry_type": "best_practice",
+  "plan_ref": {
+    "wp": "WP9",
+    "item": "WP9.best_practice",
+    "note": "Derived from the WP9 execution entry"
+  },
+  "subject": "Best practices: deterministic JSONL reporting (WP9)",
+  "changes": [],
+  "best_practice": {
+    "source_entry_id": "TO_BE_SET_AFTER_EXECUTION",
+    "items": [
+      {
+        "title": "Dedykowany writer (zero dowolności formatu)",
+        "rationale": "Spójność danych i automatyczne parsowanie przez agentów AI wymagają 1 kontraktu zapisu.",
+        "evidence": "Wpisy powstają wyłącznie przez append_report_entry.py + walidację schema_v1.py.",
+        "action": "Każdą notatkę plan/execution/best_practice dopisuj wyłącznie przez skrypt; nie edytuj JSONL ręcznie."
+      },
+      {
+        "title": "JSONL jako append-only z lockiem",
+        "rationale": "Append-only minimalizuje ryzyko uszkodzenia pliku i konfliktów przy równoległych zapisach.",
+        "evidence": "local_jsonl_store.py używa pliku .lock i dopisuje liniami (1 wpis = 1 linia).",
+        "action": "Nie edytuj istniejących linii; dopisuj korekty jako nowe wpisy."
+      },
+      {
+        "title": "Powiązanie best practice z execution przez source_entry_id",
+        "rationale": "Agenty muszą móc odtworzyć kontekst i dowody dla wniosków (traceability).",
+        "evidence": "best_practice.source_entry_id w schemacie wskazuje na entry_id wpisu execution.",
+        "action": "Każda best practice musi wskazywać konkretny execution entry_id."
+      },
+      {
+        "title": "Lokalna trwałość > Azurite",
+        "rationale": "Azurite jest nietrwałe i nie może być źródłem prawdy dla retrospektywy/uczenia agentów.",
+        "evidence": "Raporty są utrzymywane lokalnie w plikach *.jsonl w docs/workflow/wp9_reporting/.",
+        "action": "Traktuj raporty jako lokalny artefakt sesji roboczej; nie polegaj na emulatorze storage."
+      },
+      {
+        "title": "Minimalny, ale bogaty kontekst",
+        "rationale": "Raport ma zawierać tylko niezbędne pola, ale wystarczające do automatycznego wnioskowania.",
+        "evidence": "Pola: timestamp_utc, plan_ref, changes[], execution.status, tags[] (i opcjonalnie timings/runtime).",
+        "action": "Wypełniaj zawsze plan_ref i changes[]; resztę dodawaj tylko gdy wnosi wartość operacyjną."
+      }
+    ]
+  },
+  "tags": ["wp9", "best_practice"]
+}
+

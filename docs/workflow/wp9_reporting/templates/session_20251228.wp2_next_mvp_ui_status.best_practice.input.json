@@ -1,0 +1,34 @@
+{
+  "entry_type": "best_practice",
+  "plan_ref": {
+    "wp": "WP2",
+    "item": "WP2.nextjs_mvp_status_logging_v1",
+    "note": "Best practices derived from the execution entry"
+  },
+  "subject": "Best practices: MVP status UX without backend streaming (robust fallbacks + deterministic logs)",
+  "changes": [],
+  "best_practice": {
+    "source_entry_id": "rep_deac2b139cea4870aa773fe5823343df",
+    "items": [
+      {
+        "title": "Prefer deterministic UI-side status stages when backend is buffered",
+        "rationale": "If the backend does not stream, the UI still needs perceived-latency cues to prevent repeated clicks and confusion.",
+        "evidence": "UI emits 'User message sent' -> 'Agent is thinking' -> 'Rendering response' -> 'Finished' even for JSON-only responses.",
+        "action": "Keep status updates in the UI pipeline and treat backend streaming as an optional enhancement."
+      },
+      {
+        "title": "Log to a stable repo-level path (avoid cwd ambiguity)",
+        "rationale": "Next dev servers can run from different working directories; relying on process.cwd() makes logs appear in unexpected locations.",
+        "evidence": "Added diagnostics and ensured logs are written to a consistent repo-level log file.",
+        "action": "Use resolved absolute paths for operational logs and expose a simple GET endpoint for path verification."
+      },
+      {
+        "title": "Remove deprecated UI stacks to reduce maintenance",
+        "rationale": "Keeping multiple UI implementations increases confusion and breaks deterministic onboarding.",
+        "evidence": "Shiny UI folder and Shiny-specific docs/scripts were removed.",
+        "action": "Maintain a single supported UI path and keep docs pointing only to the active one."
+      }
+    ]
+  },
+  "tags": ["wp2", "best_practice", "ui", "logging", "deterministic", "cleanup"]
+}

@@ -1,0 +1,48 @@
+{
+  "entry_type": "plan",
+  "plan_ref": {
+    "wp": "WP6",
+    "item": "WP6.blob_browse_tools_v1",
+    "note": "Reduce agent guessing + bandwidth by enabling selective listing/reading (meta + multi-read + safe resolve)."
+  },
+  "subject": "WP6.A: Blob browsing upgrades (list meta + read_many_blobs + safer read_blob_file) + prompt-facing usage docs",
+  "changes": [
+    {
+      "kind": "code",
+      "path": "backend/list_blobs/__init__.py",
+      "summary": "Add include_meta=1 option to return size/last_modified alongside blob names."
+    },
+    {
+      "kind": "code",
+      "path": "backend/read_many_blobs/__init__.py",
+      "summary": "New endpoint to read N blobs with limits and optional tail extraction for JSONL/text."
+    },
+    {
+      "kind": "code",
+      "path": "backend/tools/read_many_blobs.py",
+      "summary": "Register read_many_blobs in-process to avoid proxy fallback and latency."
+    },
+    {
+      "kind": "code",
+      "path": "backend/read_blob_file/__init__.py",
+      "summary": "On 404 + basename-only, attempt unique suffix resolve within the user namespace (safe hardening)."
+    },
+    {
+      "kind": "doc",
+      "path": "FUNCTION_CALLS_PLAYBOOK.md",
+      "summary": "Add copy/paste examples and guardrails for correct tool usage."
+    },
+    {
+      "kind": "data",
+      "path": "AGENT_FUNCTIONS_CATALOG.json",
+      "summary": "Add prompt-ready tool catalog + OpenAI function schema for read_many_blobs."
+    },
+    {
+      "kind": "config",
+      "path": "backend/custom_gpt_tools/actions_openapi.json",
+      "summary": "Expose /api/read_many_blobs in OpenAPI for Custom GPT Actions (function key placeholder)."
+    }
+  ],
+  "tags": ["wp6", "tools", "storage", "blob", "read-many", "prompt", "docs"]
+}
+

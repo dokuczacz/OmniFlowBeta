@@ -1,0 +1,63 @@
+{
+  "entry_type": "plan",
+  "plan_ref": {
+    "wp": "WP1",
+    "item": "WP1.local_dev_storage_normalization",
+    "note": "Fix Azurite/local dev storage config + bootstrap missing user artifacts"
+  },
+  "subject": "WP1: Stabilize local dev (Azurite) for blob tools + handles.json auto-init (Responses runtime support)",
+  "changes": [
+    {
+      "kind": "code",
+      "path": "backend/shared/config.py",
+      "summary": "Normalize storage connection string and fallback to AzureWebJobsStorage for local Azurite."
+    },
+    {
+      "kind": "code",
+      "path": "backend/list_blobs/__init__.py",
+      "summary": "Use AzureConfig.CONNECTION_STRING / CONTAINER_NAME instead of raw env access."
+    },
+    {
+      "kind": "code",
+      "path": "backend/read_blob_file/__init__.py",
+      "summary": "Use AzureConfig.CONNECTION_STRING / CONTAINER_NAME instead of raw env access."
+    },
+    {
+      "kind": "code",
+      "path": "backend/upload_data_or_file/__init__.py",
+      "summary": "Use AzureConfig.CONNECTION_STRING / CONTAINER_NAME so writes work with UseDevelopmentStorage=true."
+    },
+    {
+      "kind": "code",
+      "path": "backend/get_filtered_data/__init__.py",
+      "summary": "Use AzureConfig.CONNECTION_STRING / CONTAINER_NAME instead of raw env access."
+    },
+    {
+      "kind": "code",
+      "path": "backend/add_new_data/__init__.py",
+      "summary": "Use AzureConfig.CONNECTION_STRING / CONTAINER_NAME instead of raw env access."
+    },
+    {
+      "kind": "code",
+      "path": "backend/manage_files/__init__.py",
+      "summary": "Use AzureConfig.CONNECTION_STRING / CONTAINER_NAME instead of raw env access."
+    },
+    {
+      "kind": "code",
+      "path": "backend/remove_data_entry/__init__.py",
+      "summary": "Use AzureConfig.CONNECTION_STRING / CONTAINER_NAME instead of raw env access."
+    },
+    {
+      "kind": "code",
+      "path": "backend/update_data_entry/__init__.py",
+      "summary": "Use AzureConfig.CONNECTION_STRING / CONTAINER_NAME instead of raw env access."
+    },
+    {
+      "kind": "code",
+      "path": "backend/tool_call_handler/__init__.py",
+      "summary": "Auto-initialize missing users/<user_id>/handles.json and rely on Prompt tools (no code fallback for Responses tools)."
+    }
+  ],
+  "tags": ["wp1", "responses", "local-dev", "azurite", "storage", "bugfix"]
+}
+

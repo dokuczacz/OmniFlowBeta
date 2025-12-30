@@ -1,0 +1,46 @@
+{
+  "entry_type": "best_practice",
+  "plan_ref": {
+    "wp": "WP1",
+    "item": "WP1.local_dev_storage_normalization",
+    "note": "Derived from the corresponding execution entry"
+  },
+  "subject": "Best practices: local dev stability for Responses + storage tools",
+  "changes": [],
+  "best_practice": {
+    "source_entry_id": "rep_4907449de57547b385982163e0436435",
+    "items": [
+      {
+        "title": "Centralize env normalization for emulators",
+        "rationale": "Local dev often uses shorthand (e.g. UseDevelopmentStorage=true) that some SDKs do not accept; normalizing once prevents repeated failures across endpoints.",
+        "evidence": "Connection string errors appeared in list/read/upload/filter tools until AzureConfig resolver was used everywhere.",
+        "action": "Route all storage client creation through AzureConfig.CONNECTION_STRING (or a single factory) and never read raw env vars in individual functions."
+      },
+      {
+        "title": "Fix the write-path, not only the read-path",
+        "rationale": "Self-healing bootstrap (e.g. handles.json auto-init) is ineffective if the write tool still fails on env/SDK issues.",
+        "evidence": "handles.json was repeatedly missing until upload_data_or_file was updated to use AzureConfig.CONNECTION_STRING.",
+        "action": "When adding auto-init, validate that the corresponding persistence path succeeds under the same runtime/environment."
+      },
+      {
+        "title": "Repo-wide audit for repeated env patterns",
+        "rationale": "When one function fails due to config shape, others usually share the same code pattern; fixing only one leads to recurring incidents.",
+        "evidence": "The same connection string issue existed across add/remove/update/manage/get_filtered/read/list/upload.",
+        "action": "On first occurrence, run a repo-wide search and apply a minimal, consistent patch across all affected modules."
+      },
+      {
+        "title": "Bootstrap missing storage artifacts deterministically",
+        "rationale": "Local emulators are non-durable; missing blob files should not require manual intervention during dev/testing.",
+        "evidence": "tool_call_handler now initializes missing users/<user_id>/handles.json and continues without hard failure.",
+        "action": "Treat baseline user artifacts (handles.json, interaction_logs.json, etc.) as bootstrap-on-demand and log the event."
+      },
+      {
+        "title": "Keep Prompt Tools as the source of truth (Responses)",
+        "rationale": "Duplicating tool schemas in code and Prompt leads to drift; tool-calling should be controlled centrally in the Prompt configuration.",
+        "evidence": "Fallback tools injection was removed to force correct Prompt configuration and avoid silent divergence.",
+        "action": "Configure tools in the Prompt dashboard; keep runtime code focused on deterministic orchestration and tool execution."
+      }
+    ]
+  },
+  "tags": ["wp1", "best_practice", "local-dev", "storage", "responses"]
+}

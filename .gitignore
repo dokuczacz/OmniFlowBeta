@@ -54,7 +54,12 @@ node_modules/
 .cache/
 .next/
 .turbo/
-ui_next/
+# Next UI (track source, ignore build artifacts + local env)
+ui_next/node_modules/
+ui_next/.next/
+ui_next/out/
+ui_next/.env.local
+ui_next/.env*.local
 
 # Streamlit secrets
 frontend/.streamlit/secrets.toml
@@ -63,7 +68,9 @@ frontend/.streamlit/secrets.toml
 ui_shiny/ui_users.json
 
 # Local workflow/progress reports (keep out of public repo)
-docs/workflow/
+# Track workflow docs (schemas/READMEs); ignore generated/local artifacts only.
+docs/workflow/**/__pycache__/
+docs/workflow/wp9_reporting/reports*.jsonl*
 
 # Local helper scripts (optional, keep local by default)
 scripts/
@@ -82,6 +89,14 @@ frontend/test_*.py
 # Docs: keep only minimal public docs
 docs/*
 !docs/shared/
+!docs/README.md
+!docs/PATCH_2_STATUS.md
+!docs/WP7_Indexer_Batch.md
+!docs/workflow/
+!docs/workflow/wp6_context_builder/
+!docs/workflow/wp6_context_builder/**
+!docs/workflow/wp9_reporting/README.md
+!docs/workflow/wp9_reporting/schema_v1.py
 docs/shared/*
 !docs/shared/README.md
 !docs/shared/USER_MANAGEMENT.md
@@ -89,6 +104,7 @@ docs/shared/*
 !docs/shared/DEMO.md
 !docs/shared/GITHUB_DISCUSSIONS_TEMPLATES.md
 !docs/shared/WP2_NEXT_UI_PLAN.md
+!docs/shared/DOCS_STANDARD.md
 
 # Local scratch docs (optional)
 /CHANGES.md

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "omniflow.wp6.preferences.v1",
+  "title": "OmniFlow WP6 Preferences (v1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "updated_utc"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "omniflow.wp6.preferences.v1"
+    },
+    "updated_utc": {
+      "type": "string",
+      "description": "UTC ISO8601 timestamp.",
+      "pattern": "Z$"
+    },
+    "brevity": {
+      "type": "string",
+      "enum": ["short", "medium", "long"],
+      "description": "Preferred response length."
+    },
+    "fast_mode": {
+      "type": "boolean",
+      "description": "If true, prefer minimal reads and faster reasoning presets when possible."
+    },
+    "allowed_reads": {
+      "type": "array",
+      "description": "Allowlisted blob names/paths (relative to user namespace) for read operations in FAST mode.",
+      "items": { "type": "string" },
+      "maxItems": 64
+    },
+    "disable_history_reads": {
+      "type": "boolean",
+      "description": "If true, block history-style reads (get_interaction_history and reading interaction_logs.json)."
+    }
+  }
+}
+
