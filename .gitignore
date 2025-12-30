@@ -44,6 +44,7 @@ htmlcov/
 tools/pretty_interactions.py
 tools/pretty_wp7_outputs.py
 tools/out/
+external/
 
 # OS
 .DS_Store
