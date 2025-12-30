@@ -5,7 +5,7 @@ import os
 import sys
 import time
 import hashlib
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List
 import uuid
 
 try:
@@ -727,7 +727,13 @@ def _wp6_write_fast_audit(
         return ""
 
 
-def _wp7_prepare_audit_input(user_id: str, *, count: int = 50) -> Dict[str, Any]:
+def _wp7_prepare_audit_input(
+    user_id: str,
+    *,
+    count: int = 50,
+    max_scan: int = 500,
+    skip_already_audited: bool = True,
+) -> Dict[str, Any]:
     """
     Prepare WP7 audit evidence bundle: >=50 index entries + >=50 corresponding artifacts.
 
@@ -752,12 +758,23 @@ def _wp7_prepare_audit_input(user_id: str, *, count: int = 50) -> Dict[str, Any]
         except Exception:
             continue
 
+    if max_scan > 0 and len(entries) > max_scan:
+        entries = entries[-max_scan:]
+
+    audited_ids: List[str] = []
+    if skip_already_audited:
+        handles = _load_handles(user_id)
+        audited_ids = _wp_audit_state(handles, "wp7").get("audited_ids", []) if isinstance(handles, dict) else []
+        audited_ids = [str(x) for x in audited_ids if str(x)]
+
     # Select most recent unique interaction_ids.
     seen: set[str] = set()
     selected: List[Dict[str, Any]] = []
     for e in reversed(entries):
         iid = str((e or {}).get("interaction_id") or "").strip()
         if not iid or iid in seen:
+            continue
+        if skip_already_audited and iid in audited_ids:
             continue
         seen.add(iid)
         selected.append(e)
@@ -799,6 +816,57 @@ def _wp7_prepare_audit_input(user_id: str, *, count: int = 50) -> Dict[str, Any]
         "artifacts": artifacts,
     }
     return out
+
+
+def _wp_audit_state(handles: Dict[str, Any], audit_type: str) -> Dict[str, Any]:
+    state = handles.get("_audit_state", {}) if isinstance(handles, dict) else {}
+    return state.get(audit_type, {}) if isinstance(state, dict) else {}
+
+
+def _wp_audit_update_state(
+    user_id: str,
+    *,
+    audit_type: str,
+    audited_ids: List[str],
+) -> None:
+    if not audited_ids:
+        return
+    try:
+        handles = _load_handles(user_id)
+        if not isinstance(handles, dict):
+            return
+        state = handles.get("_audit_state", {}) if isinstance(handles.get("_audit_state"), dict) else {}
+        type_state = state.get(audit_type, {}) if isinstance(state.get(audit_type), dict) else {}
+        existing = type_state.get("audited_ids")
+        ids = []
+        if isinstance(existing, list):
+            ids = [str(x) for x in existing if str(x)]
+        for i in audited_ids:
+            if i not in ids:
+                ids.append(i)
+        # Keep bounded history
+        max_keep = 2000
+        if len(ids) > max_keep:
+            ids = ids[-max_keep:]
+        type_state["audited_ids"] = ids
+        type_state["updated_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+        handles["_audit_state"] = {**state, audit_type: type_state}
+        _save_handles(user_id, handles, async_save=True)
+    except Exception as exc:
+        _best_effort_debug("audit_state_update_failed", user_id=str(user_id), audit_type=audit_type, error=exc)
+
+
+def _wp_audit_write_log(user_id: str, *, audit_type: str, payload: Dict[str, Any]) -> str:
+    try:
+        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        suffix = uuid.uuid4().hex[:8]
+        run_id = str(payload.get("run_id") or "run")
+        path = f"semantics/audits/{audit_type}/{ts}_{run_id}_{suffix}.json"
+        execute_tool_call("upload_data_or_file", {"target_blob_name": path, "file_content": payload}, user_id)
+        return path
+    except Exception as exc:
+        _best_effort_debug("audit_log_write_failed", user_id=str(user_id), audit_type=audit_type, error=exc)
+        return ""
 
 
 def _wp7_audit_json_schema() -> Dict[str, Any]:
@@ -955,6 +1023,8 @@ def _wp6_prepare_audit_samples(
     max_sources: int = 8,
     max_chars: int = 12000,
     recent_turns: int = 5,
+    recent_interactions: int = 200,
+    skip_already_audited: bool = True,
 ) -> Dict[str, Any]:
     """
     Prepare WP6 audit samples (fast_in/fast_out pairs) from `interaction_logs.json`
@@ -982,6 +1052,14 @@ def _wp6_prepare_audit_samples(
 
     interactions: List[Dict[str, Any]] = [x for x in (history or []) if isinstance(x, dict)]
     interactions.sort(key=lambda x: str(x.get("timestamp") or ""))
+    if recent_interactions > 0 and len(interactions) > recent_interactions:
+        interactions = interactions[-recent_interactions:]
+
+    audited_ids: List[str] = []
+    if skip_already_audited:
+        handles = _load_handles(user_id)
+        audited_ids = _wp_audit_state(handles, "wp6").get("audited_ids", []) if isinstance(handles, dict) else []
+        audited_ids = [str(x) for x in audited_ids if str(x)]
 
     samples: List[Dict[str, Any]] = []
     for it in reversed(interactions):
@@ -990,6 +1068,9 @@ def _wp6_prepare_audit_samples(
         user_message = str(it.get("user_message") or "").strip()
         assistant_text = str(it.get("assistant_response") or "").strip()
         if not user_message or not assistant_text:
+            continue
+        audit_id = str(it.get("interaction_id") or "").strip()
+        if skip_already_audited and audit_id and audit_id in audited_ids:
             continue
         thread_id = str(it.get("thread_id") or "unknown_thread")
 
@@ -1010,7 +1091,7 @@ def _wp6_prepare_audit_samples(
 
         samples.append(
             {
-                "audit_id": str(it.get("interaction_id") or uuid.uuid4().hex[:12]),
+                "audit_id": audit_id or uuid.uuid4().hex[:12],
                 "user_id": str(user_id),
                 "thread_id": thread_id,
                 "created_utc": str(it.get("timestamp") or ""),
@@ -2900,7 +2981,14 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             try:
                 if action == "wp7_prepare_audit":
                     count = int(params.get("count", 50) or 50)
-                    audit_input = _wp7_prepare_audit_input(str(user_id), count=count)
+                    max_scan = int(params.get("max_scan", 500) or 500)
+                    skip_already = bool(params.get("skip_already_audited", True))
+                    audit_input = _wp7_prepare_audit_input(
+                        str(user_id),
+                        count=count,
+                        max_scan=max_scan,
+                        skip_already_audited=skip_already,
+                    )
                     return _make_response({"status": "success", "result": audit_input}, status_code=200)
 
                 # wp7_run_audit
@@ -2919,6 +3007,35 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     model=model,
                     reasoning_effort=reasoning_effort,
                     max_output_tokens=max_output_tokens,
+                )
+                # Persist audited IDs + log run
+                audited_ids = []
+                try:
+                    audited_ids = [
+                        str(x.get("interaction_id"))
+                        for x in (audit_input.get("index_entries") or [])
+                        if isinstance(x, dict) and x.get("interaction_id")
+                    ]
+                except Exception:
+                    audited_ids = []
+                _wp_audit_update_state(str(user_id), audit_type="wp7", audited_ids=audited_ids)
+                _wp_audit_write_log(
+                    str(user_id),
+                    audit_type="wp7",
+                    payload={
+                        "run_id": str(audit_input.get("run_id") or ""),
+                        "user_id": str(user_id),
+                        "audit_type": "wp7",
+                        "model": model,
+                        "reasoning_effort": reasoning_effort,
+                        "max_output_tokens": max_output_tokens,
+                        "selected_interaction_ids": audited_ids,
+                        "result_summary": {
+                            "gate": result.get("gate"),
+                            "integrity_metrics": result.get("integrity_metrics"),
+                        },
+                        "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
+                    },
                 )
                 return _make_response({"status": "success", "result": result}, status_code=200)
             except Exception as exc:
@@ -2940,6 +3057,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         max_sources=int(params.get("max_sources", 8) or 8),
                         max_chars=int(params.get("max_chars", 12000) or 12000),
                         recent_turns=int(params.get("recent_turns", 5) or 5),
+                        recent_interactions=int(params.get("recent_interactions", 200) or 200),
+                        skip_already_audited=bool(params.get("skip_already_audited", True)),
                     )
                     return _make_response({"status": "success", "result": audit_samples}, status_code=200)
 
@@ -2957,6 +3076,34 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     model=model,
                     reasoning_effort=reasoning_effort,
                     max_output_tokens=max_output_tokens,
+                )
+                audited_ids = []
+                try:
+                    audited_ids = [
+                        str(x.get("audit_id"))
+                        for x in (audit_samples.get("samples") or [])
+                        if isinstance(x, dict) and x.get("audit_id")
+                    ]
+                except Exception:
+                    audited_ids = []
+                _wp_audit_update_state(str(user_id), audit_type="wp6", audited_ids=audited_ids)
+                _wp_audit_write_log(
+                    str(user_id),
+                    audit_type="wp6",
+                    payload={
+                        "run_id": str(audit_samples.get("run_id") or ""),
+                        "user_id": str(user_id),
+                        "audit_type": "wp6",
+                        "model": model,
+                        "reasoning_effort": reasoning_effort,
+                        "max_output_tokens": max_output_tokens,
+                        "selected_audit_ids": audited_ids,
+                        "result_summary": {
+                            "gate": result.get("gate"),
+                            "global_summary": result.get("global_summary"),
+                        },
+                        "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
+                    },
                 )
                 return _make_response({"status": "success", "result": result}, status_code=200)
             except Exception as exc:
