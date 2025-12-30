@@ -71,6 +71,8 @@ WP6_RECENT_TURNS_MAX = int(os.environ.get("WP6_RECENT_TURNS_MAX", "8") or 8)
 WP6_RECENT_TURNS_MAX_CHARS = int(os.environ.get("WP6_RECENT_TURNS_MAX_CHARS", "320") or 320)
 WP6_FAST_AUDIT_ENABLED = str(os.environ.get("WP6_FAST_AUDIT_ENABLED", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on")
 WP6_FAST_AUDIT_MAX_CHARS = int(os.environ.get("WP6_FAST_AUDIT_MAX_CHARS", "16000") or 16000)
+WP7_AUDIT_DEFAULT_MODEL = str(os.environ.get("WP7_AUDIT_DEFAULT_MODEL", "gpt-5-mini") or "gpt-5-mini").strip()
+WP7_AUDIT_DEFAULT_REASONING_EFFORT = str(os.environ.get("WP7_AUDIT_DEFAULT_REASONING_EFFORT", "medium") or "medium").strip().lower()
 # runtime counter for outbound OpenAI HTTP calls (best-effort)
 _openai_lock = threading.Lock()
 _openai_count = 0
@@ -723,6 +725,226 @@ def _wp6_write_fast_audit(
         return ""
 
 
+def _wp7_prepare_audit_input(user_id: str, *, count: int = 50) -> Dict[str, Any]:
+    """
+    Prepare WP7 audit evidence bundle: >=50 index entries + >=50 corresponding artifacts.
+
+    Sources:
+    - WP7 index JSONL: interactions/semantic/index.jsonl
+    - WP7 artifacts: interactions/semantic/<interaction_id>.json (resolved via semantic_blob_path if present)
+    """
+    from backend.shared.azure_client import AzureBlobClient
+
+    count = max(1, int(count or 50))
+    index_blob = "interactions/semantic/index.jsonl"
+    bc = AzureBlobClient.get_blob_client(index_blob, user_id=user_id)
+    text = bc.download_blob().content_as_text(encoding="utf-8")
+
+    entries: List[Dict[str, Any]] = []
+    for ln in (text or "").splitlines():
+        ln = (ln or "").strip()
+        if not ln:
+            continue
+        try:
+            entries.append(json.loads(ln))
+        except Exception:
+            continue
+
+    # Select most recent unique interaction_ids.
+    seen: set[str] = set()
+    selected: List[Dict[str, Any]] = []
+    for e in reversed(entries):
+        iid = str((e or {}).get("interaction_id") or "").strip()
+        if not iid or iid in seen:
+            continue
+        seen.add(iid)
+        selected.append(e)
+        if len(selected) >= count * 2:
+            break
+    selected = list(reversed(selected))
+
+    kept_entries: List[Dict[str, Any]] = []
+    artifacts: List[Dict[str, Any]] = []
+    for e in selected:
+        iid = str((e or {}).get("interaction_id") or "").strip()
+        if not iid:
+            continue
+
+        p = str((e or {}).get("semantic_blob_path") or "").strip()
+        rel = ""
+        if p.startswith("users/"):
+            parts = p.split("/", 2)
+            if len(parts) >= 3:
+                rel = parts[2]
+        if not rel:
+            rel = f"interactions/semantic/{iid}.json"
+
+        try:
+            bc2 = AzureBlobClient.get_blob_client(rel, user_id=user_id)
+            atext = bc2.download_blob().content_as_text(encoding="utf-8")
+            art = json.loads(atext)
+        except Exception:
+            continue
+
+        kept_entries.append(e)
+        artifacts.append(art)
+        if len(kept_entries) >= count:
+            break
+
+    out = {
+        "run_id": f"wp7_audit_input::{user_id}::{len(kept_entries)}_{len(artifacts)}",
+        "index_entries": kept_entries,
+        "artifacts": artifacts,
+    }
+    return out
+
+
+def _wp7_audit_json_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "run_id": {"type": "string"},
+            "gate": {"type": "string", "enum": ["OK", "X"]},
+            "integrity_metrics": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "index_entries_total": {"type": "integer", "minimum": 0},
+                    "artifacts_total": {"type": "integer", "minimum": 0},
+                    "mapped_pairs_total": {"type": "integer", "minimum": 0},
+                    "missing_artifacts_percent": {"type": "number", "minimum": 0},
+                    "orphan_artifacts_percent": {"type": "number", "minimum": 0},
+                    "duplicates_percent": {"type": "number", "minimum": 0},
+                    "invalid_schema_percent": {"type": "number", "minimum": 0},
+                },
+                "required": [
+                    "index_entries_total",
+                    "artifacts_total",
+                    "mapped_pairs_total",
+                    "missing_artifacts_percent",
+                    "orphan_artifacts_percent",
+                    "duplicates_percent",
+                    "invalid_schema_percent",
+                ],
+            },
+            "quality_summary": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "overall_assessment": {"type": "string"},
+                    "top_strengths": {"type": "array", "items": {"type": "string"}},
+                    "top_weaknesses": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["overall_assessment", "top_strengths", "top_weaknesses"],
+            },
+            "issue_classes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "code": {"type": "string"},
+                        "severity": {"type": "string", "enum": ["P0", "P1", "P2"]},
+                        "description": {"type": "string"},
+                        "evidence_examples": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["code", "severity", "description", "evidence_examples"],
+                },
+            },
+            "recommendations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "priority": {"type": "string", "enum": ["P0", "P1", "P2"]},
+                        "area": {"type": "string", "enum": ["indexing", "artifact_schema", "dedup", "ranking", "logging", "validation"]},
+                        "recommendation": {"type": "string"},
+                        "expected_impact": {"type": "string"},
+                        "verification": {"type": "string"},
+                    },
+                    "required": ["priority", "area", "recommendation", "expected_impact", "verification"],
+                },
+            },
+            "wp6_impact": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "expected_change_in_top_sources_quality": {"type": "string"},
+                    "expected_change_in_coverage": {"type": "string"},
+                    "risks_if_unchanged": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["expected_change_in_top_sources_quality", "expected_change_in_coverage", "risks_if_unchanged"],
+            },
+        },
+        "required": ["run_id", "gate", "integrity_metrics", "quality_summary", "issue_classes", "recommendations", "wp6_impact"],
+    }
+
+
+def _wp7_run_audit(
+    openai_client: OpenAI,
+    *,
+    user_id: str,
+    audit_input: Dict[str, Any],
+    model: str,
+    reasoning_effort: str,
+    max_output_tokens: int,
+) -> Dict[str, Any]:
+    system_prompt = (
+        "You are an auditor agent for OmniFlow WP7 (Semantic Indexer) quality.\n\n"
+        "Context (backend-aware):\n"
+        "- WP7 produces a semantic index JSONL at `interactions/semantic/index.jsonl` and semantic artifacts at `interactions/semantic/<interaction_id>.json`.\n"
+        "- WP6 FAST later reads candidates from the WP7 index, fetches artifacts, and selects top sources. If WP7 is noisy, duplicated, inconsistent, or poorly grounded, WP6 FAST loses coverage/top_sources quality.\n\n"
+        "Task:\n"
+        "Given JSON with: run_id, index_entries (>=50), artifacts (>=50), audit WP7 for integrity, schema consistency, duplication/noise, signal validity, and WP6 usability.\n\n"
+        "Rules:\n"
+        "- Output JSON only.\n"
+        "- If evidence is insufficient, gate='X' and explain in issue_classes + recommendations.\n"
+        "- Be technical and evidence-based; do not invent missing fields.\n"
+    )
+
+    reasoning_effort = str(reasoning_effort or "").strip().lower()
+    if reasoning_effort not in ("low", "medium", "high"):
+        reasoning_effort = "medium"
+
+    schema = _wp7_audit_json_schema()
+    resp = _openai_call(
+        openai_client.responses.create,
+        model=str(model or WP7_AUDIT_DEFAULT_MODEL),
+        reasoning={"effort": reasoning_effort},
+        max_output_tokens=int(max_output_tokens or 8000),
+        text={"format": {"type": "json_schema", "name": "wp7_semantic_index_audit", "strict": True, "schema": schema}},
+        input=[
+            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+            {"role": "user", "content": [{"type": "input_text", "text": json.dumps(audit_input, ensure_ascii=False)}]},
+        ],
+        metadata={"runtime": "wp7_audit", "user_id": str(user_id)},
+    )
+
+    out_text = ""
+    try:
+        # Similar extraction to other call sites: concatenate output_text parts.
+        chunks: List[str] = []
+        for item in (getattr(resp, "output", None) or []):
+            if isinstance(item, dict) and item.get("type") == "message":
+                for c in item.get("content") or []:
+                    if isinstance(c, dict) and c.get("type") == "output_text" and c.get("text"):
+                        chunks.append(str(c.get("text")))
+        out_text = "".join(chunks).strip()
+    except Exception:
+        out_text = ""
+    if not out_text:
+        try:
+            out_text = str(getattr(resp, "output_text", "") or "").strip()
+        except Exception:
+            out_text = ""
+
+    if not out_text:
+        return {"run_id": str(audit_input.get("run_id") or ""), "gate": "X", "integrity_metrics": {"index_entries_total": 0, "artifacts_total": 0, "mapped_pairs_total": 0, "missing_artifacts_percent": 100, "orphan_artifacts_percent": 100, "duplicates_percent": 0, "invalid_schema_percent": 100}, "quality_summary": {"overall_assessment": "No output_text from model", "top_strengths": [], "top_weaknesses": ["No output_text from model"]}, "issue_classes": [{"code": "no_output_text", "severity": "P0", "description": "Responses API returned no output_text.", "evidence_examples": []}], "recommendations": [{"priority": "P0", "area": "validation", "recommendation": "Inspect raw Responses output and retry.", "expected_impact": "Restores audit availability.", "verification": "Confirm model returns json_schema output_text."}], "wp6_impact": {"expected_change_in_top_sources_quality": "unknown", "expected_change_in_coverage": "unknown", "risks_if_unchanged": ["audit cannot be performed"]}}
+
+    return json.loads(out_text)
+
 def _wp6_route_context_mode(body: Dict[str, Any], user_message: str) -> Tuple[str, str, Dict[str, Any]]:
     requested_raw = str(body.get("context_mode") or body.get("context") or "").strip().upper()
     requested = requested_raw or WP6_DEFAULT_CONTEXT_MODE
@@ -1139,14 +1361,20 @@ def resolve_user_id(req, body: Dict[str, Any]) -> Tuple[Any, str]:
                 hdrs = getattr(req, 'headers', None) or {}
                 # Support both capitalized and lowercase keys
                 for hk in ('X-User-Id', 'x-user-id', 'X-User-Id'.lower()):
-                    if isinstance(hdrs, dict) and hk in hdrs and hdrs.get(hk):
-                        return str(hdrs.get(hk)), 'header'
-                    # Some HttpRequest implementations use a case-insensitive mapping
-                # Fallback: try get with case-insensitive search
-                if isinstance(hdrs, dict):
-                    for k, v in hdrs.items():
-                        if k and k.lower() == 'x-user-id' and v:
-                            return str(v), 'header'
+                    try:
+                        # azure.functions provides HttpRequestHeaders (Mapping-like), not a dict
+                        v = hdrs.get(hk) if hasattr(hdrs, "get") else None
+                        if v:
+                            return str(v), "header"
+                    except Exception:
+                        pass
+                # Fallback: iterate keys for case-insensitive match if possible
+                try:
+                    for k, v in (hdrs.items() if hasattr(hdrs, "items") else []):
+                        if k and str(k).lower() == "x-user-id" and v:
+                            return str(v), "header"
+                except Exception:
+                    pass
             except Exception:
                 pass
         # Body
@@ -2382,11 +2610,46 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         params = body.get("params", {})
         log_interaction = bool(body.get("log_interaction", True))
 
-        # Direct save/get actions bypass agent
+        # Direct actions bypass agent/tool loop
         if action in ["save_interaction", "get_interaction_history"]:
             resp_direct = handle_direct_actions(req, body, action, user_id)
             if resp_direct is not None:
                 return resp_direct
+
+        if action in ["wp7_prepare_audit", "wp7_run_audit"]:
+            if not user_id:
+                return _make_response({"error": "user_id is required"}, status_code=400)
+            # WP7 audit does not require AZURE_PROXY_URL; it reads blobs via connection string and calls OpenAI directly.
+            if not OPENAI_API_KEY:
+                return _make_response({"error": "Missing env vars: OPENAI_API_KEY", "status": "not_configured"}, status_code=503)
+            params = body.get("params", {}) or {}
+            try:
+                if action == "wp7_prepare_audit":
+                    count = int(params.get("count", 50) or 50)
+                    audit_input = _wp7_prepare_audit_input(str(user_id), count=count)
+                    return _make_response({"status": "success", "result": audit_input}, status_code=200)
+
+                # wp7_run_audit
+                model = str(params.get("model") or WP7_AUDIT_DEFAULT_MODEL).strip()
+                reasoning_effort = str(params.get("reasoning_effort") or WP7_AUDIT_DEFAULT_REASONING_EFFORT).strip().lower()
+                max_output_tokens = int(params.get("max_output_tokens", 8000) or 8000)
+                audit_input = params.get("audit_input")
+                if not isinstance(audit_input, dict):
+                    # Convenience: if not provided, prepare now (default 50).
+                    audit_input = _wp7_prepare_audit_input(str(user_id), count=50)
+                openai_client = OpenAI(api_key=OPENAI_API_KEY)
+                result = _wp7_run_audit(
+                    openai_client,
+                    user_id=str(user_id),
+                    audit_input=audit_input,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    max_output_tokens=max_output_tokens,
+                )
+                return _make_response({"status": "success", "result": result}, status_code=200)
+            except Exception as exc:
+                _best_effort_debug("wp7_audit_action_failed", user_id=str(user_id), thread_id=str(thread_id or ""), error=exc, action=action)
+                return _make_response({"status": "error", "error": str(exc), "action": action}, status_code=500)
 
         if OMNIFLOW_MOCK_AGENT:
             forced_user_id = mock_user_id()
