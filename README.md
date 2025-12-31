@@ -71,6 +71,15 @@ OmniFlowBeta/
 4) Start Next UI: `cd ui_next && npm install && npm run dev`
 5) (Optional) Start Streamlit UI: `cd frontend && streamlit run app.py`
 
+### WP7 semantic batch helper
+
+Run `scripts/run_wp7_semantic_batch.ps1` (PowerShell) or `scripts/run_wp7_semantic_batch.py` (straight Python) to launch `tools/wp7_semantic_batch.py` asynchronously. Both scripts forward any extra flags (e.g., `--source`, `--chunks`, `--reasoning`) to the Python helper so your terminal stays free while extracting schema-ready WP7 packs.
+`tools/wp7_semantic_batch.py` also accepts:
+  - `--interactive` to adjust the source/chunk/model/config interactively before each job.
+  - `--debug` to turn on verbose logging (timestamps + DEBUG output).
+  - `--loop`/`--loop-interval` to keep processing batches until a stop flag is detected; pair it with `--stop-after-next-batch` (or invoke the script with that flag alone) to request the loop shuts down after its next completed run.
+To process the entire `Sesje/` archive in order, run `python scripts/wp7_batch/run.py`. The script walks every `.txt` in `C:\Users\Mariusz\OneDrive\Pulpit\ChatGPT\Historia\Sesje`, feeds each through `tools/wp7_semantic_batch.py` (two 5k chunks, schema output), and stores manifests/results under `data/wp7_batch/`. Add `--input-dir`, `--output-dir`, `--chunk-size`, `--chunks`, or `--max-output-tokens` if you need to override the defaults; use `--dry-run` for a preview. Use `--start-index` to resume from a specific transcript if you stopped earlier.
+
 If this saved you time, star the repo.
 
 ---

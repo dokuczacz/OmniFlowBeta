@@ -115,6 +115,28 @@
         },
         "required": ["files"],
         "additionalProperties": false
+      },
+      "BridgeRequest": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "One of oauth_authorize|oauth_exchange|oauth_status|gmail_send|gmail_list|gmail_get|gmail_attachment"
+          },
+          "user_id": { "type": "string" },
+          "payload": { "type": "object", "additionalProperties": true }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+      },
+      "BridgeResponse": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string" },
+          "action": { "type": "string" },
+          "result": { "type": "object", "additionalProperties": true }
+        },
+        "required": ["status", "action", "result"]
       }
     }
   },
@@ -500,6 +522,34 @@
         ],
         "responses": {
           "200": { "description": "Interaction history" }
+        }
+      }
+    },
+    "/api/custom_bridge": {
+      "post": {
+        "operationId": "custom_bridge",
+        "summary": "Single bridge endpoint for Gmail actions",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/BridgeRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bridge response",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BridgeResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
         }
       }
     },
