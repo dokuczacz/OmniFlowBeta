@@ -1,0 +1,46 @@
+{
+  "entry_type": "execution",
+  "plan_ref": {
+    "wp": "WP2",
+    "item": "WP2.nextjs_mvp_status_logging_v1",
+    "note": "Executed: status timeline + log sink; removed Shiny UI files"
+  },
+  "subject": "WP2 execution: Next.js MVP chat status/log pipeline works; Shiny UI removed from repo",
+  "changes": [
+    {
+      "kind": "code",
+      "path": "ai-chatbot/app/api/log-event/route.ts",
+      "summary": "Log endpoint now supports GET diagnostics and writes logs for status transitions."
+    },
+    {
+      "kind": "code",
+      "path": "ai-chatbot/components/mvp-chat.tsx",
+      "summary": "Status transitions emitted for buffered JSON responses; added 'Rendering response...' stage for long answers."
+    },
+    {
+      "kind": "doc",
+      "path": "docs/shared/README.md",
+      "summary": "Removed Shiny roadmap reference and pointed to Next.js MVP."
+    },
+    {
+      "kind": "code",
+      "path": "ui_shiny/",
+      "summary": "Deleted directory."
+    },
+    {
+      "kind": "code",
+      "path": "scripts/run_shiny_prod.py",
+      "summary": "Deleted file."
+    },
+    {
+      "kind": "doc",
+      "path": "docs/shared/WP2_UI_SHINY_PLAN.md",
+      "summary": "Deleted file."
+    }
+  ],
+  "execution": {
+    "status": "success"
+  },
+  "tags": ["wp2", "nextjs", "execution", "ui", "logging", "cleanup"]
+}
+

@@ -1,0 +1,32 @@
+{
+  "entry_type": "execution",
+  "plan_ref": {
+    "wp": "WP6",
+    "item": "WP6.blob_browse_tools_v1",
+    "note": "Implemented + verified with local tool_call_handler runs (Responses)."
+  },
+  "subject": "WP6.A: Blob browsing tools implemented (meta listing + multi-read) and agent-path hardened (basename resolve + no proxy fallback)",
+  "changes": [
+    {
+      "kind": "code",
+      "path": "backend/tool_call_handler/__init__.py",
+      "summary": "Ensure read_many_blobs is treated as data-extraction tool for Responses (deterministic tool loop)."
+    },
+    {
+      "kind": "code",
+      "path": "backend/proxy_router/__init__.py",
+      "summary": "Propagate x-user-id and inject user_id to downstream tool calls to avoid default user drift."
+    },
+    {
+      "kind": "code",
+      "path": "backend/shared/logging_setup.py",
+      "summary": "Suppress verbose Azure SDK HTTP dumps by default while keeping one-line tool call + summary logs."
+    }
+  ],
+  "execution": {
+    "runtime_used": "responses",
+    "status": "success"
+  },
+  "tags": ["wp6", "execution", "responses", "tools", "validated"]
+}
+

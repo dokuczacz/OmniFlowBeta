@@ -1,0 +1,43 @@
+{
+  "entry_type": "plan",
+  "plan_ref": {
+    "wp": "WP2",
+    "item": "WP2.nextjs_mvp_status_logging_v1",
+    "note": "Next.js MVP chat: UI-only status timeline + local frontend log sink; Shiny UI removed"
+  },
+  "subject": "WP2: Next.js MVP chat UX — deterministic status updates + local logging (no backend streaming yet)",
+  "changes": [
+    {
+      "kind": "code",
+      "path": "ai-chatbot/app/api/log-event/route.ts",
+      "summary": "Added local frontend log sink endpoint and ensured logs are written to a stable repo-level location."
+    },
+    {
+      "kind": "code",
+      "path": "ai-chatbot/components/mvp-chat.tsx",
+      "summary": "Improved perceived latency UX: emit status transitions (thinking/rendering/finished) and robust fallbacks when backend returns buffered JSON."
+    },
+    {
+      "kind": "doc",
+      "path": "docs/shared/README.md",
+      "summary": "Updated UI roadmap reference to point to Next.js MVP UI."
+    },
+    {
+      "kind": "code",
+      "path": "ui_shiny/",
+      "summary": "Removed Shiny UI implementation (deprecated path)."
+    },
+    {
+      "kind": "code",
+      "path": "scripts/run_shiny_prod.py",
+      "summary": "Removed Shiny prod runner script (deprecated path)."
+    },
+    {
+      "kind": "doc",
+      "path": "docs/shared/WP2_UI_SHINY_PLAN.md",
+      "summary": "Removed Shiny UI plan doc (deprecated path)."
+    }
+  ],
+  "tags": ["wp2", "nextjs", "mvp", "ui", "status", "logging", "no-backend-streaming"]
+}
+

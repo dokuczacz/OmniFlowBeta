@@ -1,0 +1,23 @@
+{
+  "entry_type": "best_practice",
+  "plan_ref": {
+    "wp": "WP9",
+    "item": "WP9.best_practice",
+    "note": "Derived from execution entry rep_..."
+  },
+  "subject": "Best practice from WP1 migration run",
+  "changes": [],
+  "best_practice": {
+    "source_entry_id": "rep_...",
+    "items": [
+      {
+        "title": "Dual runtime overlay",
+        "rationale": "Dual runtime minimizes blast radius during migration.",
+        "evidence": "Maintains fallback path and reduces regression risk.",
+        "action": "Use a single runtime switch (assistants|responses|auto) and keep old path intact."
+      }
+    ]
+  },
+  "tags": ["wp9", "best_practice"]
+}
+

@@ -12,6 +12,18 @@
   - your UI hosting environment (Next.js)
 - Keep function codes secret (`FUNCTION_CODE_*`). Rotate them via Azure Portal when needed.
 
+## Key environment categories (sorted)
+
+| Category | Key vars | Purpose |
+| --- | --- | --- |
+| **OpenAI / Responses** | `OPENAI_API_KEY`, `OPENAI_ASSISTANT_ID`, `OPENAI_PROMPT_ID`, `OPENAI_VECTOR_STORE_ID`, `OPENAI_API_BASE`, `LLM_RUNTIME`, `OPENAI_CONTEXT_BUILDER_PROMPT_ID`, `RESPONSES_INCLUDE_TOOLS` | Select which runtime/prompt IDs you use for Responses/Assistants and enable tool calls. |
+| **Azure Functions** | `FUNCTION_URL_BASE`, `AZURE_PROXY_URL`, `FUNCTION_CODE_*` (per endpoint), `HANDLES_CACHE_TTL_SECONDS` | Control host URL, proxy routing, and function-level keys. |
+| **WP6 (Context Builder)** | `WP6_DEFAULT_CONTEXT_MODE`, `WP6_FAST_MAX_INPUT_TOKENS`, `WP6_FAST_MAX_SOURCES`, `WP6_FAST_MAX_RAW_BYTES`, `WP6_DEEP_MAX_PACK_TOKENS`, `WP6_DEEP_MAX_CANDIDATE_SOURCES`, `WP6_DEEP_MIN_SEMANTIC_SELECTED`, `WP6_DEEP_MIN_SEMANTIC_CANDIDATES`, `CONTEXTPACK_TTL_SECONDS` | Tune FAST/DEEP routing buckets plus cache TTLs. |
+| **WP7 (Semantic indexer)** | `WP7_ENABLED`, `WP7_INDEXER_MODE`, `WP7_INDEXER_USER_IDS`, `WP7_TARGET_BATCH_TOKENS`, `WP7_HARD_MIN_BATCH_TOKENS`, `WP7_MAX_WAIT_SECONDS`, `WP7_MAX_ITEMS_PER_RUN`, `WP7_MAX_OUTPUT_TOKENS_PER_ITEM`, `WP7_ALLOWED_CATEGORIES`, `WP7_UNCATEGORIZED_CONFIDENCE_LT`, `OPENAI_INDEXER_PROMPT_ID`, `OPENAI_INDEXER_MODEL` | Configure batching thresholds, allowed categories, and indexer prompt/model. |
+| **Feature toggles** | `DEBUG_TOOL_CALL_HANDLER`, `ENABLE_SAVE_INTERACTION`, `WP7_ENABLED_FORCED`, `WP8_ENABLED`, `WP11_ENABLED` | Gate new behavior, control logging, and disable pricey flows during rollouts. |
+
+Keep these values synchronized across `.env.local`, Azure App settings, and any UI hosts so each environment behaves consistently.
+
 ## Publish the backend (Azure Functions)
 
 1. Install deps: `pip install -r backend/requirements.txt`

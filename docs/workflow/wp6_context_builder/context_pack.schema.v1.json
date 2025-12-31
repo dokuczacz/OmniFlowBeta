@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "omniflow.wp6.context_pack.v1",
+  "title": "OmniFlow WP6 Context Pack (v1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "pack_id",
+    "created_utc",
+    "user_id",
+    "intent_key",
+    "context_mode",
+    "budget",
+    "selected_items"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "omniflow.wp6.context_pack.v1"
+    },
+    "pack_id": {
+      "type": "string",
+      "description": "Unique ID for this pack (stable within TTL for reuse)."
+    },
+    "created_utc": {
+      "type": "string",
+      "description": "UTC ISO8601 timestamp.",
+      "pattern": "Z$"
+    },
+    "user_id": {
+      "type": "string"
+    },
+    "intent_key": {
+      "type": "string",
+      "description": "Deterministic key summarizing the user's current intent (used for cache reuse)."
+    },
+    "context_mode": {
+      "type": "string",
+      "enum": ["FAST", "DEEP", "AUTO"]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["wp7_semantic_index"],
+      "properties": {
+        "wp7_semantic_index": {
+          "type": "string",
+          "description": "Blob path used as semantic source (usually interactions/semantic/index.jsonl)."
+        },
+        "preferences_blob": {
+          "type": ["string", "null"],
+          "description": "Optional preferences blob path (semantics/preferences.json)."
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_tokens", "max_raw_bytes", "max_sources"],
+      "properties": {
+        "max_tokens": { "type": "integer", "minimum": 1 },
+        "max_raw_bytes": { "type": "integer", "minimum": 0 },
+        "max_sources": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "estimates": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "estimated_tokens_total": { "type": "integer", "minimum": 0 },
+        "estimated_tokens_selected": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "selected_items": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "ref", "summary"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["semantic", "blob_head", "blob_full", "note"]
+          },
+          "ref": {
+            "type": "string",
+            "description": "Reference to a source item (e.g., semantic interaction_id or blob path)."
+          },
+          "summary": {
+            "type": "string",
+            "description": "Compact, ML-friendly summary used by the main agent."
+          },
+          "category": {
+            "type": ["string", "null"],
+            "enum": ["PE", "UI", "ML", "LO", "PS", "TM", "SYS", "GEN", "ID", null]
+          },
+          "tags": {
+            "type": "array",
+            "maxItems": 12,
+            "items": { "type": "string" }
+          },
+          "signal_level": {
+            "type": ["string", "null"],
+            "enum": ["low", "medium", "high", null]
+          },
+          "confidence": {
+            "type": ["number", "null"],
+            "minimum": 0,
+            "maximum": 1
+          }
+        }
+      }
+    }
+  }
+}
+

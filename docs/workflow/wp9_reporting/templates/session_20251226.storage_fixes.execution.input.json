@@ -1,0 +1,27 @@
+{
+  "entry_type": "execution",
+  "plan_ref": {
+    "wp": "WP1",
+    "item": "WP1.local_dev_storage_normalization",
+    "note": "Implemented and validated by py_compile + local runtime logs"
+  },
+  "subject": "WP1: Local dev blob tools fixed (UseDevelopmentStorage=true compatible) + handles.json self-healing",
+  "changes": [
+    {
+      "kind": "code",
+      "path": "backend/shared/config.py",
+      "summary": "AzureConfig.CONNECTION_STRING now falls back to AzureWebJobsStorage and normalizes UseDevelopmentStorage=true."
+    },
+    {
+      "kind": "code",
+      "path": "backend/upload_data_or_file/__init__.py",
+      "summary": "Upload now uses AzureConfig so handles.json init persists instead of silently failing."
+    }
+  ],
+  "execution": {
+    "runtime_used": "responses",
+    "status": "success"
+  },
+  "tags": ["wp1", "local-dev", "azurite", "done"]
+}
+

@@ -1,0 +1,29 @@
+{
+  "entry_type": "execution",
+  "plan_ref": {
+    "wp": "WP1",
+    "item": "WP1.run_responses",
+    "note": "Dual runtime overlay"
+  },
+  "subject": "WP1: Responses runtime execution smoke",
+  "changes": [
+    {
+      "kind": "code",
+      "path": "backend/tool_call_handler/__init__.py",
+      "summary": "Added dual runtime selection and Responses loop."
+    }
+  ],
+  "execution": {
+    "runtime_used": "responses",
+    "thread_id": "handle_49c9ac51cf50",
+    "tool_calls_count": 0,
+    "timings_ms": {
+      "total_ms": 3907,
+      "tools_ms": 0
+    },
+    "commit": "8b4e08b4",
+    "status": "success"
+  },
+  "tags": ["wp1", "responses", "local"]
+}
+

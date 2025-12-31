@@ -65,12 +65,16 @@ def _download_openai_file_text(client: OpenAI, file_id: str) -> str:
 
 
 def _make_audit_request(prompt_id: str, payload: Dict[str, Any], *, custom_id: str) -> Dict[str, Any]:
+    model = str(os.environ.get("OPENAI_WP6_AUDIT_MODEL") or "").strip()
+    reasoning_effort = str(os.environ.get("OPENAI_WP6_AUDIT_REASONING_EFFORT") or "").strip().lower()
     return {
         "custom_id": custom_id,
         "method": "POST",
         "url": "/v1/responses",
         "body": {
             "prompt": {"id": prompt_id},
+            **({"model": model} if model else {}),
+            **({"reasoning": {"effort": reasoning_effort}} if reasoning_effort in ("low", "medium", "high") else {}),
             "input": json.dumps(payload, ensure_ascii=False),
             "max_output_tokens": 1200,
             "metadata": {"runtime": "wp6_fast_audit", "custom_id": custom_id},

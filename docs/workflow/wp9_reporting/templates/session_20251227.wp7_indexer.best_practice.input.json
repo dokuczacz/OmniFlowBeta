@@ -1,0 +1,60 @@
+﻿{
+    "entry_type":  "best_practice",
+    "plan_ref":  {
+                     "wp":  "WP7",
+                     "item":  "WP7.semantic_indexer_batch_v1",
+                     "note":  "Derived from WP7 execution entry"
+                 },
+    "subject":  "Best practices: WP7 batch indexer (queue/state correctness, json_object constraints, cost-aware batching)",
+    "changes":  [
+
+                ],
+    "best_practice":  {
+                          "source_entry_id":  "rep_2b206a0334fc4b1999f14609269a5398",
+                          "items":  [
+                                        {
+                                            "title":  "Append-only queue with idempotent consumer",
+                                            "rationale":  "Batch processing must be restartable and safe under retries; idempotency prevents duplicate writes and makes recovery cheap.",
+                                            "evidence":  "Indexer writes artifacts per interaction_id and skips existing semantic blobs; offset advances only after successful processing.",
+                                            "action":  "Keep semantic artifacts keyed by interaction_id and ensure the runner can be called repeatedly without side-effects."
+                                        },
+                                        {
+                                            "title":  "Never trust byte offsets without newline alignment",
+                                            "rationale":  "A single bug in byte accounting can corrupt cursor state and stall the pipeline silently (0 candidates forever).",
+                                            "evidence":  "Offset drift and mid-line offsets required resync-to-newline recovery; per-line byte lengths were fixed.",
+                                            "action":  "Treat indexer_state.byte_offset as \u0027start of JSONL line\u0027; implement resync-to-newline self-heal and add logs for offset corrections."
+                                        },
+                                        {
+                                            "title":  "Validate SDK capabilities against the installed version",
+                                            "rationale":  "Assuming SDK classes exist causes runtime import failures and repeated timer-trigger errors.",
+                                            "evidence":  "ImportError for AppendBlobClient in azure.storage.blob 12.27.1; switching to BlobClient append methods restored compatibility.",
+                                            "action":  "Before using an SDK type, verify it exists in the installed package; prefer stable methods on BlobClient for Azurite/local dev."
+                                        },
+                                        {
+                                            "title":  "Responses json_object requires \u0027json\u0027 in the input",
+                                            "rationale":  "When prompt enforces json_object output, OpenAI rejects requests unless the word \u0027json\u0027 appears in input messages.",
+                                            "evidence":  "400 error: \"Response input messages must contain the word \u0027json\u0027 ...\" until format_hint was added.",
+                                            "action":  "Include a stable hint field (e.g. format_hint=\u0027json\u0027) in the model input payload when using text.format=json_object."
+                                        },
+                                        {
+                                            "title":  "Cost-aware batching with hard_min + max_wait",
+                                            "rationale":  "Batching reduces overhead but must not starve low-traffic users; a hard minimum and max wait prevents both waste and starvation.",
+                                            "evidence":  "Thresholds used: target_tokens=1000, hard_min_tokens=600, max_wait_seconds=300, max_items_per_run=25.",
+                                            "action":  "Keep target/hard_min/max_wait configurable and test with 1-2 item batches using backfill to validate the control loop."
+                                        },
+                                        {
+                                            "title":  "Add a minimal \u0027signal_level\u0027 to steer downstream usage",
+                                            "rationale":  "Downstream systems (session restore/context rebuild) need a lightweight gate to avoid replaying noise (timeouts, retries).",
+                                            "evidence":  "signal_level derived deterministically from confidence when missing; prompt can later set it explicitly.",
+                                            "action":  "Require signal_level low|medium|high in the indexer output and keep a deterministic backend fallback."
+                                        }
+                                    ]
+                      },
+    "tags":  [
+                 "wp7",
+                 "best_practice",
+                 "indexer",
+                 "batch",
+                 "responses"
+             ]
+}

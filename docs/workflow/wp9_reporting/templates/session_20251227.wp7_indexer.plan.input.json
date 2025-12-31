@@ -1,0 +1,43 @@
+{
+  "entry_type": "plan",
+  "plan_ref": {
+    "wp": "WP7",
+    "item": "WP7.semantic_indexer_batch_v1",
+    "note": "Queue -> batch -> semantic artifacts (+ portfolio) as async post-processing"
+  },
+  "subject": "WP7: Batch Indexer (queue + state + semantic artifacts) with minimal schema and cost-aware thresholds",
+  "changes": [
+    {
+      "kind": "code",
+      "path": "backend/shared/wp7_indexer.py",
+      "summary": "Added WP7 shared helpers: JSONL queue/state paths, sanitization, token estimates, append + state IO."
+    },
+    {
+      "kind": "code",
+      "path": "backend/save_interaction/__init__.py",
+      "summary": "Enqueue sanitized interaction into WP7 indexer_queue.jsonl after successful save_interaction."
+    },
+    {
+      "kind": "code",
+      "path": "backend/wp7_indexer_run/__init__.py",
+      "summary": "HTTP batch runner: threshold logic, Responses call, semantic writes, idempotency, and uncategorized routing."
+    },
+    {
+      "kind": "code",
+      "path": "backend/wp7_indexer_timer/__init__.py",
+      "summary": "Timer runner: periodic batch processing for configured user_ids."
+    },
+    {
+      "kind": "doc",
+      "path": "docs/WP7_Indexer_Batch.md",
+      "summary": "Documented WP7 data contracts, thresholds, output format, and uncategorized portfolio."
+    },
+    {
+      "kind": "code",
+      "path": "scripts/wp7_backfill_from_interaction_logs.py",
+      "summary": "Added local backfill helper to enqueue historical interaction_logs in controlled batches."
+    }
+  ],
+  "tags": ["wp7", "indexer", "batch", "responses", "jsonl", "semantic", "cost-control"]
+}
+

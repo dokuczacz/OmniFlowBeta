@@ -5,7 +5,7 @@ import os
 import sys
 import time
 import hashlib
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List
 import uuid
 
 try:
@@ -71,6 +71,10 @@ WP6_RECENT_TURNS_MAX = int(os.environ.get("WP6_RECENT_TURNS_MAX", "8") or 8)
 WP6_RECENT_TURNS_MAX_CHARS = int(os.environ.get("WP6_RECENT_TURNS_MAX_CHARS", "320") or 320)
 WP6_FAST_AUDIT_ENABLED = str(os.environ.get("WP6_FAST_AUDIT_ENABLED", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on")
 WP6_FAST_AUDIT_MAX_CHARS = int(os.environ.get("WP6_FAST_AUDIT_MAX_CHARS", "16000") or 16000)
+WP6_AUDIT_DEFAULT_MODEL = str(os.environ.get("WP6_AUDIT_DEFAULT_MODEL") or os.environ.get("OPENAI_WP6_AUDIT_MODEL") or "gpt-5-mini").strip()
+WP6_AUDIT_DEFAULT_REASONING_EFFORT = str(os.environ.get("WP6_AUDIT_DEFAULT_REASONING_EFFORT") or os.environ.get("OPENAI_WP6_AUDIT_REASONING_EFFORT") or "medium").strip().lower()
+WP7_AUDIT_DEFAULT_MODEL = str(os.environ.get("WP7_AUDIT_DEFAULT_MODEL", "gpt-5-mini") or "gpt-5-mini").strip()
+WP7_AUDIT_DEFAULT_REASONING_EFFORT = str(os.environ.get("WP7_AUDIT_DEFAULT_REASONING_EFFORT", "medium") or "medium").strip().lower()
 # runtime counter for outbound OpenAI HTTP calls (best-effort)
 _openai_lock = threading.Lock()
 _openai_count = 0
@@ -533,6 +537,9 @@ def _wp6_fast_context_from_wp7_semantic(user_id: str, max_sources: int, max_char
         "selected_sources_count": 0,
         "raw_bytes_read": 0,
         "candidate_sources": [],
+        "selected_source_ids": [],
+        "max_sources_requested": int(max_sources or 0),
+        "max_chars_requested": int(max_chars or 0),
     }
 
     # Tail the semantic index
@@ -631,6 +638,7 @@ def _wp6_fast_context_from_wp7_semantic(user_id: str, max_sources: int, max_char
                     "excerpt_or_snippet": summ[:400],
                 }
             )
+            meta["selected_source_ids"].append(f"interactions/semantic/{iid}.json")
         except Exception:
             pass
         used += 1
@@ -722,6 +730,579 @@ def _wp6_write_fast_audit(
         )
         return ""
 
+
+def _wp7_prepare_audit_input(
+    user_id: str,
+    *,
+    count: int = 50,
+    max_scan: int = 500,
+    skip_already_audited: bool = True,
+) -> Dict[str, Any]:
+    """
+    Prepare WP7 audit evidence bundle: >=50 index entries + >=50 corresponding artifacts.
+
+    Sources:
+    - WP7 index JSONL: interactions/semantic/index.jsonl
+    - WP7 artifacts: interactions/semantic/<interaction_id>.json (resolved via semantic_blob_path if present)
+    """
+    from backend.shared.azure_client import AzureBlobClient
+
+    count = max(1, int(count or 50))
+    index_blob = "interactions/semantic/index.jsonl"
+    bc = AzureBlobClient.get_blob_client(index_blob, user_id=user_id)
+    text = bc.download_blob().content_as_text(encoding="utf-8")
+
+    entries: List[Dict[str, Any]] = []
+    for ln in (text or "").splitlines():
+        ln = (ln or "").strip()
+        if not ln:
+            continue
+        try:
+            entries.append(json.loads(ln))
+        except Exception:
+            continue
+
+    if max_scan > 0 and len(entries) > max_scan:
+        entries = entries[-max_scan:]
+
+    audited_ids: List[str] = []
+    if skip_already_audited:
+        handles = _load_handles(user_id)
+        audited_ids = _wp_audit_state(handles, "wp7").get("audited_ids", []) if isinstance(handles, dict) else []
+        audited_ids = [str(x) for x in audited_ids if str(x)]
+
+    # Select most recent unique interaction_ids.
+    seen: set[str] = set()
+    selected: List[Dict[str, Any]] = []
+    for e in reversed(entries):
+        iid = str((e or {}).get("interaction_id") or "").strip()
+        if not iid or iid in seen:
+            continue
+        if skip_already_audited and iid in audited_ids:
+            continue
+        seen.add(iid)
+        selected.append(e)
+        if len(selected) >= count * 2:
+            break
+    selected = list(reversed(selected))
+
+    kept_entries: List[Dict[str, Any]] = []
+    artifacts: List[Dict[str, Any]] = []
+    for e in selected:
+        iid = str((e or {}).get("interaction_id") or "").strip()
+        if not iid:
+            continue
+
+        p = str((e or {}).get("semantic_blob_path") or "").strip()
+        rel = ""
+        if p.startswith("users/"):
+            parts = p.split("/", 2)
+            if len(parts) >= 3:
+                rel = parts[2]
+        if not rel:
+            rel = f"interactions/semantic/{iid}.json"
+
+        try:
+            bc2 = AzureBlobClient.get_blob_client(rel, user_id=user_id)
+            atext = bc2.download_blob().content_as_text(encoding="utf-8")
+            art = json.loads(atext)
+        except Exception:
+            continue
+
+        kept_entries.append(e)
+        artifacts.append(art)
+        if len(kept_entries) >= count:
+            break
+
+    out = {
+        "run_id": f"wp7_audit_input::{user_id}::{len(kept_entries)}_{len(artifacts)}",
+        "index_entries": kept_entries,
+        "artifacts": artifacts,
+    }
+    return out
+
+
+def _wp_audit_state(handles: Dict[str, Any], audit_type: str) -> Dict[str, Any]:
+    state = handles.get("_audit_state", {}) if isinstance(handles, dict) else {}
+    return state.get(audit_type, {}) if isinstance(state, dict) else {}
+
+
+def _wp_audit_update_state(
+    user_id: str,
+    *,
+    audit_type: str,
+    audited_ids: List[str],
+) -> None:
+    if not audited_ids:
+        return
+    try:
+        handles = _load_handles(user_id)
+        if not isinstance(handles, dict):
+            return
+        state = handles.get("_audit_state", {}) if isinstance(handles.get("_audit_state"), dict) else {}
+        type_state = state.get(audit_type, {}) if isinstance(state.get(audit_type), dict) else {}
+        existing = type_state.get("audited_ids")
+        ids = []
+        if isinstance(existing, list):
+            ids = [str(x) for x in existing if str(x)]
+        for i in audited_ids:
+            if i not in ids:
+                ids.append(i)
+        # Keep bounded history
+        max_keep = 2000
+        if len(ids) > max_keep:
+            ids = ids[-max_keep:]
+        type_state["audited_ids"] = ids
+        type_state["updated_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+        handles["_audit_state"] = {**state, audit_type: type_state}
+        _save_handles(user_id, handles, async_save=True)
+    except Exception as exc:
+        _best_effort_debug("audit_state_update_failed", user_id=str(user_id), audit_type=audit_type, error=exc)
+
+
+def _wp_audit_write_log(user_id: str, *, audit_type: str, payload: Dict[str, Any]) -> str:
+    try:
+        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        suffix = uuid.uuid4().hex[:8]
+        run_id = str(payload.get("run_id") or "run")
+        path = f"semantics/audits/{audit_type}/{ts}_{run_id}_{suffix}.json"
+        execute_tool_call("upload_data_or_file", {"target_blob_name": path, "file_content": payload}, user_id)
+        return path
+    except Exception as exc:
+        _best_effort_debug("audit_log_write_failed", user_id=str(user_id), audit_type=audit_type, error=exc)
+        return ""
+
+
+def _wp7_audit_json_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "run_id": {"type": "string"},
+            "gate": {"type": "string", "enum": ["OK", "X"]},
+            "integrity_metrics": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "index_entries_total": {"type": "integer", "minimum": 0},
+                    "artifacts_total": {"type": "integer", "minimum": 0},
+                    "mapped_pairs_total": {"type": "integer", "minimum": 0},
+                    "missing_artifacts_percent": {"type": "number", "minimum": 0},
+                    "orphan_artifacts_percent": {"type": "number", "minimum": 0},
+                    "duplicates_percent": {"type": "number", "minimum": 0},
+                    "invalid_schema_percent": {"type": "number", "minimum": 0},
+                },
+                "required": [
+                    "index_entries_total",
+                    "artifacts_total",
+                    "mapped_pairs_total",
+                    "missing_artifacts_percent",
+                    "orphan_artifacts_percent",
+                    "duplicates_percent",
+                    "invalid_schema_percent",
+                ],
+            },
+            "quality_summary": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "overall_assessment": {"type": "string"},
+                    "top_strengths": {"type": "array", "items": {"type": "string"}},
+                    "top_weaknesses": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["overall_assessment", "top_strengths", "top_weaknesses"],
+            },
+            "issue_classes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "code": {"type": "string"},
+                        "severity": {"type": "string", "enum": ["P0", "P1", "P2"]},
+                        "description": {"type": "string"},
+                        "evidence_examples": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["code", "severity", "description", "evidence_examples"],
+                },
+            },
+            "recommendations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "priority": {"type": "string", "enum": ["P0", "P1", "P2"]},
+                        "area": {"type": "string", "enum": ["indexing", "artifact_schema", "dedup", "ranking", "logging", "validation"]},
+                        "recommendation": {"type": "string"},
+                        "expected_impact": {"type": "string"},
+                        "verification": {"type": "string"},
+                    },
+                    "required": ["priority", "area", "recommendation", "expected_impact", "verification"],
+                },
+            },
+            "wp6_impact": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "expected_change_in_top_sources_quality": {"type": "string"},
+                    "expected_change_in_coverage": {"type": "string"},
+                    "risks_if_unchanged": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["expected_change_in_top_sources_quality", "expected_change_in_coverage", "risks_if_unchanged"],
+            },
+        },
+        "required": ["run_id", "gate", "integrity_metrics", "quality_summary", "issue_classes", "recommendations", "wp6_impact"],
+    }
+
+
+def _wp7_run_audit(
+    openai_client: OpenAI,
+    *,
+    user_id: str,
+    audit_input: Dict[str, Any],
+    model: str,
+    reasoning_effort: str,
+    max_output_tokens: int,
+) -> Dict[str, Any]:
+    system_prompt = (
+        "You are an auditor agent for OmniFlow WP7 (Semantic Indexer) quality.\n\n"
+        "Context (backend-aware):\n"
+        "- WP7 produces a semantic index JSONL at `interactions/semantic/index.jsonl` and semantic artifacts at `interactions/semantic/<interaction_id>.json`.\n"
+        "- WP6 FAST later reads candidates from the WP7 index, fetches artifacts, and selects top sources. If WP7 is noisy, duplicated, inconsistent, or poorly grounded, WP6 FAST loses coverage/top_sources quality.\n\n"
+        "Task:\n"
+        "Given JSON with: run_id, index_entries (>=50), artifacts (>=50), audit WP7 for integrity, schema consistency, duplication/noise, signal validity, and WP6 usability.\n\n"
+        "Rules:\n"
+        "- Output JSON only.\n"
+        "- If evidence is insufficient, gate='X' and explain in issue_classes + recommendations.\n"
+        "- Be technical and evidence-based; do not invent missing fields.\n"
+    )
+
+    reasoning_effort = str(reasoning_effort or "").strip().lower()
+    if reasoning_effort not in ("low", "medium", "high"):
+        reasoning_effort = "medium"
+
+    schema = _wp7_audit_json_schema()
+    resp = _openai_call(
+        openai_client.responses.create,
+        model=str(model or WP7_AUDIT_DEFAULT_MODEL),
+        reasoning={"effort": reasoning_effort},
+        max_output_tokens=int(max_output_tokens or 8000),
+        text={"format": {"type": "json_schema", "name": "wp7_semantic_index_audit", "strict": True, "schema": schema}},
+        input=[
+            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+            {"role": "user", "content": [{"type": "input_text", "text": json.dumps(audit_input, ensure_ascii=False)}]},
+        ],
+        metadata={"runtime": "wp7_audit", "user_id": str(user_id)},
+    )
+
+    out_text = ""
+    try:
+        # Similar extraction to other call sites: concatenate output_text parts.
+        chunks: List[str] = []
+        for item in (getattr(resp, "output", None) or []):
+            if isinstance(item, dict) and item.get("type") == "message":
+                for c in item.get("content") or []:
+                    if isinstance(c, dict) and c.get("type") == "output_text" and c.get("text"):
+                        chunks.append(str(c.get("text")))
+        out_text = "".join(chunks).strip()
+    except Exception:
+        out_text = ""
+    if not out_text:
+        try:
+            out_text = str(getattr(resp, "output_text", "") or "").strip()
+        except Exception:
+            out_text = ""
+
+    if not out_text:
+        return {"run_id": str(audit_input.get("run_id") or ""), "gate": "X", "integrity_metrics": {"index_entries_total": 0, "artifacts_total": 0, "mapped_pairs_total": 0, "missing_artifacts_percent": 100, "orphan_artifacts_percent": 100, "duplicates_percent": 0, "invalid_schema_percent": 100}, "quality_summary": {"overall_assessment": "No output_text from model", "top_strengths": [], "top_weaknesses": ["No output_text from model"]}, "issue_classes": [{"code": "no_output_text", "severity": "P0", "description": "Responses API returned no output_text.", "evidence_examples": []}], "recommendations": [{"priority": "P0", "area": "validation", "recommendation": "Inspect raw Responses output and retry.", "expected_impact": "Restores audit availability.", "verification": "Confirm model returns json_schema output_text."}], "wp6_impact": {"expected_change_in_top_sources_quality": "unknown", "expected_change_in_coverage": "unknown", "risks_if_unchanged": ["audit cannot be performed"]}}
+
+    return json.loads(out_text)
+
+
+def _wp6_prepare_audit_samples(
+    user_id: str,
+    *,
+    count: int = 10,
+    max_sources: int = 8,
+    max_chars: int = 12000,
+    recent_turns: int = 5,
+    recent_interactions: int = 200,
+    skip_already_audited: bool = True,
+) -> Dict[str, Any]:
+    """
+    Prepare WP6 audit samples (fast_in/fast_out pairs) from `interaction_logs.json`
+    and a freshly built FAST pack snapshot (from WP7 semantic artifacts).
+    """
+    from backend.shared.azure_client import AzureBlobClient
+
+    count = max(1, int(count or 10))
+    max_sources = max(1, int(max_sources or 8))
+    max_chars = max(1, int(max_chars or 12000))
+    recent_turns = max(0, int(recent_turns or 0))
+
+    fast_ctx, fast_meta = _wp6_fast_context_from_wp7_semantic(user_id, max_sources=max_sources, max_chars=max_chars)
+    selected_source_ids: List[str] = []
+    for src in (fast_meta.get("candidate_sources") or []):
+        if isinstance(src, dict) and src.get("path"):
+            selected_source_ids.append(str(src.get("path")))
+
+    bc = AzureBlobClient.get_blob_client("interaction_logs.json", user_id=user_id)
+    raw_text = bc.download_blob().content_as_text(encoding="utf-8")
+    try:
+        history = json.loads(raw_text)
+    except Exception:
+        history = []
+
+    interactions: List[Dict[str, Any]] = [x for x in (history or []) if isinstance(x, dict)]
+    interactions.sort(key=lambda x: str(x.get("timestamp") or ""))
+    if recent_interactions > 0 and len(interactions) > recent_interactions:
+        interactions = interactions[-recent_interactions:]
+
+    audited_ids: List[str] = []
+    if skip_already_audited:
+        handles = _load_handles(user_id)
+        audited_ids = _wp_audit_state(handles, "wp6").get("audited_ids", []) if isinstance(handles, dict) else []
+        audited_ids = [str(x) for x in audited_ids if str(x)]
+
+    samples: List[Dict[str, Any]] = []
+    for it in reversed(interactions):
+        if len(samples) >= count:
+            break
+        user_message = str(it.get("user_message") or "").strip()
+        assistant_text = str(it.get("assistant_response") or "").strip()
+        if not user_message or not assistant_text:
+            continue
+        audit_id = str(it.get("interaction_id") or "").strip()
+        if skip_already_audited and audit_id and audit_id in audited_ids:
+            continue
+        thread_id = str(it.get("thread_id") or "unknown_thread")
+
+        routing_mode, route_reason, route_meta = _wp6_route_context_mode({}, user_message)
+
+        turns: List[Dict[str, str]] = []
+        if recent_turns > 0:
+            for prev in interactions:
+                if prev is it:
+                    break
+                if str(prev.get("thread_id") or "") != thread_id:
+                    continue
+                um = str(prev.get("user_message") or "").strip()
+                if not um:
+                    continue
+                turns.append({"ts_utc": str(prev.get("timestamp") or ""), "text": um[: int(WP6_RECENT_TURNS_MAX_CHARS or 320)]})
+            turns = turns[-recent_turns:]
+
+        samples.append(
+            {
+                "audit_id": audit_id or uuid.uuid4().hex[:12],
+                "user_id": str(user_id),
+                "thread_id": thread_id,
+                "created_utc": str(it.get("timestamp") or ""),
+                "fast_in": {
+                    "user_message": user_message,
+                    "routing_mode": routing_mode,
+                    "route_reason": route_reason,
+                    "route_meta": route_meta,
+                    "recent_user_turns": turns,
+                    "fast_ctx": fast_ctx,
+                    "fast_meta": {
+                        **(fast_meta or {}),
+                        "selected_source_ids": selected_source_ids,
+                    },
+                },
+                "fast_out": {"assistant_text": assistant_text},
+            }
+        )
+
+    samples = list(reversed(samples))
+    return {
+        "run_id": f"wp6_auditor_samples::{user_id}::{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}",
+        "samples": samples,
+    }
+
+
+def _wp6_audit_json_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "run_id": {"type": "string"},
+            "gate": {"type": "string", "enum": ["OK", "X"]},
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "audit_id": {"type": "string"},
+                        "gate": {"type": "string", "enum": ["OK", "X"]},
+                        "reasoning_steps": {"type": "array", "items": {"type": "string"}},
+                        "scores": {
+                            "anyOf": [
+                                {"type": "null"},
+                                {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "relevance": {"type": "integer", "minimum": 0, "maximum": 10},
+                                        "coverage": {"type": "integer", "minimum": 0, "maximum": 10},
+                                        "traceability": {"type": "integer", "minimum": 0, "maximum": 10},
+                                        "redundancy_inverse": {"type": "integer", "minimum": 0, "maximum": 10},
+                                        "freshness": {"type": "integer", "minimum": 0, "maximum": 10},
+                                        "coherence": {"type": "integer", "minimum": 0, "maximum": 10},
+                                        "routing_sanity": {"type": "integer", "minimum": 0, "maximum": 10},
+                                    },
+                                    "required": [
+                                        "relevance",
+                                        "coverage",
+                                        "traceability",
+                                        "redundancy_inverse",
+                                        "freshness",
+                                        "coherence",
+                                        "routing_sanity",
+                                    ],
+                                },
+                            ]
+                        },
+                        "risks": {
+                            "anyOf": [
+                                {"type": "null"},
+                                {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "hallucination_risk": {"type": "integer", "minimum": 0, "maximum": 10},
+                                        "wrong_topic_risk": {"type": "integer", "minimum": 0, "maximum": 10},
+                                    },
+                                    "required": ["hallucination_risk", "wrong_topic_risk"],
+                                },
+                            ]
+                        },
+                        "key_findings": {"type": "array", "items": {"type": "string"}},
+                        "actionables": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "priority": {"type": "string", "enum": ["P0", "P1", "P2"]},
+                                    "area": {"type": "string", "enum": ["pack", "ranking", "dedup", "routing", "logging"]},
+                                    "recommendation": {"type": "string"},
+                                    "expected_impact": {"type": "string"},
+                                },
+                                "required": ["priority", "area", "recommendation", "expected_impact"],
+                            },
+                        },
+                        "traceability_map": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "claim": {"type": "string"},
+                                    "support": {"type": "string", "enum": ["supported", "partially_supported", "unsupported"]},
+                                    "supporting_source_ids": {"type": "array", "items": {"type": "string"}},
+                                },
+                                "required": ["claim", "support", "supporting_source_ids"],
+                            },
+                        },
+                    },
+                    "required": [
+                        "audit_id",
+                        "gate",
+                        "scores",
+                        "risks",
+                        "key_findings",
+                        "actionables",
+                        "traceability_map",
+                        "reasoning_steps",
+                    ],
+                },
+            },
+            "global_summary": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "samples_total": {"type": "integer", "minimum": 0},
+                    "samples_ok": {"type": "integer", "minimum": 0},
+                    "samples_x": {"type": "integer", "minimum": 0},
+                    "top_issue_patterns": {"type": "array", "items": {"type": "string"}},
+                    "top_quick_wins": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["samples_total", "samples_ok", "samples_x", "top_issue_patterns", "top_quick_wins"],
+            },
+        },
+        "required": ["run_id", "gate", "results", "global_summary"],
+    }
+
+
+def _wp6_run_audit(
+    openai_client: OpenAI,
+    *,
+    user_id: str,
+    audit_samples: Dict[str, Any],
+    model: str,
+    reasoning_effort: str,
+    max_output_tokens: int,
+) -> Dict[str, Any]:
+    reasoning_effort = str(reasoning_effort or "").strip().lower()
+    if reasoning_effort not in ("low", "medium", "high"):
+        reasoning_effort = "medium"
+
+    system_prompt = (
+        "Evaluate the quality, coverage, and answer grounding of WP6 FAST context packs using backend FAST audit artifact pairs (fast_in, fast_out). "
+        "For each sample, score core quality metrics, assess risk, check field/format validity, and produce JSON-only output.\n\n"
+        "Hard requirements:\n"
+        "- Output strictly valid JSON.\n"
+        "- reasoning_steps must be a string array (no multiline strings).\n"
+        "- Keep concise: reasoning_steps<=3, key_findings<=3, actionables<=3, traceability_map<=5.\n"
+    )
+
+    schema = _wp6_audit_json_schema()
+    resp = _openai_call(
+        openai_client.responses.create,
+        model=str(model or WP6_AUDIT_DEFAULT_MODEL),
+        reasoning={"effort": reasoning_effort},
+        max_output_tokens=int(max_output_tokens or 8000),
+        text={"format": {"type": "json_schema", "name": "wp6_fast_pack_audit", "strict": True, "schema": schema}},
+        input=[
+            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+            {"role": "user", "content": [{"type": "input_text", "text": json.dumps(audit_samples, ensure_ascii=False)}]},
+        ],
+        metadata={"runtime": "wp6_audit", "user_id": str(user_id)},
+    )
+
+    out_text = ""
+    try:
+        chunks: List[str] = []
+        for item in (getattr(resp, "output", None) or []):
+            if isinstance(item, dict) and item.get("type") == "message":
+                for c in item.get("content") or []:
+                    if isinstance(c, dict) and c.get("type") == "output_text" and c.get("text"):
+                        chunks.append(str(c.get("text")))
+        out_text = "".join(chunks).strip()
+    except Exception:
+        out_text = ""
+    if not out_text:
+        try:
+            out_text = str(getattr(resp, "output_text", "") or "").strip()
+        except Exception:
+            out_text = ""
+    if not out_text:
+        return {
+            "run_id": str(audit_samples.get("run_id") or ""),
+            "gate": "X",
+            "results": [],
+            "global_summary": {
+                "samples_total": int(len((audit_samples.get("samples") or []) if isinstance(audit_samples, dict) else [])),
+                "samples_ok": 0,
+                "samples_x": 0,
+                "top_issue_patterns": ["no_output_text_from_model"],
+                "top_quick_wins": ["retry_with_higher_max_output_tokens"],
+            },
+        }
+    return json.loads(out_text)
 
 def _wp6_route_context_mode(body: Dict[str, Any], user_message: str) -> Tuple[str, str, Dict[str, Any]]:
     requested_raw = str(body.get("context_mode") or body.get("context") or "").strip().upper()
@@ -1139,14 +1720,20 @@ def resolve_user_id(req, body: Dict[str, Any]) -> Tuple[Any, str]:
                 hdrs = getattr(req, 'headers', None) or {}
                 # Support both capitalized and lowercase keys
                 for hk in ('X-User-Id', 'x-user-id', 'X-User-Id'.lower()):
-                    if isinstance(hdrs, dict) and hk in hdrs and hdrs.get(hk):
-                        return str(hdrs.get(hk)), 'header'
-                    # Some HttpRequest implementations use a case-insensitive mapping
-                # Fallback: try get with case-insensitive search
-                if isinstance(hdrs, dict):
-                    for k, v in hdrs.items():
-                        if k and k.lower() == 'x-user-id' and v:
-                            return str(v), 'header'
+                    try:
+                        # azure.functions provides HttpRequestHeaders (Mapping-like), not a dict
+                        v = hdrs.get(hk) if hasattr(hdrs, "get") else None
+                        if v:
+                            return str(v), "header"
+                    except Exception:
+                        pass
+                # Fallback: iterate keys for case-insensitive match if possible
+                try:
+                    for k, v in (hdrs.items() if hasattr(hdrs, "items") else []):
+                        if k and str(k).lower() == "x-user-id" and v:
+                            return str(v), "header"
+                except Exception:
+                    pass
             except Exception:
                 pass
         # Body
@@ -1323,6 +1910,24 @@ def _persist_responses_state(user_id: str, thread_id: str, conversation_id: str,
     except Exception:
         return
 
+def _wp6_recent_turns_metadata(turns: list[str]) -> str:
+    safe = [str(t or "").strip() for t in turns if str(t or "").strip()]
+    if not safe:
+        return ""
+    if int(WP6_RECENT_TURNS_MAX or 0) > 0:
+        safe = safe[-int(WP6_RECENT_TURNS_MAX) :]
+    joined = "\n".join(safe)
+    if len(joined) <= 512:
+        return joined
+    ellipsis = "…\n…\n"
+    allowed = 512 - len(ellipsis)
+    if allowed <= 0:
+        return joined[:512]
+    half = allowed // 2
+    prefix = joined[:half].rstrip()
+    suffix = joined[-(allowed - half) :].lstrip()
+    return f"{prefix}{ellipsis}{suffix}"
+
 
 def run_responses(
     openai_client: OpenAI,
@@ -1331,6 +1936,7 @@ def run_responses(
     thread_id: str,
     *,
     persist_handles: bool = True,
+    recent_turns: list[str] | None = None,
 ) -> Tuple[str, list, Dict[str, Any], str]:
     """Responses API deterministic tool loop using a Prompt ID (dual-runtime mode)."""
     if not thread_id:
@@ -1351,8 +1957,9 @@ def run_responses(
     responses_max_output_tokens = int(os.environ.get("RESPONSES_MAX_OUTPUT_TOKENS", "4096") or 4096)
     retried_with_smaller_output = False
     retried_after_tpm_reset = False
+    recent_turns_buffer: list[str] = list(recent_turns or [])
 
-    for _ in range(25):
+    for iteration in range(25):
         create_kwargs: Dict[str, Any] = {
             "prompt": {"id": OPENAI_PROMPT_ID},
             "input": current_input,
@@ -1361,11 +1968,33 @@ def run_responses(
             # Important: without an explicit cap, the Prompt/model defaults may request very large output budgets,
             # which can blow TPM limits even for tiny user prompts (because conversation history is server-side).
             "max_output_tokens": responses_max_output_tokens,
-            "metadata": {"user_id": str(user_id), "thread_id": str(thread_id), "runtime": "responses"},
-        }
+            "metadata": {
+                "user_id": str(user_id),
+                "thread_id": str(thread_id),
+                "runtime": "responses",
+                **(
+                    {"recent_user_turns": _wp6_recent_turns_metadata(recent_turns_buffer)}
+                    if recent_turns_buffer
+                    else {}
+                ),
+            },
+            }
+        registered_call_ids = [call.get("call_id") for call in all_tool_calls if isinstance(call, dict)]
+        logging.debug(
+            "responses.prepare user_id=%s thread_id=%s iteration=%s tool_calls_registered=%s tool_calls_kw=%s recent_turns=%s input_type=%s",
+            user_id,
+            thread_id,
+            iteration,
+            registered_call_ids,
+            create_kwargs.get("tool_calls"),
+            len(recent_turns_buffer),
+            type(create_kwargs.get("input")).__name__,
+        )
         if (not WP6_RESPONSES_STATELESS) and conversation_id:
             create_kwargs["conversation"] = conversation_id
-        if (not WP6_RESPONSES_STATELESS) and previous_response_id:
+        # Even in stateless mode, continue the tool loop within this single request.
+        # Otherwise, `function_call_output` items cannot be matched to a pending tool call.
+        if previous_response_id and iteration > 0:
             create_kwargs["previous_response_id"] = previous_response_id
 
         try:
@@ -1453,6 +2082,13 @@ def run_responses(
         conversation_id = _coerce_conversation_id(getattr(response, "conversation", None) or conversation_id)
 
         function_calls = _extract_response_function_calls(response)
+        logging.debug(
+            "responses iteration function_calls user_id=%s thread_id=%s iteration=%s calls=%s",
+            user_id,
+            thread_id,
+            iteration,
+            [{"name": call.get("name"), "call_id": call.get("call_id")} for call in function_calls],
+        )
         if not function_calls:
             final_text = getattr(response, "output_text", None) or ""
             if not final_text:
@@ -2382,11 +3018,150 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         params = body.get("params", {})
         log_interaction = bool(body.get("log_interaction", True))
 
-        # Direct save/get actions bypass agent
+        # Direct actions bypass agent/tool loop
         if action in ["save_interaction", "get_interaction_history"]:
             resp_direct = handle_direct_actions(req, body, action, user_id)
             if resp_direct is not None:
                 return resp_direct
+
+        if action in ["wp7_prepare_audit", "wp7_run_audit"]:
+            if not user_id:
+                return _make_response({"error": "user_id is required"}, status_code=400)
+            # WP7 audit does not require AZURE_PROXY_URL; it reads blobs via connection string and calls OpenAI directly.
+            if not OPENAI_API_KEY:
+                return _make_response({"error": "Missing env vars: OPENAI_API_KEY", "status": "not_configured"}, status_code=503)
+            params = body.get("params", {}) or {}
+            try:
+                if action == "wp7_prepare_audit":
+                    count = int(params.get("count", 50) or 50)
+                    max_scan = int(params.get("max_scan", 500) or 500)
+                    skip_already = bool(params.get("skip_already_audited", True))
+                    audit_input = _wp7_prepare_audit_input(
+                        str(user_id),
+                        count=count,
+                        max_scan=max_scan,
+                        skip_already_audited=skip_already,
+                    )
+                    return _make_response({"status": "success", "result": audit_input}, status_code=200)
+
+                # wp7_run_audit
+                model = str(params.get("model") or WP7_AUDIT_DEFAULT_MODEL).strip()
+                reasoning_effort = str(params.get("reasoning_effort") or WP7_AUDIT_DEFAULT_REASONING_EFFORT).strip().lower()
+                max_output_tokens = int(params.get("max_output_tokens", 8000) or 8000)
+                audit_input = params.get("audit_input")
+                if not isinstance(audit_input, dict):
+                    # Convenience: if not provided, prepare now (default 50).
+                    audit_input = _wp7_prepare_audit_input(str(user_id), count=50)
+                openai_client = OpenAI(api_key=OPENAI_API_KEY)
+                result = _wp7_run_audit(
+                    openai_client,
+                    user_id=str(user_id),
+                    audit_input=audit_input,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    max_output_tokens=max_output_tokens,
+                )
+                # Persist audited IDs + log run
+                audited_ids = []
+                try:
+                    audited_ids = [
+                        str(x.get("interaction_id"))
+                        for x in (audit_input.get("index_entries") or [])
+                        if isinstance(x, dict) and x.get("interaction_id")
+                    ]
+                except Exception:
+                    audited_ids = []
+                _wp_audit_update_state(str(user_id), audit_type="wp7", audited_ids=audited_ids)
+                _wp_audit_write_log(
+                    str(user_id),
+                    audit_type="wp7",
+                    payload={
+                        "run_id": str(audit_input.get("run_id") or ""),
+                        "user_id": str(user_id),
+                        "audit_type": "wp7",
+                        "model": model,
+                        "reasoning_effort": reasoning_effort,
+                        "max_output_tokens": max_output_tokens,
+                        "selected_interaction_ids": audited_ids,
+                        "result_summary": {
+                            "gate": result.get("gate"),
+                            "integrity_metrics": result.get("integrity_metrics"),
+                        },
+                        "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
+                    },
+                )
+                return _make_response({"status": "success", "result": result}, status_code=200)
+            except Exception as exc:
+                _best_effort_debug("wp7_audit_action_failed", user_id=str(user_id), thread_id=str(thread_id or ""), error=exc, action=action)
+                return _make_response({"status": "error", "error": str(exc), "action": action}, status_code=500)
+
+        if action in ["wp6_prepare_audit", "wp6_run_audit"]:
+            if not user_id:
+                return _make_response({"error": "user_id is required"}, status_code=400)
+            # WP6 audit does not require AZURE_PROXY_URL; it reads blobs via connection string and calls OpenAI directly.
+            if not OPENAI_API_KEY:
+                return _make_response({"error": "Missing env vars: OPENAI_API_KEY", "status": "not_configured"}, status_code=503)
+            params = body.get("params", {}) or {}
+            try:
+                if action == "wp6_prepare_audit":
+                    audit_samples = _wp6_prepare_audit_samples(
+                        str(user_id),
+                        count=int(params.get("count", 10) or 10),
+                        max_sources=int(params.get("max_sources", 8) or 8),
+                        max_chars=int(params.get("max_chars", 12000) or 12000),
+                        recent_turns=int(params.get("recent_turns", 5) or 5),
+                        recent_interactions=int(params.get("recent_interactions", 200) or 200),
+                        skip_already_audited=bool(params.get("skip_already_audited", True)),
+                    )
+                    return _make_response({"status": "success", "result": audit_samples}, status_code=200)
+
+                model = str(params.get("model") or WP6_AUDIT_DEFAULT_MODEL).strip()
+                reasoning_effort = str(params.get("reasoning_effort") or WP6_AUDIT_DEFAULT_REASONING_EFFORT).strip().lower()
+                max_output_tokens = int(params.get("max_output_tokens", 8000) or 8000)
+                audit_samples = params.get("audit_samples")
+                if not isinstance(audit_samples, dict):
+                    audit_samples = _wp6_prepare_audit_samples(str(user_id), count=10, max_sources=8, max_chars=12000, recent_turns=5)
+                openai_client = OpenAI(api_key=OPENAI_API_KEY)
+                result = _wp6_run_audit(
+                    openai_client,
+                    user_id=str(user_id),
+                    audit_samples=audit_samples,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    max_output_tokens=max_output_tokens,
+                )
+                audited_ids = []
+                try:
+                    audited_ids = [
+                        str(x.get("audit_id"))
+                        for x in (audit_samples.get("samples") or [])
+                        if isinstance(x, dict) and x.get("audit_id")
+                    ]
+                except Exception:
+                    audited_ids = []
+                _wp_audit_update_state(str(user_id), audit_type="wp6", audited_ids=audited_ids)
+                _wp_audit_write_log(
+                    str(user_id),
+                    audit_type="wp6",
+                    payload={
+                        "run_id": str(audit_samples.get("run_id") or ""),
+                        "user_id": str(user_id),
+                        "audit_type": "wp6",
+                        "model": model,
+                        "reasoning_effort": reasoning_effort,
+                        "max_output_tokens": max_output_tokens,
+                        "selected_audit_ids": audited_ids,
+                        "result_summary": {
+                            "gate": result.get("gate"),
+                            "global_summary": result.get("global_summary"),
+                        },
+                        "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
+                    },
+                )
+                return _make_response({"status": "success", "result": result}, status_code=200)
+            except Exception as exc:
+                _best_effort_debug("wp6_audit_action_failed", user_id=str(user_id), thread_id=str(thread_id or ""), error=exc, action=action)
+                return _make_response({"status": "error", "error": str(exc), "action": action}, status_code=500)
 
         if OMNIFLOW_MOCK_AGENT:
             forced_user_id = mock_user_id()
@@ -2533,6 +3308,13 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         fast_ctx_trunc = str(fast_ctx or "")
                         if int(WP6_FAST_AUDIT_MAX_CHARS or 0) > 0:
                             fast_ctx_trunc = fast_ctx_trunc[: int(WP6_FAST_AUDIT_MAX_CHARS)]
+                        fast_limits = {
+                            "max_sources_requested": int((fast_meta or {}).get("max_sources_requested") or 0),
+                            "max_chars_requested": int((fast_meta or {}).get("max_chars_requested") or 0),
+                            "fast_max_input_tokens": int(WP6_FAST_MAX_INPUT_TOKENS or 0),
+                            "fast_max_raw_bytes": int(WP6_FAST_MAX_RAW_BYTES or 0),
+                        }
+                        fast_selected_ids = list((fast_meta or {}).get("selected_source_ids") or [])
                         payload_in = {
                             "schema_version": "omniflow.wp6.fast_audit.v1",
                             "kind": "fast_in",
@@ -2545,11 +3327,13 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                             "routing": dict(wp6_meta.get("routing") or {}),
                             "recent_user_turns": list(recent_turns or []),
                             "fast_ctx": fast_ctx_trunc,
+                            "limits": fast_limits,
                             "fast_meta": {
                                 "semantic_candidates_count": int((fast_meta or {}).get("semantic_candidates_count") or 0),
                                 "selected_sources_count": int((fast_meta or {}).get("selected_sources_count") or 0),
                                 "raw_bytes_read": int((fast_meta or {}).get("raw_bytes_read") or 0),
                                 "candidate_sources": list((fast_meta or {}).get("candidate_sources") or []),
+                                "selected_source_ids": fast_selected_ids,
                             },
                         }
                         audit_in_path = _wp6_write_fast_audit(
@@ -2627,6 +3411,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     user_message=model_input_message,
                     thread_id=thread_id,
                     persist_handles=persist_in_run,
+                    recent_turns=recent_turns,
                 )
 
                 # Phase 2 (AUTO only): parse FAST response signal and optionally escalate to DEEP once.
@@ -2655,6 +3440,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                                     user_message=deep_input_message,
                                     thread_id=thread_id,
                                     persist_handles=persist_in_run,
+                                    recent_turns=recent_turns,
                                 )
                                 deep_signal, deep_cleaned = _wp6_parse_need_deep_signal(deep_resp or "")
                                 wp6_meta["need_deep_signal_deep"] = deep_signal
