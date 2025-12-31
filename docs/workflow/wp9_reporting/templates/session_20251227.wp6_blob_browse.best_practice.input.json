@@ -1,0 +1,40 @@
+{
+  "entry_type": "best_practice",
+  "plan_ref": {
+    "wp": "WP6",
+    "item": "WP6.blob_browse_tools_v1",
+    "note": "Derived from WP6 execution entry"
+  },
+  "subject": "Best practices: safer + cheaper blob browsing for agents (meta-first, multi-read, hardening against ambiguous filenames)",
+  "changes": [],
+  "best_practice": {
+    "source_entry_id": "rep_494ba7a6cdf8407cbb92781f2c10cca4",
+    "items": [
+      {
+        "title": "Prefer meta listing before reading content",
+        "rationale": "Agents should avoid reading whole files just to discover names/sizes; meta reduces tokens and latency.",
+        "evidence": "list_blobs include_meta returns name/size/last_modified so the agent can pick the right files first.",
+        "action": "When exploring storage, call list_blobs with include_meta=1 and filter by prefix before any read."
+      },
+      {
+        "title": "Provide a single multi-read tool to reduce tool-call overhead",
+        "rationale": "Reading many files one-by-one increases tool loop steps and cost; batching reads reduces round trips and model/tool chatter.",
+        "evidence": "read_many_blobs reads multiple blobs in one call with explicit limits and optional tail extraction.",
+        "action": "Use read_many_blobs for N>1 files and treat read_blob_file as a special case (N=1) or when content must be exact."
+      },
+      {
+        "title": "Harden read paths against ambiguous agent file references",
+        "rationale": "Agents often shorten paths (e.g., 'index.jsonl'); a safe resolve prevents false negatives while avoiding wrong reads.",
+        "evidence": "read_blob_file attempts unique suffix resolve only when basename-only and the match is unambiguous; otherwise returns candidates.",
+        "action": "Keep basename resolve conservative: only auto-resolve when exactly one candidate exists; otherwise prompt the agent/user to choose."
+      },
+      {
+        "title": "Register tools in-process to avoid proxy fallbacks",
+        "rationale": "Fallback proxies add latency and can break user_id propagation; deterministic tool dispatch should prefer in-process handlers.",
+        "evidence": "read_many_blobs is registered in the tool registry and no longer routes through proxy_router.",
+        "action": "When adding a new tool, update the tool registry and add a minimal integration test/run to confirm it is called in-process."
+      }
+    ]
+  },
+  "tags": ["wp6", "best_practice", "tools", "storage", "cost-control"]
+}

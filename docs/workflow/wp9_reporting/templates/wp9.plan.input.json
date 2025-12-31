@@ -1,0 +1,33 @@
+{
+  "entry_type": "plan",
+  "plan_ref": {
+    "wp": "WP9",
+    "item": "WP9.reporting_templates_v1",
+    "note": "Strict JSONL templates + writer script"
+  },
+  "subject": "WP9: Define strict reporting format (plan/execution/best_practice) with deterministic writer",
+  "changes": [
+    {
+      "kind": "doc",
+      "path": "docs/workflow/wp9_reporting/README.md",
+      "summary": "Documented WP9 local reporting workflow and usage."
+    },
+    {
+      "kind": "code",
+      "path": "docs/workflow/wp9_reporting/schema_v1.py",
+      "summary": "Added strict schema v1 for report entries."
+    },
+    {
+      "kind": "code",
+      "path": "docs/workflow/wp9_reporting/append_report_entry.py",
+      "summary": "Added dedicated append script (single allowed entrypoint)."
+    },
+    {
+      "kind": "code",
+      "path": "docs/workflow/wp9_reporting/local_jsonl_store.py",
+      "summary": "Added local JSONL append with lockfile."
+    }
+  ],
+  "tags": ["wp9", "reporting", "jsonl", "local"]
+}
+

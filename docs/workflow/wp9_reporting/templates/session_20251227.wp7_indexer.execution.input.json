@@ -1,0 +1,40 @@
+{
+  "entry_type": "execution",
+  "plan_ref": {
+    "wp": "WP7",
+    "item": "WP7.semantic_indexer_batch_v1",
+    "note": "Implemented core + validated on real interaction_logs via local backfill"
+  },
+  "subject": "WP7: Batch indexer implemented and validated locally (queue processed, semantic artifacts produced, idle state reached)",
+  "changes": [
+    {
+      "kind": "code",
+      "path": "backend/shared/wp7_indexer.py",
+      "summary": "Fixed Azurite compatibility (append via BlobClient), added deterministic signal_level derivation."
+    },
+    {
+      "kind": "code",
+      "path": "backend/wp7_indexer_run/__init__.py",
+      "summary": "Fixed offset drift (per-line byte lengths), added resync to newline for recovery, and ensured json_object compatibility by including 'json' in input."
+    },
+    {
+      "kind": "code",
+      "path": "backend/wp7_indexer_timer/__init__.py",
+      "summary": "Aligned JSONL parsing/offset logic with HTTP runner; added resync logic for stuck offsets."
+    },
+    {
+      "kind": "doc",
+      "path": "docs/WP7_Indexer_Batch.md",
+      "summary": "Updated output examples to include signal_level and documented fallback derivation."
+    }
+  ],
+  "execution": {
+    "runtime_used": "responses",
+    "status": "success",
+    "timings_ms": {
+      "notes": 0
+    }
+  },
+  "tags": ["wp7", "execution", "local-dev", "azurite", "responses", "validated"]
+}
+

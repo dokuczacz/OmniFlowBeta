@@ -1,0 +1,26 @@
+{
+  "entry_type": "execution",
+  "plan_ref": {
+    "wp": "WP9",
+    "item": "WP9.reporting_implemented",
+    "note": "Local JSONL reporting implemented"
+  },
+  "subject": "WP9: Reporting implemented locally (schema + deterministic append tool)",
+  "changes": [
+    {
+      "kind": "code",
+      "path": "docs/workflow/wp9_reporting/schema_v1.py",
+      "summary": "Strict schema and required fields for agents."
+    },
+    {
+      "kind": "code",
+      "path": "docs/workflow/wp9_reporting/append_report_entry.py",
+      "summary": "Writer enforces schema, timestamps, and entry_id generation."
+    }
+  ],
+  "execution": {
+    "status": "success"
+  },
+  "tags": ["wp9", "reporting", "done"]
+}
+
