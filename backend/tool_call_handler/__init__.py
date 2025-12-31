@@ -537,6 +537,9 @@ def _wp6_fast_context_from_wp7_semantic(user_id: str, max_sources: int, max_char
         "selected_sources_count": 0,
         "raw_bytes_read": 0,
         "candidate_sources": [],
+        "selected_source_ids": [],
+        "max_sources_requested": int(max_sources or 0),
+        "max_chars_requested": int(max_chars or 0),
     }
 
     # Tail the semantic index
@@ -635,6 +638,7 @@ def _wp6_fast_context_from_wp7_semantic(user_id: str, max_sources: int, max_char
                     "excerpt_or_snippet": summ[:400],
                 }
             )
+            meta["selected_source_ids"].append(f"interactions/semantic/{iid}.json")
         except Exception:
             pass
         used += 1
@@ -1906,6 +1910,24 @@ def _persist_responses_state(user_id: str, thread_id: str, conversation_id: str,
     except Exception:
         return
 
+def _wp6_recent_turns_metadata(turns: list[str]) -> str:
+    safe = [str(t or "").strip() for t in turns if str(t or "").strip()]
+    if not safe:
+        return ""
+    if int(WP6_RECENT_TURNS_MAX or 0) > 0:
+        safe = safe[-int(WP6_RECENT_TURNS_MAX) :]
+    joined = "\n".join(safe)
+    if len(joined) <= 512:
+        return joined
+    ellipsis = "…\n…\n"
+    allowed = 512 - len(ellipsis)
+    if allowed <= 0:
+        return joined[:512]
+    half = allowed // 2
+    prefix = joined[:half].rstrip()
+    suffix = joined[-(allowed - half) :].lstrip()
+    return f"{prefix}{ellipsis}{suffix}"
+
 
 def run_responses(
     openai_client: OpenAI,
@@ -1914,6 +1936,7 @@ def run_responses(
     thread_id: str,
     *,
     persist_handles: bool = True,
+    recent_turns: list[str] | None = None,
 ) -> Tuple[str, list, Dict[str, Any], str]:
     """Responses API deterministic tool loop using a Prompt ID (dual-runtime mode)."""
     if not thread_id:
@@ -1934,8 +1957,9 @@ def run_responses(
     responses_max_output_tokens = int(os.environ.get("RESPONSES_MAX_OUTPUT_TOKENS", "4096") or 4096)
     retried_with_smaller_output = False
     retried_after_tpm_reset = False
+    recent_turns_buffer: list[str] = list(recent_turns or [])
 
-    for _ in range(25):
+    for iteration in range(25):
         create_kwargs: Dict[str, Any] = {
             "prompt": {"id": OPENAI_PROMPT_ID},
             "input": current_input,
@@ -1944,11 +1968,33 @@ def run_responses(
             # Important: without an explicit cap, the Prompt/model defaults may request very large output budgets,
             # which can blow TPM limits even for tiny user prompts (because conversation history is server-side).
             "max_output_tokens": responses_max_output_tokens,
-            "metadata": {"user_id": str(user_id), "thread_id": str(thread_id), "runtime": "responses"},
-        }
+            "metadata": {
+                "user_id": str(user_id),
+                "thread_id": str(thread_id),
+                "runtime": "responses",
+                **(
+                    {"recent_user_turns": _wp6_recent_turns_metadata(recent_turns_buffer)}
+                    if recent_turns_buffer
+                    else {}
+                ),
+            },
+            }
+        registered_call_ids = [call.get("call_id") for call in all_tool_calls if isinstance(call, dict)]
+        logging.debug(
+            "responses.prepare user_id=%s thread_id=%s iteration=%s tool_calls_registered=%s tool_calls_kw=%s recent_turns=%s input_type=%s",
+            user_id,
+            thread_id,
+            iteration,
+            registered_call_ids,
+            create_kwargs.get("tool_calls"),
+            len(recent_turns_buffer),
+            type(create_kwargs.get("input")).__name__,
+        )
         if (not WP6_RESPONSES_STATELESS) and conversation_id:
             create_kwargs["conversation"] = conversation_id
-        if (not WP6_RESPONSES_STATELESS) and previous_response_id:
+        # Even in stateless mode, continue the tool loop within this single request.
+        # Otherwise, `function_call_output` items cannot be matched to a pending tool call.
+        if previous_response_id and iteration > 0:
             create_kwargs["previous_response_id"] = previous_response_id
 
         try:
@@ -2036,6 +2082,13 @@ def run_responses(
         conversation_id = _coerce_conversation_id(getattr(response, "conversation", None) or conversation_id)
 
         function_calls = _extract_response_function_calls(response)
+        logging.debug(
+            "responses iteration function_calls user_id=%s thread_id=%s iteration=%s calls=%s",
+            user_id,
+            thread_id,
+            iteration,
+            [{"name": call.get("name"), "call_id": call.get("call_id")} for call in function_calls],
+        )
         if not function_calls:
             final_text = getattr(response, "output_text", None) or ""
             if not final_text:
@@ -3255,6 +3308,13 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         fast_ctx_trunc = str(fast_ctx or "")
                         if int(WP6_FAST_AUDIT_MAX_CHARS or 0) > 0:
                             fast_ctx_trunc = fast_ctx_trunc[: int(WP6_FAST_AUDIT_MAX_CHARS)]
+                        fast_limits = {
+                            "max_sources_requested": int((fast_meta or {}).get("max_sources_requested") or 0),
+                            "max_chars_requested": int((fast_meta or {}).get("max_chars_requested") or 0),
+                            "fast_max_input_tokens": int(WP6_FAST_MAX_INPUT_TOKENS or 0),
+                            "fast_max_raw_bytes": int(WP6_FAST_MAX_RAW_BYTES or 0),
+                        }
+                        fast_selected_ids = list((fast_meta or {}).get("selected_source_ids") or [])
                         payload_in = {
                             "schema_version": "omniflow.wp6.fast_audit.v1",
                             "kind": "fast_in",
@@ -3267,11 +3327,13 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                             "routing": dict(wp6_meta.get("routing") or {}),
                             "recent_user_turns": list(recent_turns or []),
                             "fast_ctx": fast_ctx_trunc,
+                            "limits": fast_limits,
                             "fast_meta": {
                                 "semantic_candidates_count": int((fast_meta or {}).get("semantic_candidates_count") or 0),
                                 "selected_sources_count": int((fast_meta or {}).get("selected_sources_count") or 0),
                                 "raw_bytes_read": int((fast_meta or {}).get("raw_bytes_read") or 0),
                                 "candidate_sources": list((fast_meta or {}).get("candidate_sources") or []),
+                                "selected_source_ids": fast_selected_ids,
                             },
                         }
                         audit_in_path = _wp6_write_fast_audit(
@@ -3349,6 +3411,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     user_message=model_input_message,
                     thread_id=thread_id,
                     persist_handles=persist_in_run,
+                    recent_turns=recent_turns,
                 )
 
                 # Phase 2 (AUTO only): parse FAST response signal and optionally escalate to DEEP once.
@@ -3377,6 +3440,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                                     user_message=deep_input_message,
                                     thread_id=thread_id,
                                     persist_handles=persist_in_run,
+                                    recent_turns=recent_turns,
                                 )
                                 deep_signal, deep_cleaned = _wp6_parse_need_deep_signal(deep_resp or "")
                                 wp6_meta["need_deep_signal_deep"] = deep_signal
