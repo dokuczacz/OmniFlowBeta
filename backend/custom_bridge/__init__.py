@@ -51,6 +51,18 @@ def _resolve_user_id(body: Dict[str, Any]) -> str:
     )
     return user_id.strip() if isinstance(user_id, str) and user_id.strip() else "default"
 
+def _bearer_token(req: func.HttpRequest) -> str | None:
+    auth = req.headers.get("Authorization") or req.headers.get("authorization")
+    if not auth or not isinstance(auth, str):
+        return None
+    parts = auth.split(None, 1)
+    if len(parts) != 2:
+        return None
+    scheme, token = parts[0].lower(), parts[1].strip()
+    if scheme != "bearer" or not token:
+        return None
+    return token
+
 
 def _read_blob(blob_name: str) -> bytes:
     if not blob_name:
@@ -132,7 +144,7 @@ def _exchange_code(code: str) -> Dict[str, Any]:
         raise ValueError(f"Token exchange failed (status={status})") from exc
 
 
-def handle_oauth_authorize(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def handle_oauth_authorize(user_id: str, payload: Dict[str, Any], __: str | None = None) -> Dict[str, Any]:
     if not GmailOAuthConfig.has_credentials():
         raise ValueError("Gmail OAuth configuration is incomplete")
     state = str(uuid.uuid4())
@@ -148,7 +160,7 @@ def handle_oauth_authorize(user_id: str, payload: Dict[str, Any]) -> Dict[str, A
     }
 
 
-def handle_oauth_exchange(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def handle_oauth_exchange(user_id: str, payload: Dict[str, Any], __: str | None = None) -> Dict[str, Any]:
     code = payload.get("code")
     if not code:
         raise ValueError("code is required for oauth_exchange")
@@ -164,7 +176,7 @@ def handle_oauth_exchange(user_id: str, payload: Dict[str, Any]) -> Dict[str, An
     }
 
 
-def handle_oauth_status(user_id: str, _: Dict[str, Any]) -> Dict[str, Any]:
+def handle_oauth_status(user_id: str, _: Dict[str, Any], __: str | None = None) -> Dict[str, Any]:
     stored = GmailTokenStore.load_tokens(user_id)
     if not stored:
         return {
@@ -182,10 +194,10 @@ def handle_oauth_status(user_id: str, _: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def handle_gmail_send(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def handle_gmail_send(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
     email = _build_email(payload)
     raw = base64.urlsafe_b64encode(email.as_bytes()).decode("ascii")
-    gmail = GmailClient(user_id)
+    gmail = GmailClient(user_id, access_token=access_token)
     response = gmail.request("post", "messages/send", json={"raw": raw})
     result = response.json()
     return {
@@ -197,7 +209,7 @@ def handle_gmail_send(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def handle_gmail_list(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def handle_gmail_list(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
     params: Dict[str, Any] = {}
     if max_results := payload.get("max_results"):
         params["maxResults"] = int(max_results)
@@ -207,7 +219,7 @@ def handle_gmail_list(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         params["q"] = query
     if page_token := payload.get("page_token"):
         params["pageToken"] = page_token
-    gmail = GmailClient(user_id)
+    gmail = GmailClient(user_id, access_token=access_token)
     response = gmail.request("get", "messages", params=params)
     result = response.json()
     return {
@@ -220,14 +232,14 @@ def handle_gmail_list(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def handle_gmail_get(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def handle_gmail_get(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
     message_id = payload.get("message_id")
     if not message_id:
         raise ValueError("message_id is required for gmail_get")
     format_type = payload.get("format") or "full"
     if format_type not in {"minimal", "full", "metadata", "raw"}:
         raise ValueError("format must be one of minimal|full|metadata|raw")
-    gmail = GmailClient(user_id)
+    gmail = GmailClient(user_id, access_token=access_token)
     response = gmail.request("get", f"messages/{message_id}", params={"format": format_type})
     payload_response = response.json()
     return {
@@ -238,12 +250,12 @@ def handle_gmail_get(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def handle_gmail_attachment(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def handle_gmail_attachment(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
     message_id = payload.get("message_id")
     attachment_id = payload.get("attachment_id")
     if not message_id or not attachment_id:
         raise ValueError("message_id and attachment_id are required for gmail_attachment")
-    gmail = GmailClient(user_id)
+    gmail = GmailClient(user_id, access_token=access_token)
     response = gmail.request("get", f"messages/{message_id}/attachments/{attachment_id}")
     payload_response = response.json()
     return {
@@ -275,9 +287,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     if not handler:
         return _error(f"Unknown action '{action}'")
     user_id = _resolve_user_id(body)
+    access_token = _bearer_token(req)
     payload = body.get("payload", {})
     try:
-        result = handler(user_id, payload)
+        result = handler(user_id, payload, access_token)
     except ValueError as exc:
         return _error(str(exc))
     except Exception as exc:

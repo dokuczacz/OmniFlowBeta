@@ -12,10 +12,11 @@ from .gmail_oauth import GmailOAuthConfig, GmailTokenStore
 class GmailClient:
     BASE_URL = "https://gmail.googleapis.com/gmail/v1/users/me"
 
-    def __init__(self, user_id: str):
+    def __init__(self, user_id: str, *, access_token: Optional[str] = None):
         self.user_id = user_id
-        self.tokens = GmailTokenStore.load_tokens(user_id)
-        if not self.tokens:
+        self._external_access_token = access_token.strip() if isinstance(access_token, str) and access_token.strip() else None
+        self.tokens = GmailTokenStore.load_tokens(user_id) if not self._external_access_token else None
+        if not self._external_access_token and not self.tokens:
             raise ValueError("Gmail tokens not found for user")
 
     def _now(self) -> datetime:
@@ -32,6 +33,8 @@ class GmailClient:
         return expires - self._now() < timedelta(seconds=60)
 
     def _ensure_access_token(self) -> str:
+        if self._external_access_token:
+            return self._external_access_token
         if self._expires_soon():
             self._refresh_tokens()
         token = self.tokens.get("access_token")
