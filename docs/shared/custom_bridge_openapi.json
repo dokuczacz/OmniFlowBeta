@@ -7,7 +7,7 @@
   },
   "servers": [
     {
-      "url": "https://agentbackendservice-dfcpcudzeah4b6ae.northeurope-01.azurewebsites.net/api"
+      "url": "https://agentbackendservice-dfcpcudzeah4b6ae.northeurope-01.azurewebsites.net"
     }
   ],
   "components": {
@@ -72,7 +72,7 @@
     }
   ],
   "paths": {
-    "/custom_bridge": {
+    "/api/custom_bridge": {
       "post": {
         "operationId": "custom_bridge",
         "summary": "Unified GPT tool for Gmail actions.",
