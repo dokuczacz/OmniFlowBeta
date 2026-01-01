@@ -89,34 +89,61 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": {
-                "type": "object",
-                "allOf": [
-                  { "$ref": "#/components/schemas/BridgeRequest" }
-                ],
+            "schema": {
+              "type": "object",
+              "properties": {
+                "action": {
+                  "$ref": "#/components/schemas/Action"
+                },
+                "user_id": {
+                  "type": "string"
+                },
+                "payload": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "required": [
+                "action",
+                "user_id"
+              ],
+              "additionalProperties": false,
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/BridgeRequest"
+                }
+              ],
+              "if": {
+                "properties": {
+                  "action": {
+                    "const": "gmail_get"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "payload": {
+                    "$ref": "#/components/schemas/GmailGetPayload"
+                  }
+                }
+              },
+              "else": {
                 "if": {
                   "properties": {
-                    "action": { "const": "gmail_get" }
+                    "action": {
+                      "const": "gmail_attachment"
+                    }
                   }
                 },
                 "then": {
                   "properties": {
-                    "payload": { "$ref": "#/components/schemas/GmailGetPayload" }
-                  }
-                },
-                "else": {
-                  "if": {
-                    "properties": {
-                      "action": { "const": "gmail_attachment" }
-                    }
-                  },
-                  "then": {
-                    "properties": {
-                      "payload": { "$ref": "#/components/schemas/GmailAttachmentPayload" }
+                    "payload": {
+                      "$ref": "#/components/schemas/GmailAttachmentPayload"
                     }
                   }
                 }
-              },
+              }
+            },
               "examples": {
                 "oauth_authorize": {
                   "summary": "oauth_authorize example",
