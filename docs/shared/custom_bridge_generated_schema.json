@@ -1,0 +1,179 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "OmniFlow Custom Gmail Bridge (generated)",
+    "version": "1.0.0",
+    "description": "Auto-generated schema reflecting ACTION_HANDLERS."
+  },
+  "servers": [
+    {
+      "url": "https://agentbackendservice-dfcpcudzeah4b6ae.northeurope-01.azurewebsites.net"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "functionKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-functions-key",
+        "description": "Function key sent via header."
+      }
+    },
+    "schemas": {
+      "Action": {
+        "type": "string",
+        "enum": [
+          "oauth_authorize",
+          "oauth_exchange",
+          "oauth_status",
+          "ensure_authorized",
+          "gmail_send",
+          "gmail_list",
+          "gmail_get",
+          "gmail_attachment"
+        ]
+      },
+      "BridgeRequest": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/Action"
+          },
+          "user_id": {
+            "type": "string"
+          },
+          "payload": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "action",
+          "user_id"
+        ]
+      }
+    }
+  },
+  "security": [
+    {
+      "functionKey": []
+    }
+  ],
+  "paths": {
+    "/api/custom_bridge": {
+      "post": {
+        "operationId": "custom_bridge",
+        "summary": "Unified GPT tool for Gmail actions.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BridgeRequest"
+              },
+              "examples": {
+                "oauth_authorize": {
+                  "summary": "oauth_authorize example",
+                  "value": {
+                    "action": "oauth_authorize",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": {
+                      "login_hint": "dokuczacz@gmail.com"
+                    }
+                  }
+                },
+                "oauth_exchange": {
+                  "summary": "oauth_exchange example",
+                  "value": {
+                    "action": "oauth_exchange",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": {
+                      "code": "AUTH_CODE"
+                    }
+                  }
+                },
+                "oauth_status": {
+                  "summary": "oauth_status example",
+                  "value": {
+                    "action": "oauth_status",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": {}
+                  }
+                },
+                "ensure_authorized": {
+                  "summary": "ensure_authorized example",
+                  "value": {
+                    "action": "ensure_authorized",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": {
+                      "login_hint": "dokuczacz@gmail.com"
+                    }
+                  }
+                },
+                "gmail_send": {
+                  "summary": "gmail_send example",
+                  "value": {
+                    "action": "gmail_send",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": {
+                      "to": [
+                        "dokuczacz@gmail.com"
+                      ],
+                      "subject": "Hello from GPT",
+                      "body": "Friendly test message to confirm Gmail bridge works."
+                    }
+                  }
+                },
+                "gmail_list": {
+                  "summary": "gmail_list example",
+                  "value": {
+                    "action": "gmail_list",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": {
+                      "max_results": 5
+                    }
+                  }
+                },
+                "gmail_get": {
+                  "summary": "gmail_get example",
+                  "value": {
+                    "action": "gmail_get",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": {
+                      "message_id": "MESSAGE_ID"
+                    }
+                  }
+                },
+                "gmail_attachment": {
+                  "summary": "gmail_attachment example",
+                  "value": {
+                    "action": "gmail_attachment",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": {
+                      "message_id": "MESSAGE_ID",
+                      "attachment_id": "ATTACHMENT_ID"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful action result."
+          },
+          "400": {
+            "description": "Missing payload or invalid action."
+          },
+          "401": {
+            "description": "Invalid function key."
+          },
+          "500": {
+            "description": "Server error."
+          }
+        }
+      }
+    }
+  }
+}

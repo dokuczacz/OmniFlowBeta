@@ -116,6 +116,7 @@ docs/shared/*
 !docs/shared/DOCS_STANDARD.md
 !docs/shared/PRIVACY_POLICY.md
 !docs/shared/ENVIRONMENT_VARIABLES.md
+!docs/shared/custom_bridge_generated_schema.json
 !docs/shared/custom_bridge_openapi.json
 
 # Local scratch docs (optional)
