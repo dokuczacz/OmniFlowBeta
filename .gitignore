@@ -46,6 +46,14 @@ tools/pretty_wp7_outputs.py
 tools/out/
 external/
 
+# Generated data + local tooling (keep untracked)
+data/
+tools/
+
+# Keep local tests untracked (repo focuses on deployment artifacts/docs)
+ai-chatbot/tests/
+backend/**/test_*.py
+
 # OS
 .DS_Store
 Thumbs.db
@@ -106,8 +114,10 @@ docs/shared/*
 !docs/shared/GITHUB_DISCUSSIONS_TEMPLATES.md
 !docs/shared/WP2_NEXT_UI_PLAN.md
 !docs/shared/DOCS_STANDARD.md
+!docs/shared/ENVIRONMENT_VARIABLES.md
 
 # Local scratch docs (optional)
 /CHANGES.md
 /COMMIT_INSTRUCTIONS.txt
 /IMPLEMENTER_AGENT.md
+headers.txt
