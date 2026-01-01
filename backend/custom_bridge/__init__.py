@@ -157,11 +157,18 @@ def _exchange_code(code: str) -> Dict[str, Any]:
         "redirect_uri": GmailOAuthConfig.REDIRECT_URI,
     }
     headers = {"Accept": "application/json"}
-    response = requests.post(GmailOAuthConfig.token_url(), data=payload, headers=headers, timeout=20)
-    response.raise_for_status()
-    data = response.json()
-    data["fetched_at"] = datetime.now(timezone.utc).isoformat()
-    return data
+    try:
+        response = requests.post(GmailOAuthConfig.token_url(), data=payload, headers=headers, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        data["fetched_at"] = datetime.now(timezone.utc).isoformat()
+        return data
+    except requests.HTTPError as exc:  # surface Google error details for diagnostics
+        status = exc.response.status_code if exc.response else "n/a"
+        body = exc.response.text if exc.response else ""
+        logging.error("Token exchange failed (status=%s): %s", status, body)
+        # bubble a trimmed message so callback returns 400 instead of 500
+        raise ValueError(f"Token exchange failed (status={status})") from exc
 
 
 def handle_oauth_authorize(_: str, payload: Dict[str, Any]) -> Dict[str, Any]:
