@@ -60,7 +60,7 @@ Keep these values synchronized across `.env.local`, Azure App settings, and any 
 ### Custom GPT schema import
 
 - Use the raw URL `https://raw.githubusercontent.com/dokuczacz/OmniFlowBeta/main/docs/shared/custom_bridge_openapi.json` when importing the OpenAPI tool in GPT Builder.
-- In the authentication dialog pick **API key**, store the function key there, choose **Header** → `x-functions-key`, and avoid putting secrets directly into the JSON.
+- In the authentication dialog pick **API key**, store the function key there, choose **Query** → `code`, and avoid putting secrets directly into the JSON.
 - Custom GPT should always call `ensure_authorized` first; if the reply has `authorized:false`, open the `authorize_url`, complete consent, then repeat `ensure_authorized` before Gmail actions.
 
 ## Publish the UI (Next.js)
