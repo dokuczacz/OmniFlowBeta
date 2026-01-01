@@ -82,7 +82,8 @@ docs/workflow/**/__pycache__/
 docs/workflow/wp9_reporting/reports*.jsonl*
 
 # Local helper scripts (optional, keep local by default)
-scripts/
+scripts/*
+!scripts/generate_custom_bridge_schema.py
 backend/scripts/
 backend/tooling/
 backend/batch_tool_executor/

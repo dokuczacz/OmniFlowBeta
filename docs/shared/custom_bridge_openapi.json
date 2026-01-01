@@ -90,32 +90,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "allOf": [
-                  { "$ref": "#/components/schemas/BridgeRequest" }
-                ],
-                "if": {
-                  "properties": {
-                    "action": { "const": "gmail_get" }
-                  }
-                },
-                "then": {
-                  "properties": {
-                    "payload": { "$ref": "#/components/schemas/GmailGetPayload" }
-                  }
-                },
-                "else": {
-                  "if": {
-                    "properties": {
-                      "action": { "const": "gmail_attachment" }
-                    }
-                  },
-                  "then": {
-                    "properties": {
-                      "payload": { "$ref": "#/components/schemas/GmailAttachmentPayload" }
-                    }
-                  }
-                }
+                "$ref": "#/components/schemas/BridgeRequest"
               },
               "examples": {
                 "oauth_authorize": {
