@@ -14,9 +14,9 @@
     "securitySchemes": {
       "functionKey": {
         "type": "apiKey",
-        "in": "query",
-        "name": "code",
-        "description": "Azure Function key stored securely in Custom GPT tool auth settings (sent as the `code` query parameter)."
+        "in": "header",
+        "name": "x-functions-key",
+        "description": "Azure Function key stored securely in Custom GPT tool auth settings (sent as the `x-functions-key` header)."
       }
     },
     "schemas": {
