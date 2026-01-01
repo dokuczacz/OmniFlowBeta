@@ -1,0 +1,148 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "OmniFlow Custom Gmail Bridge",
+    "version": "1.0.0",
+    "description": "Single POST endpoint that drives OAuth + Gmail through Azure Function. Use the function key from Azure configuration in the required `code` query parameter (store it in Custom GPT tool auth settings)."
+  },
+  "servers": [
+    {
+      "url": "https://agentbackendservice-dfcpcudzeah4b6ae.northeurope-01.azurewebsites.net/api"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "functionKey": {
+        "type": "apiKey",
+        "in": "query",
+        "name": "code",
+        "description": "Azure Function key stored securely in Custom GPT tool auth settings (sent as the `code` query parameter)."
+      }
+    },
+    "schemas": {
+      "Action": {
+        "type": "string",
+        "enum": [
+          "ensure_authorized",
+          "oauth_authorize",
+          "oauth_status",
+          "oauth_exchange",
+          "gmail_send",
+          "gmail_list",
+          "gmail_get",
+          "gmail_attachment"
+        ]
+      },
+      "BridgeRequest": {
+        "type": "object",
+        "properties": {
+          "action": { "$ref": "#/components/schemas/Action" },
+          "user_id": {
+            "type": "string",
+            "description": "Optional namespace used to isolate tokens. Defaults to 'default'."
+          },
+          "payload": {
+            "type": "object",
+            "description": "Action-specific payload (attachments, search params, etc.).",
+            "additionalProperties": true
+          }
+        },
+        "required": ["action", "user_id"],
+        "additionalProperties": false
+      },
+      "Attachment": {
+        "type": "object",
+        "properties": {
+          "fileName": { "type": "string" },
+          "contentBase64": { "type": "string" },
+          "blob_name": { "type": "string" }
+        },
+        "required": ["fileName"],
+        "anyOf": [
+          { "required": ["contentBase64"] },
+          { "required": ["blob_name"] }
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "security": [
+    {
+      "functionKey": []
+    }
+  ],
+  "paths": {
+    "/custom_bridge": {
+      "post": {
+        "operationId": "custom_bridge",
+        "summary": "Unified GPT tool for Gmail actions.",
+        "description": "Call `ensure_authorized` first; if `authorized:false` return `authorize_url`, open it externally, then rerun `ensure_authorized`. Attachments can come via inline base64 or blob names.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/BridgeRequest" },
+              "examples": {
+                "ensure_authorized": {
+                  "summary": "Check or obtain consent.",
+                  "value": {
+                    "action": "ensure_authorized",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": { "login_hint": "dokuczacz@gmail.com" }
+                  }
+                },
+                "gmail_list": {
+                  "summary": "List messages after authorization.",
+                  "value": {
+                    "action": "gmail_list",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": { "q": "from:me", "max_results": 5 }
+                  }
+                },
+                "gmail_send": {
+                  "summary": "Send email (attachments optional).",
+                  "value": {
+                    "action": "gmail_send",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": {
+                      "to": ["recipient@example.com"],
+                      "subject": "Hello from GPT",
+                      "body": "see attachments",
+                      "attachments": [
+                        {
+                          "fileName": "note.txt",
+                          "contentBase64": "SGVsbG8sIHdvcmxkIQ=="
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful action result.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string" },
+                    "action": { "$ref": "#/components/schemas/Action" },
+                    "result": { "type": "object" }
+                  },
+                  "required": ["status", "action", "result"]
+                }
+              }
+            }
+          },
+          "400": { "description": "Missing payload or invalid action." },
+          "401": { "description": "Invalid function key." },
+          "500": { "description": "Server error." }
+        }
+      }
+    }
+  }
+}
