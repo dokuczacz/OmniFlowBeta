@@ -194,6 +194,41 @@ def handle_oauth_status(user_id: str, _: Dict[str, Any], __: str | None = None) 
     }
 
 
+def handle_ensure_authorized(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
+    if access_token:
+        return {
+            "action": "ensure_authorized",
+            "authorized": True,
+            "user_id": user_id,
+            "scope": GmailOAuthConfig.SCOPES,
+        }
+    stored = GmailTokenStore.load_tokens(user_id)
+    if stored:
+        return {
+            "action": "ensure_authorized",
+            "authorized": True,
+            "user_id": user_id,
+            "scope": stored.get("scope"),
+            "expires_at": stored.get("expires_at"),
+            "saved_at": stored.get("saved_at"),
+        }
+    if not GmailOAuthConfig.has_credentials():
+        raise ValueError("Gmail OAuth configuration is incomplete")
+    state = str(uuid.uuid4())
+    login_hint = payload.get("login_hint")
+    GmailTokenStore.save_state(state, user_id)
+    authorize_url = GmailOAuthConfig.authorize_url(state, login_hint=login_hint)
+    return {
+        "action": "ensure_authorized",
+        "authorized": False,
+        "user_id": user_id,
+        "scope": GmailOAuthConfig.SCOPES,
+        "state": state,
+        "authorize_url": authorize_url,
+        "redirect_uri": GmailOAuthConfig.REDIRECT_URI,
+    }
+
+
 def handle_gmail_send(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
     email = _build_email(payload)
     raw = base64.urlsafe_b64encode(email.as_bytes()).decode("ascii")
@@ -271,6 +306,7 @@ ACTION_HANDLERS = {
     "oauth_authorize": handle_oauth_authorize,
     "oauth_exchange": handle_oauth_exchange,
     "oauth_status": handle_oauth_status,
+    "ensure_authorized": handle_ensure_authorized,
     "gmail_send": handle_gmail_send,
     "gmail_list": handle_gmail_list,
     "gmail_get": handle_gmail_get,
