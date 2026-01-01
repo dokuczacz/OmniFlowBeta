@@ -51,6 +51,27 @@
           "action",
           "user_id"
         ]
+      },
+      "GmailGetPayload": {
+        "type": "object",
+        "properties": {
+          "message_id": { "type": "string" },
+          "format": {
+            "type": "string",
+            "enum": ["minimal", "full", "metadata", "raw"]
+          }
+        },
+        "required": ["message_id"],
+        "additionalProperties": false
+      },
+      "GmailAttachmentPayload": {
+        "type": "object",
+        "properties": {
+          "message_id": { "type": "string" },
+          "attachment_id": { "type": "string" }
+        },
+        "required": ["message_id", "attachment_id"],
+        "additionalProperties": false
       }
     }
   },
@@ -69,7 +90,31 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/BridgeRequest"
+                "allOf": [
+                  { "$ref": "#/components/schemas/BridgeRequest" }
+                ],
+                "if": {
+                  "properties": {
+                    "action": { "const": "gmail_get" }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "payload": { "$ref": "#/components/schemas/GmailGetPayload" }
+                  }
+                },
+                "else": {
+                  "if": {
+                    "properties": {
+                      "action": { "const": "gmail_attachment" }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "payload": { "$ref": "#/components/schemas/GmailAttachmentPayload" }
+                    }
+                  }
+                }
               },
               "examples": {
                 "oauth_authorize": {
