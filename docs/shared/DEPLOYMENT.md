@@ -11,6 +11,27 @@
   - Azure Function App configuration
   - your UI hosting environment (Next.js)
 - Keep function codes secret (`FUNCTION_CODE_*`). Rotate them via Azure Portal when needed.
+- See `docs/shared/ENVIRONMENT_VARIABLES.md` for a copy/paste-ready catalog of required App Service settings and secret placeholders.
+
+## Future `config.json` surface (WP6/WP7)
+
+To reduce the number of manually updated App Settings, WP6/WP7 are preparing a `config.json` that can live next to the operator UI (for example under `ui_next/` or in a shared config repo/blob). The intention is to make tuning UI-friendly and centrally managed.
+
+**What it stores**
+- Grouped, UI-editable tuning values (example shape):
+  - `wp6`: FAST/DEEP limits, cache TTLs, routing knobs
+  - `wp7`: batching thresholds, allowed categories, dedup window
+- Optional feature gates (future): `wp6.enabled`, `wp7.enabled`, `wp6.deepMode`, etc.
+
+**Who edits it**
+- Operator / release engineer via Next.js operator UI (not developers editing App Settings by hand).
+
+**How it replaces envs**
+- Runtime remains compatible with current env-driven defaults (`backend/local.settings.template.json`).
+- `config.json` should be treated as an overlay: only keys present in the JSON override defaults.
+- Rollback is deterministic: revert `config.json` (or point UI back to previous version) and the runtime returns to env defaults.
+
+Keep `docs/shared/ENVIRONMENT_VARIABLES.md` as the authoritative catalog of environment keys and secrets even after `config.json` is introduced; the JSON is for operational tuning, not for storing secrets.
 
 ## Key environment categories (sorted)
 
