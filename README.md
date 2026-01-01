@@ -2,6 +2,9 @@
 
 OmniFlow Beta is a **multi-user AI agent backend** built on **Azure Functions + Azure Blob Storage**, with a **Next.js UI**.
 
+## 📜 Privacy policy
+- [Privacy policy](docs/shared/PRIVACY_POLICY.md)
+
 ---
 
 ## Key features (start here)

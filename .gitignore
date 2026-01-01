@@ -114,6 +114,7 @@ docs/shared/*
 !docs/shared/GITHUB_DISCUSSIONS_TEMPLATES.md
 !docs/shared/WP2_NEXT_UI_PLAN.md
 !docs/shared/DOCS_STANDARD.md
+!docs/shared/PRIVACY_POLICY.md
 !docs/shared/ENVIRONMENT_VARIABLES.md
 
 # Local scratch docs (optional)
