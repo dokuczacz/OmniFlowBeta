@@ -56,6 +56,7 @@ class GmailTokenStore:
     """Persist Gmail OAuth payloads in blob storage for each user."""
 
     BLOB_PREFIX = "gmail/oauth"
+    STATE_PREFIX = "gmail/state"
 
     @staticmethod
     def _normalize_user_id(user_id: Optional[str]) -> str:
@@ -82,6 +83,60 @@ class GmailTokenStore:
             container_client = blob_service_client.get_container_client(AzureConfig.CONTAINER_NAME)
         blob_path = f"{cls.BLOB_PREFIX}/{normalized_id}.json"
         return container_client.get_blob_client(blob_path)
+
+    @classmethod
+    def _state_blob_client(cls, state: str):
+        if not state or not isinstance(state, str) or not state.strip():
+            raise ValueError("state is required")
+        if not AzureConfig.CONNECTION_STRING:
+            raise ValueError("Azure storage connection string is missing")
+        blob_service_client = BlobServiceClient.from_connection_string(AzureConfig.CONNECTION_STRING)
+        container_client = blob_service_client.get_container_client(AzureConfig.CONTAINER_NAME)
+        try:
+            container_client.get_container_properties()
+        except ResourceNotFoundError:
+            try:
+                blob_service_client.create_container(AzureConfig.CONTAINER_NAME)
+            except AzureError as exc:
+                logging.error("Could not create container %s: %s", AzureConfig.CONTAINER_NAME, exc)
+                raise
+            container_client = blob_service_client.get_container_client(AzureConfig.CONTAINER_NAME)
+        safe_state = state.strip().replace("/", "_").replace("\\", "_")
+        blob_path = f"{cls.STATE_PREFIX}/{safe_state}.json"
+        return container_client.get_blob_client(blob_path)
+
+    @classmethod
+    def save_state(cls, state: str, user_id: Optional[str]) -> None:
+        blob_client = cls._state_blob_client(state)
+        record = {
+            "state": state,
+            "user_id": cls._normalize_user_id(user_id),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        blob_client.upload_blob(json.dumps(record, ensure_ascii=False).encode("utf-8"), overwrite=True)
+
+    @classmethod
+    def load_state(cls, state: str) -> Optional[Dict[str, object]]:
+        blob_client = cls._state_blob_client(state)
+        try:
+            raw = blob_client.download_blob().readall().decode("utf-8")
+            return json.loads(raw)
+        except ResourceNotFoundError:
+            return None
+        except AzureError as exc:
+            logging.error("Failed to load state %s: %s", state, exc)
+            raise
+
+    @classmethod
+    def delete_state(cls, state: str) -> None:
+        blob_client = cls._state_blob_client(state)
+        try:
+            blob_client.delete_blob()
+        except ResourceNotFoundError:
+            return
+        except AzureError as exc:
+            logging.error("Failed to delete state %s: %s", state, exc)
+            raise
 
     @classmethod
     def save_tokens(cls, user_id: Optional[str], token_payload: Dict[str, object]) -> None:
