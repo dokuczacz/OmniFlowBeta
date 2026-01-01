@@ -77,7 +77,7 @@ Copy-paste this catalog when provisioning Azure App Service settings or local `.
 | --- | --- | --- |
 | `GMAIL_OAUTH_CLIENT_ID` | `<secret>` | Gmail OAuth client ID. |
 | `GMAIL_OAUTH_CLIENT_SECRET` | `<secret>` | Gmail OAuth client secret. |
-| `GMAIL_OAUTH_REDIRECT_URI` | `http://localhost:7071/api/custom_bridge` | Redirect URI for OAuth handshake. |
+| `GMAIL_OAUTH_REDIRECT_URI` | `http://localhost:7071/api/custom_bridge` | Redirect URI for OAuth handshake (handled via GET on `custom_bridge`). |
 | `GMAIL_OAUTH_SCOPES` | `https://mail.google.com/` | Gmail scopes requested. |
 | `GMAIL_OAUTH_PROMPT` | `consent` | Prompt presented to Gmail user. |
 
