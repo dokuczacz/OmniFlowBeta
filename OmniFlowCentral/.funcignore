@@ -1,0 +1,18 @@
+# Local settings (never deploy)
+local.settings.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual env
+.venv/
+
+# Editor / OS
+.vscode/
+.DS_Store
+
+# Logs
+*.log
+logs/

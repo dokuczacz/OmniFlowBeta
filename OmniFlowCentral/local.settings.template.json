@@ -1,0 +1,29 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+
+    "AZURE_STORAGE_CONNECTION_STRING": "UseDevelopmentStorage=true",
+
+    "AZURE_BLOB_CONTAINER_NAME": "omniflowcentralcustomgpt",
+
+    "AZURE_SDK_LOG_LEVEL": "WARNING",
+    "AZURE_HTTP_LOGGING": "0",
+    "OMNIFLOW_DEBUG": "0",
+
+    "OAUTH_TENANT_ID": "",
+    "OAUTH_CLIENT_ID": "",
+    "OAUTH_CLIENT_SECRET": "",
+    "OAUTH_REDIRECT_URI": "https://login.microsoftonline.com/common/oauth2/nativeclient",
+    "OAUTH_SCOPES": "https://graph.microsoft.com/Mail.ReadWrite offline_access openid profile",
+    "OAUTH_RESPONSE_MODE": "query",
+    "OAUTH_PROMPT": "consent",
+
+    "GMAIL_OAUTH_CLIENT_ID": "",
+    "GMAIL_OAUTH_CLIENT_SECRET": "",
+    "GMAIL_OAUTH_REDIRECT_URI": "http://localhost:7072/api/gmail_oauth_callback",
+    "GMAIL_OAUTH_SCOPES": "https://mail.google.com/",
+    "GMAIL_OAUTH_PROMPT": "consent"
+  }
+}
