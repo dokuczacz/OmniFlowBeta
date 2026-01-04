@@ -50,6 +50,9 @@ external/
 data/
 tools/
 
+# Archived UI components (not actively maintained)
+ui_archived/
+
 # Keep local tests untracked (repo focuses on deployment artifacts/docs)
 ai-chatbot/tests/
 backend/**/test_*.py

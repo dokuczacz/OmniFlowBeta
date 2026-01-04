@@ -1860,6 +1860,146 @@ def _save_handles(user_id: str, handles: Dict[str, Any], async_save: bool = Fals
         pass
 
 
+RUN_PROGRESS_MAX_EVENTS = int(os.environ.get("RUN_PROGRESS_MAX_EVENTS", "25") or 25)
+RUN_PROGRESS_MIN_WRITE_INTERVAL_S = float(os.environ.get("RUN_PROGRESS_MIN_WRITE_INTERVAL_S", "0.35") or 0.35)
+_RUN_PROGRESS_LOCK = threading.Lock()
+_run_progress_last_write_s: Dict[str, float] = {}
+
+
+def _utc_now_iso() -> str:
+    return datetime.datetime.utcnow().isoformat() + "Z"
+
+
+def _get_run_progress(handles: Dict[str, Any], thread_id: str) -> Dict[str, Any] | None:
+    if not (isinstance(handles, dict) and thread_id):
+        return None
+    state = handles.get(thread_id)
+    if not isinstance(state, dict):
+        return None
+    rp = state.get("run_progress")
+    return rp if isinstance(rp, dict) else None
+
+
+def _update_run_progress_in_handles(
+    *,
+    handles: Dict[str, Any],
+    user_id: str,
+    thread_id: str,
+    run_id: str,
+    trace_id: str,
+    status: str,
+    stage: str,
+    message: str,
+    tool_name: str = "",
+) -> Dict[str, Any] | None:
+    """
+    Store a minimal "quasi streaming" milestone state in `handles.json` under:
+      handles[thread_id]["run_progress"].
+    """
+    if not (isinstance(handles, dict) and thread_id):
+        return None
+    thread_state = handles.get(thread_id, {}) if isinstance(handles.get(thread_id), dict) else {}
+    prev = thread_state.get("run_progress") if isinstance(thread_state.get("run_progress"), dict) else {}
+    prev_events = prev.get("events") if isinstance(prev.get("events"), list) else []
+
+    try:
+        seq = int(prev.get("seq") or 0) + 1
+    except Exception:
+        seq = 1
+
+    ts_utc = _utc_now_iso()
+    event = {
+        "seq": seq,
+        "ts_utc": ts_utc,
+        "status": str(status or ""),
+        "stage": str(stage or ""),
+        "message": str(message or ""),
+        **({"tool": str(tool_name)} if tool_name else {}),
+    }
+    events = [e for e in prev_events if isinstance(e, dict)]
+    events.append(event)
+    if RUN_PROGRESS_MAX_EVENTS > 0 and len(events) > RUN_PROGRESS_MAX_EVENTS:
+        events = events[-RUN_PROGRESS_MAX_EVENTS:]
+
+    rp = {
+        "schema_version": "omniflow.run_progress.v1",
+        "user_id": str(user_id or ""),
+        "thread_id": str(thread_id or ""),
+        "run_id": str(run_id or ""),
+        "trace_id": str(trace_id or ""),
+        "status": str(status or ""),
+        "stage": str(stage or ""),
+        "message": str(message or ""),
+        "seq": seq,
+        "ts_utc": ts_utc,
+        "events": events,
+    }
+
+    handles[thread_id] = {
+        **thread_state,
+        "run_progress": rp,
+        "updated_at": ts_utc,
+    }
+    return rp
+
+
+def _emit_run_progress(
+    *,
+    user_id: str,
+    thread_id: str,
+    run_id: str,
+    trace_id: str = "",
+    status: str,
+    stage: str,
+    message: str,
+    tool_name: str = "",
+    async_save: bool = True,
+    handles: Dict[str, Any] | None = None,
+) -> Dict[str, Any] | None:
+    """Best-effort progress emitter; never raises."""
+    uid = str(user_id or "").strip()
+    tid = str(thread_id or "").strip()
+    if not (uid and tid):
+        return None
+
+    now_s = time.time()
+    key = f"{uid}:{tid}"
+    try:
+        with _RUN_PROGRESS_LOCK:
+            last = float(_run_progress_last_write_s.get(key) or 0.0)
+            if (now_s - last) < RUN_PROGRESS_MIN_WRITE_INTERVAL_S:
+                return None
+            _run_progress_last_write_s[key] = now_s
+    except Exception:
+        pass
+
+    try:
+        local_handles = handles if isinstance(handles, dict) else _load_handles(uid)
+        rp = _update_run_progress_in_handles(
+            handles=local_handles,
+            user_id=uid,
+            thread_id=tid,
+            run_id=str(run_id or ""),
+            trace_id=str(trace_id or ""),
+            status=status,
+            stage=stage,
+            message=message,
+            tool_name=tool_name,
+        )
+        if isinstance(local_handles, dict):
+            _save_handles(uid, local_handles, async_save=async_save)
+        return rp
+    except Exception as exc:
+        _best_effort_debug(
+            "emit_run_progress_failed",
+            user_id=uid,
+            thread_id=tid,
+            error=exc,
+            stage=stage,
+        )
+        return None
+
+
 def _extract_response_function_calls(response: Any) -> list:
     calls = []
     for item in (getattr(response, "output", None) or []):
@@ -1937,6 +2077,8 @@ def run_responses(
     *,
     persist_handles: bool = True,
     recent_turns: list[str] | None = None,
+    run_id: str = "",
+    trace_id: str = "",
 ) -> Tuple[str, list, Dict[str, Any], str]:
     """Responses API deterministic tool loop using a Prompt ID (dual-runtime mode)."""
     if not thread_id:
@@ -2113,6 +2255,18 @@ def run_responses(
         for call in function_calls:
             name = call.get("name") or ""
             args = _safe_load_json(call.get("arguments") or "")
+            _emit_run_progress(
+                user_id=user_id,
+                thread_id=thread_id,
+                run_id=str(run_id or ""),
+                trace_id=str(trace_id or ""),
+                status="in_progress",
+                stage="calling_tools",
+                message=f"Calling tool: {name}",
+                tool_name=str(name or ""),
+                async_save=True,
+                handles=handles if isinstance(handles, dict) else None,
+            )
             result_str, info = execute_tool_call(name, args, user_id)
             info = dict(info or {})
             info["call_id"] = call.get("call_id")
@@ -3017,12 +3171,32 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         action = body.get("action")
         params = body.get("params", {})
         log_interaction = bool(body.get("log_interaction", True))
+        trace_id = str(body.get("trace_id") or "").strip()
 
         # Direct actions bypass agent/tool loop
         if action in ["save_interaction", "get_interaction_history"]:
             resp_direct = handle_direct_actions(req, body, action, user_id)
             if resp_direct is not None:
                 return resp_direct
+
+        if action == "get_run_progress":
+            if not user_id:
+                return _make_response({"error": "user_id is required", "action": action}, status_code=400)
+            if not thread_id:
+                return _make_response({"error": "thread_id is required", "action": action}, status_code=400)
+            handles = _load_handles(str(user_id))
+            rp = _get_run_progress(handles if isinstance(handles, dict) else {}, str(thread_id))
+            return _make_response(
+                {
+                    "status": "success",
+                    "action": action,
+                    "user_id": str(user_id),
+                    "thread_id": str(thread_id),
+                    "has_progress": bool(isinstance(rp, dict) and rp),
+                    "run_progress": rp or {},
+                },
+                status_code=200,
+            )
 
         if action in ["wp7_prepare_audit", "wp7_run_audit"]:
             if not user_id:
@@ -3212,6 +3386,17 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 wp6_meta: Dict[str, Any] = {}
                 if not thread_id:
                     thread_id = f"handle_{uuid.uuid4().hex[:12]}"
+                run_id = uuid.uuid4().hex[:12]
+                _emit_run_progress(
+                    user_id=str(user_id),
+                    thread_id=str(thread_id),
+                    run_id=run_id,
+                    trace_id=trace_id,
+                    status="in_progress",
+                    stage="grasping_context",
+                    message="Starting: building context",
+                    async_save=True,
+                )
 
                 recent_turns = _wp6_update_recent_user_turns(user_id, str(thread_id), user_message)
                 recent_block = _wp6_format_recent_turns(recent_turns)
@@ -3405,6 +3590,16 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         mode_reason = "deep_skipped_insufficient_inputs"
                         model_input_message = fast_input_message
 
+                _emit_run_progress(
+                    user_id=str(user_id),
+                    thread_id=str(thread_id),
+                    run_id=run_id,
+                    trace_id=trace_id,
+                    status="in_progress",
+                    stage=("looking_more_data" if mode_initial == "DEEP" else "grasping_context"),
+                    message=("Routing to DEEP" if mode_initial == "DEEP" else "Routing to FAST"),
+                    async_save=True,
+                )
                 assistant_response, all_tool_calls, responses_meta, thread_id = run_responses(
                     openai_client=openai_client,
                     user_id=user_id,
@@ -3412,6 +3607,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     thread_id=thread_id,
                     persist_handles=persist_in_run,
                     recent_turns=recent_turns,
+                    run_id=run_id,
+                    trace_id=trace_id,
                 )
 
                 # Phase 2 (AUTO only): parse FAST response signal and optionally escalate to DEEP once.
@@ -3430,6 +3627,16 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                             deep_input_message, pack_meta = _build_deep_input_message()
                             wp6_meta.update(pack_meta)
                             if deep_input_message:
+                                _emit_run_progress(
+                                    user_id=str(user_id),
+                                    thread_id=str(thread_id),
+                                    run_id=run_id,
+                                    trace_id=trace_id,
+                                    status="in_progress",
+                                    stage="looking_more_data",
+                                    message="Escalating: building DEEP context",
+                                    async_save=True,
+                                )
                                 mode_used = "DEEP"
                                 mode_reason = "agent_need_deep"
                                 wp6_meta["routing"]["escalated"] = True
@@ -3441,6 +3648,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                                     thread_id=thread_id,
                                     persist_handles=persist_in_run,
                                     recent_turns=recent_turns,
+                                    run_id=run_id,
+                                    trace_id=trace_id,
                                 )
                                 deep_signal, deep_cleaned = _wp6_parse_need_deep_signal(deep_resp or "")
                                 wp6_meta["need_deep_signal_deep"] = deep_signal
@@ -3557,6 +3766,16 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     responses_meta["wp6"] = wp6_meta
             except Exception:
                 pass
+            _emit_run_progress(
+                user_id=str(user_id),
+                thread_id=str(thread_id),
+                run_id=run_id,
+                trace_id=trace_id,
+                status="completed",
+                stage="done",
+                message="Done",
+                async_save=False,
+            )
             return finalize_response(
                 openai_client=openai_client,
                 thread_id=thread_id,

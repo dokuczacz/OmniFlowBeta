@@ -39,13 +39,33 @@ Legend: OK  X  Pending  Available/Needs constraints
 
 ---
 
-## Live demo
+## 📁 Project Structure
 
-- Streamlit (legacy LAB): https://omniflowbeta-gjv5gjhezwbfg7pb7pucwe.streamlit.app/
+```
+OmniFlowBeta/
+├── backend/              # Azure Functions (legacy, deprecated)
+├── OmniFlowCentral/      # Azure Functions (App2, active deployment)
+├── ai-chatbot/           # Main UI (Next.js, actively maintained)
+├── frontend/             # Lab UI (Streamlit, for testing)
+├── data/                 # Local data files (gitignored)
+├── docs/                 # Documentation (selective tracking)
+├── experiments/          # Experimental features (untracked)
+├── external/             # External templates/dependencies
+├── logs/                 # Runtime logs (gitignored)
+├── scripts/              # Automation scripts
+├── tests/                # Test suites
+├── tools/                # Local tooling (gitignored)
+├── ui_archived/          # Archived UI proposals (gitignored)
+│   ├── ui_next_proposal/ # Future Next.js UI proposal
+│   └── ui_shiny/         # Archived Shiny UI
+└── .azurite/             # Azurite emulator data (gitignored)
+```
 
 ---
 
 ## Known limitations
+
+## Live demo
 
 - WP6: `DEEP` not deterministically forceable end-to-end.
 - Streamlit UI is legacy/LAB only (primary UI is Next.js).
