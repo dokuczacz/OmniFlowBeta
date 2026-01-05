@@ -43,38 +43,51 @@ except Exception:
     detach_file_handler = None
 from shared.http_client import requests_get, requests_post
 from shared.mock_agent import build_mock_agent_response, mock_marker, mock_user_id
+from shared.manage_files_params import normalize_manage_files_params
+from shared.tool_catalog import apply_param_aliases, canonical_tool_name
+from shared.tool_handler_config import DEFAULT_TOOL_HANDLER_CONFIG as TOOL_HANDLER_CONFIG
 
 # Config
+# General config
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 ASSISTANT_ID = os.environ.get("OPENAI_ASSISTANT_ID", "")
 OPENAI_PROMPT_ID = os.environ.get("OPENAI_PROMPT_ID", "")
 LLM_RUNTIME_DEFAULT = os.environ.get("LLM_RUNTIME", "assistants")
-# Cache `handles.json` in-memory to avoid repeated blob reads.
-# Default TTL is 10 minutes to tolerate long responses/tool loops without frequent cache refresh.
-HANDLES_CACHE_TTL_SECONDS = int(os.environ.get("HANDLES_CACHE_TTL_SECONDS", "600") or 600)
+VECTOR_STORE_ID = os.environ.get("OPENAI_VECTOR_STORE_ID", "")
 PROXY_URL = os.environ.get("AZURE_PROXY_URL", "")
 PROXY_FUNCTION_KEY = os.environ.get("FUNCTION_CODE_PROXY_ROUTER", "")
-ENABLE_SAVE_INTERACTION = True  # Hardcoded to always enable saving for now
-VECTOR_STORE_ID = os.environ.get("OPENAI_VECTOR_STORE_ID", "")
-DEBUG_TOOL_CALL_HANDLER = os.environ.get("DEBUG_TOOL_CALL_HANDLER", "").lower() in ("1", "true", "yes")
-OMNIFLOW_DEBUG = os.environ.get("OMNIFLOW_DEBUG", "").lower() in ("1", "true", "yes")
-DEBUG_TOOL_CALL_HANDLER = bool(DEBUG_TOOL_CALL_HANDLER or OMNIFLOW_DEBUG)
-OMNIFLOW_MOCK_AGENT = os.environ.get("OMNIFLOW_MOCK_AGENT", "").lower() in ("1", "true", "yes")
-OPENAI_MAX_REQUESTS = int(os.environ.get("OPENAI_MAX_REQUESTS", "0") or 0)
-# WP6 routing: when UI does not send `context_mode`, fall back to this default.
-# Values: AUTO | FAST | DEEP
-WP6_DEFAULT_CONTEXT_MODE = (os.environ.get("WP6_DEFAULT_CONTEXT_MODE", "AUTO") or "AUTO").strip().upper()
+CONFIG = TOOL_HANDLER_CONFIG
+HANDLES_CACHE_TTL_SECONDS = CONFIG.handles_cache_ttl_seconds
+PREFERENCES_CACHE_TTL_SECONDS = CONFIG.preferences_cache_ttl_seconds
+OPENAI_MAX_REQUESTS = CONFIG.openai_max_requests
+DEBUG_TOOL_CALL_HANDLER = CONFIG.debug_tool_call_handler
+OMNIFLOW_DEBUG = CONFIG.omniflow_debug
+OMNIFLOW_MOCK_AGENT = CONFIG.omniflow_mock_agent
+ENABLE_SAVE_INTERACTION = CONFIG.enable_save_interaction
+WP6_DEFAULT_CONTEXT_MODE = CONFIG.wp6_default_context_mode
 WP6_TOPIC_CHANGE_ENABLED = False
 WP6_TOPIC_CHANGE_WINDOW_SECONDS = 0
-WP6_RESPONSES_STATELESS = os.environ.get("WP6_RESPONSES_STATELESS", "").lower() in ("1", "true", "yes")
-WP6_RECENT_TURNS_MAX = int(os.environ.get("WP6_RECENT_TURNS_MAX", "8") or 8)
-WP6_RECENT_TURNS_MAX_CHARS = int(os.environ.get("WP6_RECENT_TURNS_MAX_CHARS", "320") or 320)
-WP6_FAST_AUDIT_ENABLED = str(os.environ.get("WP6_FAST_AUDIT_ENABLED", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on")
-WP6_FAST_AUDIT_MAX_CHARS = int(os.environ.get("WP6_FAST_AUDIT_MAX_CHARS", "16000") or 16000)
-WP6_AUDIT_DEFAULT_MODEL = str(os.environ.get("WP6_AUDIT_DEFAULT_MODEL") or os.environ.get("OPENAI_WP6_AUDIT_MODEL") or "gpt-5-mini").strip()
-WP6_AUDIT_DEFAULT_REASONING_EFFORT = str(os.environ.get("WP6_AUDIT_DEFAULT_REASONING_EFFORT") or os.environ.get("OPENAI_WP6_AUDIT_REASONING_EFFORT") or "medium").strip().lower()
-WP7_AUDIT_DEFAULT_MODEL = str(os.environ.get("WP7_AUDIT_DEFAULT_MODEL", "gpt-5-mini") or "gpt-5-mini").strip()
-WP7_AUDIT_DEFAULT_REASONING_EFFORT = str(os.environ.get("WP7_AUDIT_DEFAULT_REASONING_EFFORT", "medium") or "medium").strip().lower()
+WP6_RESPONSES_STATELESS = CONFIG.wp6_responses_stateless
+WP6_RECENT_TURNS_MAX = CONFIG.wp6_recent_turns_max
+WP6_RECENT_TURNS_MAX_CHARS = CONFIG.wp6_recent_turns_max_chars
+WP6_FAST_AUDIT_ENABLED = CONFIG.wp6_fast_audit_enabled
+WP6_FAST_AUDIT_MAX_CHARS = CONFIG.wp6_fast_audit_max_chars
+WP6_AUDIT_DEFAULT_MODEL = CONFIG.wp6_audit_default_model
+WP6_AUDIT_DEFAULT_REASONING_EFFORT = CONFIG.wp6_audit_default_reasoning_effort
+ALLOWED_TOOL_ACTIONS = frozenset(
+    [
+        "add_new_data",
+        "get_current_time",
+        "get_filtered_data",
+        "list_blobs",
+        "read_blob_file",
+        "read_many_blobs",
+        "remove_data_entry",
+        "update_data_entry",
+        "upload_data_or_file",
+        "manage_files",
+    ]
+)
 # runtime counter for outbound OpenAI HTTP calls (best-effort)
 _openai_lock = threading.Lock()
 _openai_count = 0
@@ -83,25 +96,18 @@ _handles_cache: Dict[str, Dict[str, Any]] = {}
 
 # WP6.M1: preferences cache (best-effort; no hard dependency)
 _prefs_cache: Dict[str, Dict[str, Any]] = {}
-PREFERENCES_CACHE_TTL_SECONDS = int(os.environ.get("PREFERENCES_CACHE_TTL_SECONDS", "600") or 600)
-WP6_PREFERENCES_AUTO_CREATE = str(os.environ.get("WP6_PREFERENCES_AUTO_CREATE", "1") or "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "y",
-    "on",
-)
+PREFERENCES_CACHE_TTL_SECONDS = CONFIG.preferences_cache_ttl_seconds
+WP6_PREFERENCES_AUTO_CREATE = CONFIG.wp6_preferences_auto_create
 _prefs_loading = threading.local()
-
-WP6_FAST_MAX_INPUT_TOKENS = int(os.environ.get("WP6_FAST_MAX_INPUT_TOKENS", "2000") or 2000)
-WP6_FAST_MAX_SOURCES = int(os.environ.get("WP6_FAST_MAX_SOURCES", "4") or 4)
-WP6_FAST_MAX_RAW_BYTES = int(os.environ.get("WP6_FAST_MAX_RAW_BYTES", "64000") or 64000)
-WP6_DEEP_MAX_PACK_TOKENS = int(os.environ.get("WP6_DEEP_MAX_PACK_TOKENS", "16000") or 16000)
-WP6_DEEP_MAX_CANDIDATE_SOURCES = int(os.environ.get("WP6_DEEP_MAX_CANDIDATE_SOURCES", "12") or 12)
-WP6_DEEP_MIN_SEMANTIC_SELECTED = int(os.environ.get("WP6_DEEP_MIN_SEMANTIC_SELECTED", "3") or 3)
-WP6_DEEP_MIN_SEMANTIC_CANDIDATES = int(os.environ.get("WP6_DEEP_MIN_SEMANTIC_CANDIDATES", "6") or 6)
-WP6_CONTEXT_PACK_TTL_SECONDS = int(os.environ.get("WP6_CONTEXT_PACK_TTL_SECONDS", "300") or 300)
-WP6_DEEP_COOLDOWN_SECONDS = int(os.environ.get("WP6_DEEP_COOLDOWN_SECONDS", "600") or 600)
+WP6_FAST_MAX_INPUT_TOKENS = CONFIG.wp6_fast_max_input_tokens
+WP6_FAST_MAX_SOURCES = CONFIG.wp6_fast_max_sources
+WP6_FAST_MAX_RAW_BYTES = CONFIG.wp6_fast_max_raw_bytes
+WP6_DEEP_MAX_PACK_TOKENS = CONFIG.wp6_deep_max_pack_tokens
+WP6_DEEP_MAX_CANDIDATE_SOURCES = CONFIG.wp6_deep_max_candidate_sources
+WP6_DEEP_MIN_SEMANTIC_SELECTED = CONFIG.wp6_deep_min_semantic_selected
+WP6_DEEP_MIN_SEMANTIC_CANDIDATES = CONFIG.wp6_deep_min_semantic_candidates
+WP6_CONTEXT_PACK_TTL_SECONDS = CONFIG.wp6_context_pack_ttl_seconds
+WP6_DEEP_COOLDOWN_SECONDS = CONFIG.wp6_deep_cooldown_seconds
 OPENAI_CONTEXT_BUILDER_PROMPT_ID = os.environ.get("OPENAI_CONTEXT_BUILDER_PROMPT_ID", "")
 
 def _best_effort_debug(code: str, *, user_id: str = "", thread_id: str = "", error: Exception | None = None, **ctx: Any) -> None:
@@ -985,7 +991,7 @@ def _wp7_run_audit(
     schema = _wp7_audit_json_schema()
     resp = _openai_call(
         openai_client.responses.create,
-        model=str(model or WP7_AUDIT_DEFAULT_MODEL),
+        model=str(model or TOOL_HANDLER_CONFIG.wp7_audit_default_model),
         reasoning={"effort": reasoning_effort},
         max_output_tokens=int(max_output_tokens or 8000),
         text={"format": {"type": "json_schema", "name": "wp7_semantic_index_audit", "strict": True, "schema": schema}},
@@ -2872,10 +2878,12 @@ def _openai_rest_headers(include_beta: bool = True) -> Dict[str, str]:
 def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: str) -> Tuple[str, Dict[str, Any]]:
     """Call proxy_router for a given tool."""
     start_time = time.time()
+    canonical_tool = canonical_tool_name(tool_name)
     normalized_args = normalize_tool_arguments(tool_name, tool_arguments)
-    params_with_user = {**(normalized_args or {}), "user_id": user_id}
+    normalized_args = apply_param_aliases(canonical_tool, normalized_args or {}, keep_legacy=True)
+    params_with_user = {**normalized_args, "user_id": user_id}
     dispatch_args = params_with_user
-    logging.debug(f"Dispatching tool={tool_name} with params={dispatch_args}")
+    logging.debug(f"Dispatching tool={tool_name} (canonical={canonical_tool}) with params={dispatch_args}")
 
     # WP6.M1 preferences enforcement (best-effort).
     # Goal: reduce costly/history reads and prevent agent "browsing" beyond allowlisted files.
@@ -2949,18 +2957,19 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
 
     # Hard validation for manage_files to avoid bad requests
     if tool_name == "manage_files":
+        dispatch_args = normalize_manage_files_params(dispatch_args, keep_legacy=True)
         op = dispatch_args.get("operation")
         src = dispatch_args.get("source_name")
         tgt = dispatch_args.get("target_name")
         if op is None:
-            err = "manage_files requires 'operation' (rename/delete)"
+            err = "manage_files requires 'operation' (rename/delete/list)"
             info = {"tool_name": tool_name, "arguments": dispatch_args, "error": err, "status": "failed", "duration_ms": 0}
             return json.dumps({"error": err}), info
-        if op not in ["rename", "delete"]:
+        if op not in ["rename", "delete", "list"]:
             err = f"manage_files operation '{op}' is not supported. Use list_blobs for listing."
             info = {"tool_name": tool_name, "arguments": dispatch_args, "error": err, "status": "failed", "duration_ms": 0}
             return json.dumps({"error": err}), info
-        if not src:
+        if op in ["rename", "delete"] and not src:
             err = "manage_files requires 'source_name'"
             info = {"tool_name": tool_name, "arguments": dispatch_args, "error": err, "status": "failed", "duration_ms": 0}
             return json.dumps({"error": err}), info
@@ -3148,6 +3157,14 @@ def save_interaction_log(user_id: str, user_message: str, assistant_response: st
         logging.warning(f"save_interaction_log failed: {e}")
 
 
+
+def _parse_tool_result(result_str: str) -> Any:
+    try:
+        return json.loads(result_str)
+    except Exception:
+        return result_str
+
+
 def main(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("=" * 60)
     logging.info("TOOL_CALL_HANDLER start")
@@ -3164,739 +3181,37 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         except Exception:
             return _make_response({"error": "Invalid JSON payload"}, status_code=400)
 
-        user_message = body.get("message", "")
+        action = str(body.get("action") or "").strip()
+        params = body.get("params") or {}
         user_id, _user_id_source = resolve_user_id(req, body)
-        thread_id = body.get("thread_id")
-        time_only = bool(body.get("time_only", False))
-        action = body.get("action")
-        params = body.get("params", {})
-        log_interaction = bool(body.get("log_interaction", True))
         trace_id = str(body.get("trace_id") or "").strip()
-
-        # Direct actions bypass agent/tool loop
-        if action in ["save_interaction", "get_interaction_history"]:
-            resp_direct = handle_direct_actions(req, body, action, user_id)
-            if resp_direct is not None:
-                return resp_direct
-
-        if action == "get_run_progress":
-            if not user_id:
-                return _make_response({"error": "user_id is required", "action": action}, status_code=400)
-            if not thread_id:
-                return _make_response({"error": "thread_id is required", "action": action}, status_code=400)
-            handles = _load_handles(str(user_id))
-            rp = _get_run_progress(handles if isinstance(handles, dict) else {}, str(thread_id))
-            return _make_response(
-                {
-                    "status": "success",
-                    "action": action,
-                    "user_id": str(user_id),
-                    "thread_id": str(thread_id),
-                    "has_progress": bool(isinstance(rp, dict) and rp),
-                    "run_progress": rp or {},
-                },
-                status_code=200,
-            )
-
-        if action in ["wp7_prepare_audit", "wp7_run_audit"]:
-            if not user_id:
-                return _make_response({"error": "user_id is required"}, status_code=400)
-            # WP7 audit does not require AZURE_PROXY_URL; it reads blobs via connection string and calls OpenAI directly.
-            if not OPENAI_API_KEY:
-                return _make_response({"error": "Missing env vars: OPENAI_API_KEY", "status": "not_configured"}, status_code=503)
-            params = body.get("params", {}) or {}
-            try:
-                if action == "wp7_prepare_audit":
-                    count = int(params.get("count", 50) or 50)
-                    max_scan = int(params.get("max_scan", 500) or 500)
-                    skip_already = bool(params.get("skip_already_audited", True))
-                    audit_input = _wp7_prepare_audit_input(
-                        str(user_id),
-                        count=count,
-                        max_scan=max_scan,
-                        skip_already_audited=skip_already,
-                    )
-                    return _make_response({"status": "success", "result": audit_input}, status_code=200)
-
-                # wp7_run_audit
-                model = str(params.get("model") or WP7_AUDIT_DEFAULT_MODEL).strip()
-                reasoning_effort = str(params.get("reasoning_effort") or WP7_AUDIT_DEFAULT_REASONING_EFFORT).strip().lower()
-                max_output_tokens = int(params.get("max_output_tokens", 8000) or 8000)
-                audit_input = params.get("audit_input")
-                if not isinstance(audit_input, dict):
-                    # Convenience: if not provided, prepare now (default 50).
-                    audit_input = _wp7_prepare_audit_input(str(user_id), count=50)
-                openai_client = OpenAI(api_key=OPENAI_API_KEY)
-                result = _wp7_run_audit(
-                    openai_client,
-                    user_id=str(user_id),
-                    audit_input=audit_input,
-                    model=model,
-                    reasoning_effort=reasoning_effort,
-                    max_output_tokens=max_output_tokens,
-                )
-                # Persist audited IDs + log run
-                audited_ids = []
-                try:
-                    audited_ids = [
-                        str(x.get("interaction_id"))
-                        for x in (audit_input.get("index_entries") or [])
-                        if isinstance(x, dict) and x.get("interaction_id")
-                    ]
-                except Exception:
-                    audited_ids = []
-                _wp_audit_update_state(str(user_id), audit_type="wp7", audited_ids=audited_ids)
-                _wp_audit_write_log(
-                    str(user_id),
-                    audit_type="wp7",
-                    payload={
-                        "run_id": str(audit_input.get("run_id") or ""),
-                        "user_id": str(user_id),
-                        "audit_type": "wp7",
-                        "model": model,
-                        "reasoning_effort": reasoning_effort,
-                        "max_output_tokens": max_output_tokens,
-                        "selected_interaction_ids": audited_ids,
-                        "result_summary": {
-                            "gate": result.get("gate"),
-                            "integrity_metrics": result.get("integrity_metrics"),
-                        },
-                        "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
-                    },
-                )
-                return _make_response({"status": "success", "result": result}, status_code=200)
-            except Exception as exc:
-                _best_effort_debug("wp7_audit_action_failed", user_id=str(user_id), thread_id=str(thread_id or ""), error=exc, action=action)
-                return _make_response({"status": "error", "error": str(exc), "action": action}, status_code=500)
-
-        if action in ["wp6_prepare_audit", "wp6_run_audit"]:
-            if not user_id:
-                return _make_response({"error": "user_id is required"}, status_code=400)
-            # WP6 audit does not require AZURE_PROXY_URL; it reads blobs via connection string and calls OpenAI directly.
-            if not OPENAI_API_KEY:
-                return _make_response({"error": "Missing env vars: OPENAI_API_KEY", "status": "not_configured"}, status_code=503)
-            params = body.get("params", {}) or {}
-            try:
-                if action == "wp6_prepare_audit":
-                    audit_samples = _wp6_prepare_audit_samples(
-                        str(user_id),
-                        count=int(params.get("count", 10) or 10),
-                        max_sources=int(params.get("max_sources", 8) or 8),
-                        max_chars=int(params.get("max_chars", 12000) or 12000),
-                        recent_turns=int(params.get("recent_turns", 5) or 5),
-                        recent_interactions=int(params.get("recent_interactions", 200) or 200),
-                        skip_already_audited=bool(params.get("skip_already_audited", True)),
-                    )
-                    return _make_response({"status": "success", "result": audit_samples}, status_code=200)
-
-                model = str(params.get("model") or WP6_AUDIT_DEFAULT_MODEL).strip()
-                reasoning_effort = str(params.get("reasoning_effort") or WP6_AUDIT_DEFAULT_REASONING_EFFORT).strip().lower()
-                max_output_tokens = int(params.get("max_output_tokens", 8000) or 8000)
-                audit_samples = params.get("audit_samples")
-                if not isinstance(audit_samples, dict):
-                    audit_samples = _wp6_prepare_audit_samples(str(user_id), count=10, max_sources=8, max_chars=12000, recent_turns=5)
-                openai_client = OpenAI(api_key=OPENAI_API_KEY)
-                result = _wp6_run_audit(
-                    openai_client,
-                    user_id=str(user_id),
-                    audit_samples=audit_samples,
-                    model=model,
-                    reasoning_effort=reasoning_effort,
-                    max_output_tokens=max_output_tokens,
-                )
-                audited_ids = []
-                try:
-                    audited_ids = [
-                        str(x.get("audit_id"))
-                        for x in (audit_samples.get("samples") or [])
-                        if isinstance(x, dict) and x.get("audit_id")
-                    ]
-                except Exception:
-                    audited_ids = []
-                _wp_audit_update_state(str(user_id), audit_type="wp6", audited_ids=audited_ids)
-                _wp_audit_write_log(
-                    str(user_id),
-                    audit_type="wp6",
-                    payload={
-                        "run_id": str(audit_samples.get("run_id") or ""),
-                        "user_id": str(user_id),
-                        "audit_type": "wp6",
-                        "model": model,
-                        "reasoning_effort": reasoning_effort,
-                        "max_output_tokens": max_output_tokens,
-                        "selected_audit_ids": audited_ids,
-                        "result_summary": {
-                            "gate": result.get("gate"),
-                            "global_summary": result.get("global_summary"),
-                        },
-                        "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
-                    },
-                )
-                return _make_response({"status": "success", "result": result}, status_code=200)
-            except Exception as exc:
-                _best_effort_debug("wp6_audit_action_failed", user_id=str(user_id), thread_id=str(thread_id or ""), error=exc, action=action)
-                return _make_response({"status": "error", "error": str(exc), "action": action}, status_code=500)
-
-        if OMNIFLOW_MOCK_AGENT:
-            forced_user_id = mock_user_id()
-            mock_thread_id = str(thread_id or "mock_thread")
-            body_mock = build_mock_agent_response(
-                agent="wp6",
-                user_id=str(forced_user_id),
-                thread_id=mock_thread_id,
-                user_message=str(user_message or ""),
-                marker=mock_marker("wp6"),
-            )
-            return _make_response(body_mock, status_code=200)
-
-        # Runtime selection (dual runtime: assistants|responses|auto)
+        if not action:
+            return _make_response({"error": "action is required"}, status_code=400)
+        if action not in ALLOWED_TOOL_ACTIONS:
+            return _make_response({"error": "action not supported", "allowed_actions": sorted(ALLOWED_TOOL_ACTIONS)}, status_code=403)
+        if not user_id:
+            return _make_response({"error": "user_id is required for tool actions"}, status_code=400)
         try:
-            runtime_requested = resolve_runtime(body)
-        except ValueError as vex:
-            return _make_response({"error": str(vex)}, status_code=400)
-
-        if runtime_requested == "auto":
-            if not _missing_env_vars_for_runtime("responses"):
-                runtime_used = "responses"
-            elif not _missing_env_vars_for_runtime("assistants"):
-                runtime_used = "assistants"
-            else:
-                # Prefer listing everything required for both runtimes to aid setup.
-                missing = sorted(set(_missing_env_vars_for_runtime("responses") + _missing_env_vars_for_runtime("assistants")))
-                return _make_response({"error": f"Missing env vars: {', '.join(missing)}", "status": "not_configured"}, status_code=503)
-        else:
-            runtime_used = runtime_requested
-
-        # Config check (after direct actions so save/get can work without proxy config)
-        missing = _missing_env_vars_for_runtime(runtime_used)
-        if missing:
-            return _make_response({"error": f"Missing env vars: {', '.join(missing)}", "status": "not_configured", "runtime": runtime_used}, status_code=503)
-
-        # Run
-        # Initialize OpenAI client and detect SDK capabilities early so we
-        # can attempt SDK-based thread creation before falling back to REST.
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
-        # Note: SDK tool_resources support is detectable via _supports_tool_resources(),
-        # but the value is not used in this handler; keep function available for future use.
-
-        # Responses runtime (Prompt ID + deterministic tool loop)
-        if runtime_used == "responses":
-            request_start = time.time()
-            try:
-                wp6_meta: Dict[str, Any] = {}
-                if not thread_id:
-                    thread_id = f"handle_{uuid.uuid4().hex[:12]}"
-                run_id = uuid.uuid4().hex[:12]
-                _emit_run_progress(
-                    user_id=str(user_id),
-                    thread_id=str(thread_id),
-                    run_id=run_id,
-                    trace_id=trace_id,
-                    status="in_progress",
-                    stage="grasping_context",
-                    message="Starting: building context",
-                    async_save=True,
-                )
-
-                recent_turns = _wp6_update_recent_user_turns(user_id, str(thread_id), user_message)
-                recent_block = _wp6_format_recent_turns(recent_turns)
-                wp6_meta["recent_user_turns_count"] = int(len(recent_turns or []))
-                wp6_meta["recent_user_turns_chars"] = int(sum(len(str(t or "")) for t in (recent_turns or [])))
-
-                audit_id = uuid.uuid4().hex[:12] if WP6_FAST_AUDIT_ENABLED else ""
-                audit_in_path = ""
-                audit_out_path = ""
-
-                routed_mode, route_reason, route_meta = _wp6_route_context_mode(body, user_message)
-
-                # Build bounded FAST semantic context (used also as an input for DEEP builder).
-                fast_ctx, fast_meta = _wp6_fast_context_from_wp7_semantic(
-                    user_id=user_id,
-                    max_sources=min(WP6_FAST_MAX_SOURCES, 10),
-                    max_chars=min(WP6_FAST_MAX_RAW_BYTES, WP6_FAST_MAX_INPUT_TOKENS * 4),
-                )
-                wp6_meta = {**route_meta, **fast_meta}
-                try:
-                    wp6_meta["recent_user_turns_count"] = int(len(recent_turns or []))
-                    wp6_meta["recent_user_turns_chars"] = int(sum(len(str(t or "")) for t in (recent_turns or [])))
-                except Exception:
-                    pass
-
-                handles_for_thread = _load_handles(user_id)
-                state_for_thread = (
-                    handles_for_thread.get(thread_id, {}) if (thread_id and isinstance(handles_for_thread, dict)) else {}
-                )
-                intent_key = _wp6_norm_intent_key(user_message)
-                wp6_meta["intent_key"] = intent_key
-
-                # Minimum input evidence for DEEP builder (Context Builder has no tools).
-                core_sources, core_meta = _wp6_core_candidate_sources_tm_lo_ps(user_id)
-                wp6_meta["core_snippets_count"] = int((core_meta or {}).get("core_snippets_count") or 0)
-                wp6_meta["core_snippets_bytes"] = int((core_meta or {}).get("core_snippets_bytes") or 0)
-
-                semantic_selected = int((fast_meta or {}).get("selected_sources_count") or 0)
-                semantic_candidates = int((fast_meta or {}).get("semantic_candidates_count") or 0)
-                deep_allowed_inputs = (
-                    semantic_selected >= int(WP6_DEEP_MIN_SEMANTIC_SELECTED)
-                    or semantic_candidates >= int(WP6_DEEP_MIN_SEMANTIC_CANDIDATES)
-                    or int(wp6_meta.get("core_snippets_count") or 0) >= 3
-                )
-                wp6_meta["deep_allowed_inputs"] = bool(deep_allowed_inputs)
-                wp6_meta["deep_allowed_inputs_semantic_selected"] = semantic_selected
-                wp6_meta["deep_allowed_inputs_semantic_candidates"] = semantic_candidates
-
-                # Cooldown is applied only for AUTO-mode escalations to avoid repeated costly DEEP runs.
-                cooldown_ok, cooldown_reason = _wp6_deep_cooldown_allowed(state_for_thread if isinstance(state_for_thread, dict) else {})
-                wp6_meta["deep_cooldown_ok"] = bool(cooldown_ok)
-                wp6_meta["deep_cooldown_reason"] = cooldown_reason
-
-                requested_mode = str(route_meta.get("context_mode_requested") or "AUTO").upper()
-                auto_mode = requested_mode == "AUTO"
-                deep_allowed = bool(deep_allowed_inputs) and (bool(cooldown_ok) if auto_mode else True)
-                wp6_meta["deep_allowed"] = bool(deep_allowed)
-
-                # FAST input (evidence-lite) is always built; used both for FAST run and as seed for DEEP builder.
-                fast_input_message = user_message
-                if fast_ctx:
-                    fast_input_message = f"[FAST_CONTEXT]\n{fast_ctx}\n\n[USER_MESSAGE]\n{user_message}"
-                if recent_block:
-                    fast_input_message = f"{recent_block}\n\n{fast_input_message}"
-
-                # Routing: AUTO defaults to FAST; DEEP can be entered:
-                # - deterministically (e.g., FAST context empty) before first call, or
-                # - agent-driven after FAST via need_deep/__ROUTE_DEEP__ signal.
-                mode_initial = "FAST"
-                reason_initial = route_reason
-                if requested_mode == "DEEP":
-                    mode_initial = "DEEP"
-                    reason_initial = "explicit"
-                elif requested_mode == "FAST":
-                    mode_initial = "FAST"
-                    reason_initial = "explicit"
-                else:
-                    if deep_allowed and not str(fast_ctx or "").strip():
-                        mode_initial = "DEEP"
-                        reason_initial = "fast_context_empty"
-                    else:
-                        mode_initial = "FAST"
-                        reason_initial = "auto_fast"
-
-                wp6_meta["routing"] = {
-                    "mode_requested": requested_mode,
-                    "mode_initial": mode_initial,
-                    "reason_initial": reason_initial,
-                    "deep_allowed": bool(deep_allowed),
-                }
-
-                if audit_id:
-                    try:
-                        fast_ctx_trunc = str(fast_ctx or "")
-                        if int(WP6_FAST_AUDIT_MAX_CHARS or 0) > 0:
-                            fast_ctx_trunc = fast_ctx_trunc[: int(WP6_FAST_AUDIT_MAX_CHARS)]
-                        fast_limits = {
-                            "max_sources_requested": int((fast_meta or {}).get("max_sources_requested") or 0),
-                            "max_chars_requested": int((fast_meta or {}).get("max_chars_requested") or 0),
-                            "fast_max_input_tokens": int(WP6_FAST_MAX_INPUT_TOKENS or 0),
-                            "fast_max_raw_bytes": int(WP6_FAST_MAX_RAW_BYTES or 0),
-                        }
-                        fast_selected_ids = list((fast_meta or {}).get("selected_source_ids") or [])
-                        payload_in = {
-                            "schema_version": "omniflow.wp6.fast_audit.v1",
-                            "kind": "fast_in",
-                            "audit_id": audit_id,
-                            "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
-                            "user_id": str(user_id),
-                            "thread_id": str(thread_id),
-                            "stateless": bool(WP6_RESPONSES_STATELESS),
-                            "intent_key": str(intent_key),
-                            "routing": dict(wp6_meta.get("routing") or {}),
-                            "recent_user_turns": list(recent_turns or []),
-                            "fast_ctx": fast_ctx_trunc,
-                            "limits": fast_limits,
-                            "fast_meta": {
-                                "semantic_candidates_count": int((fast_meta or {}).get("semantic_candidates_count") or 0),
-                                "selected_sources_count": int((fast_meta or {}).get("selected_sources_count") or 0),
-                                "raw_bytes_read": int((fast_meta or {}).get("raw_bytes_read") or 0),
-                                "candidate_sources": list((fast_meta or {}).get("candidate_sources") or []),
-                                "selected_source_ids": fast_selected_ids,
-                            },
-                        }
-                        audit_in_path = _wp6_write_fast_audit(
-                            user_id,
-                            str(thread_id),
-                            audit_id=audit_id,
-                            kind="fast_in",
-                            payload=payload_in,
-                        )
-                    except Exception as exc:
-                        _best_effort_debug("wp6_fast_audit_in_failed", user_id=str(user_id), thread_id=str(thread_id), error=exc)
-
-                # For AUTO we delay persisting response continuation until we know if we escalate to DEEP.
-                persist_in_run = not auto_mode
-                escalations_used = 0
-
-                mode_used = mode_initial
-                mode_reason = reason_initial
-
-                # Helper: build Context Builder pack input and return model input message (or "" on failure).
-                def _build_deep_input_message() -> Tuple[str, Dict[str, Any]]:
-                    # Merge core snippets (TM/LO/PS) with semantic sources; keep order and dedupe by path.
-                    merged_sources: list[dict] = []
-                    seen_paths: set[str] = set()
-                    for src in (core_sources or []) + list((fast_meta or {}).get("candidate_sources") or []):
-                        if not isinstance(src, dict):
-                            continue
-                        pth = str(src.get("path") or "").strip()
-                        if not pth or pth in seen_paths:
-                            continue
-                        merged_sources.append(src)
-                        seen_paths.add(pth)
-
-                    max_candidates_eff = WP6_DEEP_MAX_CANDIDATE_SOURCES + (
-                        2 if int(wp6_meta.get("core_snippets_count") or 0) >= 3 else 0
-                    )
-                    wp6_meta["deep_max_candidates_eff"] = int(max_candidates_eff)
-                    wp6_meta["deep_candidate_sources_count"] = int(len(merged_sources))
-
-                    pack_text, pack_meta = _wp6_build_or_reuse_context_pack(
-                        openai_client=openai_client,
-                        user_id=user_id,
-                        thread_id=str(thread_id or ""),
-                        user_message=user_message,
-                        state=state_for_thread if isinstance(state_for_thread, dict) else {},
-                        fast_ctx=fast_ctx,
-                        intent_key=intent_key,
-                        candidate_sources=merged_sources,
-                        max_candidates=max_candidates_eff,
-                    )
-                    return (f"[CONTEXT_PACK_JSON]\n{pack_text}\n\n[USER_MESSAGE]\n{user_message}" if pack_text else ""), pack_meta
-
-                # Run phase 1 (FAST by default, or DEEP deterministically).
-                model_input_message = fast_input_message
-                if mode_initial == "DEEP":
-                    if deep_allowed_inputs:
-                        deep_input_message, pack_meta = _build_deep_input_message()
-                        wp6_meta.update(pack_meta)
-                        if deep_input_message:
-                            model_input_message = deep_input_message
-                            mode_used = "DEEP"
-                            mode_reason = reason_initial
-                        else:
-                            mode_used = "FAST"
-                            mode_reason = f"deep_fallback:{pack_meta.get('error') or 'no_pack'}"
-                            model_input_message = fast_input_message
-                    else:
-                        mode_used = "FAST"
-                        mode_reason = "deep_skipped_insufficient_inputs"
-                        model_input_message = fast_input_message
-
-                _emit_run_progress(
-                    user_id=str(user_id),
-                    thread_id=str(thread_id),
-                    run_id=run_id,
-                    trace_id=trace_id,
-                    status="in_progress",
-                    stage=("looking_more_data" if mode_initial == "DEEP" else "grasping_context"),
-                    message=("Routing to DEEP" if mode_initial == "DEEP" else "Routing to FAST"),
-                    async_save=True,
-                )
-                assistant_response, all_tool_calls, responses_meta, thread_id = run_responses(
-                    openai_client=openai_client,
-                    user_id=user_id,
-                    user_message=model_input_message,
-                    thread_id=thread_id,
-                    persist_handles=persist_in_run,
-                    recent_turns=recent_turns,
-                    run_id=run_id,
-                    trace_id=trace_id,
-                )
-
-                # Phase 2 (AUTO only): parse FAST response signal and optionally escalate to DEEP once.
-                if auto_mode and mode_used == "FAST":
-                    signal, cleaned = _wp6_parse_need_deep_signal(assistant_response or "")
-                    wp6_meta["need_deep_signal"] = signal
-                    assistant_response = cleaned
-
-                    if bool(signal.get("need_deep")):
-                        wp6_meta["routing"]["need_deep_from_model"] = True
-                        wp6_meta["routing"]["parse_status"] = str(signal.get("parse_status") or "none")
-                        wp6_meta["routing"]["escalations_used"] = escalations_used
-
-                        if deep_allowed and escalations_used == 0:
-                            escalations_used = 1
-                            deep_input_message, pack_meta = _build_deep_input_message()
-                            wp6_meta.update(pack_meta)
-                            if deep_input_message:
-                                _emit_run_progress(
-                                    user_id=str(user_id),
-                                    thread_id=str(thread_id),
-                                    run_id=run_id,
-                                    trace_id=trace_id,
-                                    status="in_progress",
-                                    stage="looking_more_data",
-                                    message="Escalating: building DEEP context",
-                                    async_save=True,
-                                )
-                                mode_used = "DEEP"
-                                mode_reason = "agent_need_deep"
-                                wp6_meta["routing"]["escalated"] = True
-                                wp6_meta["routing"]["escalations_used"] = escalations_used
-                                deep_resp, deep_calls, deep_meta, thread_id = run_responses(
-                                    openai_client=openai_client,
-                                    user_id=user_id,
-                                    user_message=deep_input_message,
-                                    thread_id=thread_id,
-                                    persist_handles=persist_in_run,
-                                    recent_turns=recent_turns,
-                                    run_id=run_id,
-                                    trace_id=trace_id,
-                                )
-                                deep_signal, deep_cleaned = _wp6_parse_need_deep_signal(deep_resp or "")
-                                wp6_meta["need_deep_signal_deep"] = deep_signal
-                                assistant_response = deep_cleaned
-                                all_tool_calls = list(all_tool_calls or []) + list(deep_calls or [])
-                                responses_meta = deep_meta
-                            else:
-                                wp6_meta["routing"]["escalated"] = False
-                                wp6_meta["routing"]["escalation_block_reason"] = "no_context_pack"
-                        else:
-                            wp6_meta["routing"]["escalated"] = False
-                            wp6_meta["routing"]["escalation_block_reason"] = (
-                                "deep_disallowed" if not deep_allowed else "already_escalated"
-                            )
-                            missing = signal.get("missing") or []
-                            why = str(signal.get("why") or "").strip()
-                            if missing or why:
-                                note = "DEEP blocked"
-                                if why:
-                                    note += f": {why}"
-                                if missing:
-                                    note += f" (missing: {', '.join([str(x) for x in missing][:5])})"
-                                assistant_response = (assistant_response or "").rstrip() + "\n\n" + note
-                    else:
-                        wp6_meta["routing"]["need_deep_from_model"] = False
-                        wp6_meta["routing"]["parse_status"] = str(signal.get("parse_status") or "none")
-                        wp6_meta["routing"]["escalated"] = False
-
-                try:
-                    if isinstance(wp6_meta.get("routing"), dict):
-                        wp6_meta["routing"]["mode_used"] = mode_used
-                        wp6_meta["routing"]["reason_used"] = mode_reason
-                        wp6_meta["routing"]["escalations_used"] = int(escalations_used or 0)
-                except Exception:
-                    pass
-
-                # Persist continuation pointers for AUTO after deciding whether we escalated.
-                if auto_mode and isinstance(responses_meta, dict):
-                    _persist_responses_state(
-                        user_id=user_id,
-                        thread_id=str(thread_id or ""),
-                        conversation_id=str(responses_meta.get("responses_conversation_id") or ""),
-                        response_id=str(responses_meta.get("responses_last_response_id") or ""),
-                    )
-
-                # Persist last intent for deterministic topic-change routing (best-effort).
-                try:
-                    if isinstance(handles_for_thread, dict) and thread_id:
-                        thread_state = handles_for_thread.get(thread_id, {}) if isinstance(handles_for_thread.get(thread_id), dict) else {}
-                        handles_for_thread[thread_id] = {
-                            **thread_state,
-                            "wp6_last_intent_key": intent_key,
-                            "wp6_last_intent_ts": time.time(),
-                            "wp6_last_deep_at": (time.time() if mode_used == "DEEP" else float(thread_state.get("wp6_last_deep_at") or 0.0)),
-                            "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
-                        }
-                        _save_handles(user_id, handles_for_thread, async_save=True)
-                except Exception:
-                    pass
-
-                wp6_meta["context_mode_used"] = mode_used
-                wp6_meta["context_mode_reason"] = mode_reason
-                wp6_meta["fast_ctx_tokens_est"] = _wp6_est_tokens_from_text(fast_ctx or "")
-                wp6_meta["fast_ctx_chars"] = len(fast_ctx or "")
-
-                logging.info(
-                    "WP6 route user_id=%s mode=%s reason=%s prompt_tokens_est=%s selected_sources=%s raw_bytes=%s",
-                    user_id,
-                    mode_used,
-                    mode_reason,
-                    wp6_meta.get("prompt_tokens_est"),
-                    wp6_meta.get("selected_sources_count"),
-                    wp6_meta.get("raw_bytes_read"),
-                )
-            except RuntimeError as rexc:
-                return _make_response({"error": str(rexc), "runtime": "responses"}, status_code=500)
-            except Exception as exc:
-                logging.exception(f"Failed during responses loop: {exc}")
-                return _make_response({"error": "Internal server error", "details": str(exc), "runtime": "responses"}, status_code=500)
-
-            total_ms = (time.time() - request_start) * 1000
-            if audit_id:
-                try:
-                    resp_snip = str(assistant_response or "")
-                    resp_len = len(resp_snip)
-                    resp_snip = resp_snip[:2000]
-                    payload_out = {
-                        "schema_version": "omniflow.wp6.fast_audit.v1",
-                        "kind": "fast_out",
-                        "audit_id": audit_id,
-                        "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
-                        "user_id": str(user_id),
-                        "thread_id": str(thread_id),
-                        "stateless": bool(WP6_RESPONSES_STATELESS),
-                        "audit_in_path": str(audit_in_path or ""),
-                        "assistant_response_len": int(resp_len),
-                        "assistant_response_snip": resp_snip,
-                        "wp6": wp6_meta,
-                    }
-                    audit_out_path = _wp6_write_fast_audit(
-                        user_id,
-                        str(thread_id),
-                        audit_id=audit_id,
-                        kind="fast_out",
-                        payload=payload_out,
-                    )
-                    if isinstance(responses_meta, dict):
-                        responses_meta["wp6_fast_audit_in_path"] = str(audit_in_path or "")
-                        responses_meta["wp6_fast_audit_out_path"] = str(audit_out_path or "")
-                except Exception as exc:
-                    _best_effort_debug("wp6_fast_audit_out_failed", user_id=str(user_id), thread_id=str(thread_id), error=exc)
-            try:
-                if isinstance(responses_meta, dict):
-                    responses_meta["wp6"] = wp6_meta
-            except Exception:
-                pass
-            _emit_run_progress(
-                user_id=str(user_id),
-                thread_id=str(thread_id),
-                run_id=run_id,
-                trace_id=trace_id,
-                status="completed",
-                stage="done",
-                message="Done",
-                async_save=False,
-            )
-            return finalize_response(
-                openai_client=openai_client,
-                thread_id=thread_id,
-                user_id=user_id,
-                user_message=user_message,
-                all_tool_calls=all_tool_calls,
-                vector_store_attached=False,
-                total_ms=total_ms,
-                log_interaction=log_interaction,
-                assistant_response_override=assistant_response,
-                runtime_used="responses",
-                responses_meta=responses_meta,
-            )
-
-        # If the caller didn't supply a thread identifier, attempt to restore
-        # a previously saved thread for this user from blob storage. If restore
-        # fails, create a new thread via the installed OpenAI SDK (preferred).
-        # If the SDK-based creation fails (or is unavailable), fall back to
-        # a REST call. This avoids routing issues where a hardcoded REST
-        # endpoint may be intercepted by a local proxy returning HTML.
-        if not thread_id:
-            try:
-                thread_id = restore_or_create_thread(openai_client, user_id, thread_id)
-            except RuntimeError as rexc:
-                msg = str(rexc)
-                if 'failed to create thread' in msg or 'invalid response' in msg or 'thread creation returned no id' in msg:
-                    return _make_response({"error": msg}, status_code=502)
-                return _make_response({"error": msg}, status_code=500)
-
-        # --- Synchronization: always append the user's message to the thread ---
-        # Use SDK when available, otherwise fall back to REST so the thread
-        # contains the user's message before creating a run.
-        try:
-            append_user_message(openai_client, thread_id, user_message)
-        except Exception:
-            logging.exception("Unexpected error while appending user message to thread")
-
-        run = None
-        all_tool_calls = []
-        tool_outputs_struct = []
-        request_start = time.time()
-        # Vector store support removed per configuration: we no longer attach
-        # OpenAI-managed vector stores to runs. This simplifies runtime
-        # behavior and avoids SDK/proxy compatibility issues.
-        vector_store_attached = False
-        # Run summary and per-step timestamps
-        run_summary = {"timestamps": {}, "steps": []}
-
-        # Optional pre-run restore (caller may request state restore)
-        do_restore = bool(body.get("do_restore", False))
-        if do_restore:
-            try:
-                run_summary["timestamps"]["restore_start"] = time.time()
-                base = os.getenv("FUNCTION_URL_BASE", "http://localhost:7071").rstrip("/")
-                restore_url = f"{base}/api/restore_session"
-                function_code_env = os.getenv("FUNCTION_CODE_RESTORE_SESSION", "")
-                if function_code_env:
-                    restore_url = f"{restore_url}?code={function_code_env}"
-                headers = {"X-User-Id": str(user_id), "Content-Type": "application/json"}
-                if DEBUG_TOOL_CALL_HANDLER:
-                    logging.debug(f"[DEBUG] Calling restore_session {restore_url} user_id={user_id}")
-                try:
-                    r = requests_post(
-                        restore_url,
-                        json={"user_id": user_id, "thread_id": thread_id},
-                        headers=headers,
-                        timeout=30,
-                        user_id=str(user_id),
-                        thread_id=str(thread_id),
-                        code="restore_session_post",
-                    )
-                    r.raise_for_status()
-                    try:
-                        restore_result = r.json()
-                    except Exception:
-                        restore_result = {"raw": r.text}
-                except Exception as e:
-                    restore_result = {"error": str(e)}
-                    if DEBUG_TOOL_CALL_HANDLER:
-                        logging.exception("Restore session failed")
-                run_summary["timestamps"]["restore_end"] = time.time()
-                run_summary["steps"].append({"step": "restore", "result": restore_result})
-            except Exception as e:
-                if DEBUG_TOOL_CALL_HANDLER:
-                    logging.exception(f"Unexpected error during restore: {e}")
-
-        # Create run and poll via helper (encapsulates run creation, polling,
-        # required-action tool execution and submit outputs). Any runtime
-        # failures in that flow are converted into appropriate HTTP responses.
-        try:
-            run, all_tool_calls, tool_outputs_struct, run_summary = create_run_and_poll(openai_client, thread_id, user_id)
-        except RuntimeError as rexc:
-            return _make_response({"error": str(rexc)}, status_code=500)
+            result_str, _info = execute_tool_call(action, params, user_id)
+            response_payload = {
+                "status": "success",
+                "action": action,
+                "result": _parse_tool_result(result_str),
+            }
+            if trace_id:
+                response_payload["trace_id"] = trace_id
+            return _make_response(response_payload, status_code=200)
         except Exception as exc:
-            logging.exception(f"Failed during run creation/polling: {exc}")
-            return _make_response({"error": "Internal server error", "details": str(exc)}, status_code=500)
-
-        # Build final response and return
-        total_ms = (time.time() - request_start) * 1000
-        return finalize_response(
-            openai_client,
-            thread_id,
-            user_id,
-            user_message,
-            all_tool_calls,
-            vector_store_attached,
-            total_ms=total_ms,
-            log_interaction=log_interaction,
-            runtime_used=runtime_used,
-        )
-    # Ensure any uncaught exception returns a Functions-compatible HttpResponse
-    except Exception as e:
-        logging.exception(f"Unhandled exception in tool_call_handler.main: {e}")
+            logging.exception(f"Tool {action} failed: {exc}")
+            return _make_response({"error": str(exc), "action": action}, status_code=500)
+    except Exception as exc:
+        logging.exception(f"Unhandled exception in tool_call_handler.main: {exc}")
         try:
-            return _make_response({"error": "Internal server error", "details": str(e)}, status_code=500)
+            return _make_response({"error": "Internal server error", "details": str(exc)}, status_code=500)
         except Exception:
-            # Fallback: construct HttpResponse directly to avoid worker encoding issues
             try:
                 return func.HttpResponse(json.dumps({"error": "Internal server error"}), status_code=500, mimetype="application/json")
             except Exception:
-                # As a last resort, return a plain tuple (the worker may still handle it)
                 return json.dumps({"error": "Internal server error"}), 500, {"Content-Type": "application/json"}
     finally:
         if file_handler is not None and detach_file_handler:
@@ -3904,4 +3219,3 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 detach_file_handler(file_handler)
             except Exception:
                 logging.warning("Failed to detach file log handler")
-
