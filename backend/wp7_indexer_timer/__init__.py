@@ -18,6 +18,7 @@ from openai._legacy_response import HttpxBinaryResponseContent
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from shared.azure_client import AzureBlobClient
+from shared.tool_handler_config import DEFAULT_TOOL_HANDLER_CONFIG as TOOL_HANDLER_CONFIG
 from shared.wp7_indexer import (
     QueueThresholds,
     WP7_BATCH_AUDIT_BLOB_NAME,
@@ -43,6 +44,8 @@ from shared.wp7_indexer import (
     wp7_text_json_schema_format,
 )
 from shared.mock_agent import mock_enabled, mock_marker, mock_user_id
+
+CONFIG = TOOL_HANDLER_CONFIG
 
 
 WP7_BATCH_STATE_BLOB_NAME = "interactions/indexer_batch_state.json"
@@ -105,11 +108,11 @@ def _iter_jsonl_lines(data: bytes) -> List[Tuple[int, str]]:
 
 
 def _wp7_mode() -> str:
-    return str(os.environ.get("WP7_INDEXER_MODE") or "sync").strip().lower()
+    return CONFIG.wp7_indexer_mode
 
 
 def _wp7_enabled() -> bool:
-    return str(os.environ.get("WP7_ENABLED", "1") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+    return CONFIG.wp7_enabled
 
 
 def _discover_user_ids_with_queue() -> list[str]:
@@ -238,15 +241,11 @@ def _parse_confidence(value: Any) -> float:
 
 
 def _allowed_categories() -> set:
-    raw = os.environ.get("WP7_ALLOWED_CATEGORIES", "PE,UI,ML,LO,PS,TM,SYS,GEN,ID")
-    return {c.strip().upper() for c in (raw or "").split(",") if c.strip()}
+    return {c.upper() for c in CONFIG.wp7_allowed_categories}
 
 
 def _uncategorized_conf_threshold() -> float:
-    try:
-        return float(os.environ.get("WP7_UNCATEGORIZED_CONFIDENCE_LT", "0.6"))
-    except Exception:
-        return 0.6
+    return CONFIG.wp7_uncategorized_confidence_lt
 
 
 def _should_portfolio_uncategorized(artifact: Dict[str, Any]) -> tuple[bool, list]:
@@ -280,7 +279,7 @@ def _enqueue_uncategorized_portfolio(user_id: str, artifact: Dict[str, Any], sem
 
 
 def _create_indexer_input(items: List[Dict[str, Any]]) -> str:
-    compact = str(os.environ.get("WP7_INDEXER_INPUT_COMPACT") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
+    compact = CONFIG.wp7_indexer_input_compact
     payload_items = compact_indexer_items(items) if compact else items
     payload = {"schema_version": "omniflow.wp7.indexer_input.v1", "format_hint": "json", "items": payload_items}
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
@@ -340,10 +339,10 @@ def _submit_openai_batch(
     input_text = _create_indexer_input(batch_items)
     # Guard against incomplete batch outputs (no output_text) when the model spends most of the
     # budget on reasoning. Keep a sensible floor and allow env overrides.
-    per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 400)
+    per_item = CONFIG.wp7_max_output_tokens_per_item
     max_output_tokens = max(1024, min(4096, 128 + (max(1, len(batch_items)) * max(60, per_item))))
 
-    model = str(os.environ.get("OPENAI_INDEXER_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-5-mini").strip()
+    model = CONFIG.openai_indexer_model
     body = {
         "model": model,
         "prompt": {"id": prompt_id},
@@ -644,18 +643,35 @@ def _call_indexer_model(openai_client: OpenAI, prompt_id: str, items: List[Dict[
     per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 400)
     max_output_tokens = max(1024, min(4096, 128 + (max(1, len(items)) * max(60, per_item))))
     resp = openai_client.responses.create(
+        model=CONFIG.openai_indexer_model,
         prompt={"id": prompt_id},
         input=input_text,
         tool_choice="none",
         parallel_tool_calls=False,
+        text=wp7_text_json_schema_format(),
+        reasoning={"effort": "minimal"},
         max_output_tokens=max_output_tokens,
         store=False,
         metadata={"runtime": "wp7_indexer_timer"},
     )
-    output = getattr(resp, "output_text", None) or ""
+    output = str(getattr(resp, "output_text", None) or "").strip()
+    if not output:
+        body: Any = None
+        try:
+            body = resp.model_dump()  # type: ignore[attr-defined]
+        except Exception:
+            try:
+                body = resp.to_dict()  # type: ignore[attr-defined]
+            except Exception:
+                body = None
+        output = _output_text_from_response_body(body)
     if not output:
         raise RuntimeError("Indexer returned empty output_text")
-    parsed = json.loads(output)
+    try:
+        parsed = json.loads(output)
+    except Exception as e:
+        snippet = output[:240].replace("\n", "\\n")
+        raise RuntimeError(f"Indexer output is not valid JSON: {e}. output_prefix={snippet!r}") from e
     # Prompt may enforce `text.format: json_object` (Dashboard), so accept:
     # - object with `items[]` (preferred)
     # - array (legacy / permissive)
@@ -672,22 +688,19 @@ def _call_indexer_model(openai_client: OpenAI, prompt_id: str, items: List[Dict[
 def _thresholds_from_env() -> QueueThresholds:
     # Reduce daily organization usage by sending larger batches less often.
     # Multiplier affects only thresholds (when to run), not output schema limits (maxItems=25).
-    batch_mult = _safe_int(os.environ.get("WP7_BATCH_SIZE_MULTIPLIER"), 9)
-    batch_mult = max(1, batch_mult)
+    batch_mult = max(1, CONFIG.wp7_batch_size_multiplier)
     return QueueThresholds(
-        target_tokens=_safe_int(os.environ.get("WP7_TARGET_BATCH_TOKENS"), 1000) * batch_mult,
-        hard_min_tokens=_safe_int(os.environ.get("WP7_HARD_MIN_BATCH_TOKENS"), 600) * batch_mult,
-        max_wait_seconds=_safe_int(os.environ.get("WP7_MAX_WAIT_SECONDS"), 300),
-        max_items_per_run=min(_safe_int(os.environ.get("WP7_MAX_ITEMS_PER_RUN"), 25), 25),
-        max_user_chars=_safe_int(os.environ.get("WP7_MAX_USER_CHARS"), 2000),
-        max_assistant_chars=_safe_int(os.environ.get("WP7_MAX_ASSISTANT_CHARS"), 4000),
+        target_tokens=CONFIG.wp7_target_batch_tokens * batch_mult,
+        hard_min_tokens=CONFIG.wp7_hard_min_batch_tokens * batch_mult,
+        max_wait_seconds=CONFIG.wp7_max_wait_seconds,
+        max_items_per_run=min(CONFIG.wp7_max_items_per_run, 25),
+        max_user_chars=CONFIG.wp7_max_user_chars,
+        max_assistant_chars=CONFIG.wp7_max_assistant_chars,
     )
 
 
 def _wp7_log_verbose() -> bool:
-    if str(os.environ.get("OMNIFLOW_DEBUG", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on"):
-        return True
-    return str(os.environ.get("WP7_LOG_VERBOSE", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+    return CONFIG.wp7_log_verbose
 
 
 def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, thresholds: QueueThresholds) -> Dict[str, Any]:
@@ -995,7 +1008,7 @@ def main(timer: func.TimerRequest) -> None:
     if not _wp7_enabled():
         logging.info("WP7 indexer timer disabled (WP7_ENABLED=0)")
         return
-    user_ids_env = str(os.environ.get("WP7_INDEXER_USER_IDS", "default") or "").strip()
+    user_ids_env = str(CONFIG.wp7_indexer_user_ids or "").strip()
     if user_ids_env.lower() in ("auto", "*"):
         user_ids = _discover_user_ids_with_queue()
         user_ids = [u for u in user_ids if str(u).strip() and str(u).strip().lower() not in ("none", "null")]
@@ -1009,7 +1022,7 @@ def main(timer: func.TimerRequest) -> None:
         if not user_ids:
             user_ids = ["default"]
 
-    prompt_id = os.environ.get("OPENAI_INDEXER_PROMPT_ID", "").strip()
+    prompt_id = CONFIG.openai_indexer_prompt_id
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     if not (prompt_id and openai_key):
         logging.warning("WP7 indexer timer disabled (missing OPENAI_INDEXER_PROMPT_ID or OPENAI_API_KEY)")
@@ -1017,9 +1030,9 @@ def main(timer: func.TimerRequest) -> None:
 
     thresholds = _thresholds_from_env()
     openai_client = OpenAI(api_key=openai_key)
-    batch_mult = max(1, _safe_int(os.environ.get("WP7_BATCH_SIZE_MULTIPLIER"), 9))
-    base_target = _safe_int(os.environ.get("WP7_TARGET_BATCH_TOKENS"), 1000)
-    base_hard_min = _safe_int(os.environ.get("WP7_HARD_MIN_BATCH_TOKENS"), 600)
+    batch_mult = max(1, CONFIG.wp7_batch_size_multiplier)
+    base_target = CONFIG.wp7_target_batch_tokens
+    base_hard_min = CONFIG.wp7_hard_min_batch_tokens
     logging.info(
         "WP7: timer_start user_ids=%s mode=%s multiplier=%s target_tokens_eff=%s hard_min_eff=%s (base_target=%s base_hard_min=%s) max_wait_s=%s max_items=%s",
         ",".join(user_ids),

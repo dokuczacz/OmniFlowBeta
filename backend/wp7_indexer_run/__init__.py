@@ -37,6 +37,9 @@ from shared.wp7_indexer import (
     wp7_text_json_schema_format,
 )
 from shared.mock_agent import mock_enabled, mock_marker, mock_user_id
+from shared.tool_handler_config import DEFAULT_TOOL_HANDLER_CONFIG as TOOL_HANDLER_CONFIG
+
+CONFIG = TOOL_HANDLER_CONFIG
 
 
 def _parse_bool(value: Any) -> bool:
@@ -44,13 +47,11 @@ def _parse_bool(value: Any) -> bool:
 
 
 def _wp7_log_verbose() -> bool:
-    if str(os.environ.get("OMNIFLOW_DEBUG", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on"):
-        return True
-    return str(os.environ.get("WP7_LOG_VERBOSE", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+    return CONFIG.wp7_log_verbose
 
 
 def _wp7_enabled() -> bool:
-    return str(os.environ.get("WP7_ENABLED", "1") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+    return CONFIG.wp7_enabled
 
 
 def _safe_int(value: Any, default: int) -> int:
@@ -119,13 +120,13 @@ def _load_thresholds(req: func.HttpRequest) -> QueueThresholds:
         body = req.get_json() if req.method.lower() == "post" else {}
     except Exception:
         body = {}
-    batch_mult = _safe_int(body.get("batch_size_multiplier") or os.environ.get("WP7_BATCH_SIZE_MULTIPLIER"), 9)
+    batch_mult = _safe_int(body.get("batch_size_multiplier") or CONFIG.wp7_batch_size_multiplier, 9)
     batch_mult = max(1, batch_mult)
     if _wp7_log_verbose():
-        base_target = _safe_int(body.get("target_tokens") or os.environ.get("WP7_TARGET_BATCH_TOKENS"), 1000)
-        base_hard = _safe_int(body.get("hard_min_tokens") or os.environ.get("WP7_HARD_MIN_BATCH_TOKENS"), 600)
-        max_wait = _safe_int(body.get("max_wait_seconds") or os.environ.get("WP7_MAX_WAIT_SECONDS"), 300)
-        max_items = min(_safe_int(body.get("max_items_per_run") or os.environ.get("WP7_MAX_ITEMS_PER_RUN"), 25), 25)
+        base_target = _safe_int(body.get("target_tokens") or CONFIG.wp7_target_batch_tokens, CONFIG.wp7_target_batch_tokens)
+        base_hard = _safe_int(body.get("hard_min_tokens") or CONFIG.wp7_hard_min_batch_tokens, CONFIG.wp7_hard_min_batch_tokens)
+        max_wait = _safe_int(body.get("max_wait_seconds") or CONFIG.wp7_max_wait_seconds, CONFIG.wp7_max_wait_seconds)
+        max_items = min(_safe_int(body.get("max_items_per_run") or CONFIG.wp7_max_items_per_run, CONFIG.wp7_max_items_per_run), 25)
         logging.info(
             "WP7(run): thresholds multiplier=%s target_tokens_eff=%s hard_min_eff=%s (base_target=%s base_hard_min=%s) max_wait_s=%s max_items=%s",
             batch_mult,
@@ -137,12 +138,12 @@ def _load_thresholds(req: func.HttpRequest) -> QueueThresholds:
             max_items,
         )
     return QueueThresholds(
-        target_tokens=_safe_int(body.get("target_tokens") or os.environ.get("WP7_TARGET_BATCH_TOKENS"), 1000) * batch_mult,
-        hard_min_tokens=_safe_int(body.get("hard_min_tokens") or os.environ.get("WP7_HARD_MIN_BATCH_TOKENS"), 600) * batch_mult,
-        max_wait_seconds=_safe_int(body.get("max_wait_seconds") or os.environ.get("WP7_MAX_WAIT_SECONDS"), 300),
-        max_items_per_run=min(_safe_int(body.get("max_items_per_run") or os.environ.get("WP7_MAX_ITEMS_PER_RUN"), 25), 25),
-        max_user_chars=_safe_int(os.environ.get("WP7_MAX_USER_CHARS"), 2000),
-        max_assistant_chars=_safe_int(os.environ.get("WP7_MAX_ASSISTANT_CHARS"), 4000),
+        target_tokens=_safe_int(body.get("target_tokens") or CONFIG.wp7_target_batch_tokens, CONFIG.wp7_target_batch_tokens) * batch_mult,
+        hard_min_tokens=_safe_int(body.get("hard_min_tokens") or CONFIG.wp7_hard_min_batch_tokens, CONFIG.wp7_hard_min_batch_tokens) * batch_mult,
+        max_wait_seconds=_safe_int(body.get("max_wait_seconds") or CONFIG.wp7_max_wait_seconds, CONFIG.wp7_max_wait_seconds),
+        max_items_per_run=min(_safe_int(body.get("max_items_per_run") or CONFIG.wp7_max_items_per_run, CONFIG.wp7_max_items_per_run), 25),
+        max_user_chars=CONFIG.wp7_max_user_chars,
+        max_assistant_chars=CONFIG.wp7_max_assistant_chars,
     )
 
 
@@ -150,10 +151,36 @@ def _create_indexer_input(items: List[Dict[str, Any]]) -> str:
     # The Indexer Prompt is responsible for enforcing schema and category enumeration.
     # NOTE: Some OpenAI `text.format: json_object` configurations require the word "json"
     # to appear in the input messages; include a stable hint field to satisfy that constraint.
-    compact = str(os.environ.get("WP7_INDEXER_INPUT_COMPACT") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
+    compact = CONFIG.wp7_indexer_input_compact
     payload_items = compact_indexer_items(items) if compact else items
     payload = {"schema_version": "omniflow.wp7.indexer_input.v1", "format_hint": "json", "items": payload_items}
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _output_text_from_response_body(body: Any) -> str:
+    if isinstance(body, dict):
+        direct = body.get("output_text")
+        if isinstance(direct, str) and direct.strip():
+            return direct
+        output = body.get("output")
+        if isinstance(output, list):
+            parts: List[str] = []
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if isinstance(content, list):
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "output_text":
+                            t = c.get("text")
+                            if isinstance(t, str) and t:
+                                parts.append(t)
+            joined = "".join(parts).strip()
+            if joined:
+                return joined
+    if isinstance(body, str):
+        return body
+    return ""
 
 
 def _resync_offset_to_newline(user_id: str, *, offset: int, lookback: int = 8192) -> int:
@@ -179,9 +206,16 @@ def _call_indexer_model(openai_client: OpenAI, prompt_id: str, items: List[Dict[
     input_text = _create_indexer_input(items)
     # Output tokens are typically priced higher; keep a tight, per-item budget.
     # If the prompt is well-formed (strict JSON, short summaries), this cap should be sufficient.
-    per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 400)
+    per_item = CONFIG.wp7_max_output_tokens_per_item
     max_output_tokens = max(1024, min(4096, 128 + (max(1, len(items)) * max(60, per_item))))
+    logging.info(
+        "WP7 indexer prompt input prompt_id=%s items=%s tokens=%s",
+        prompt_id,
+        len(items),
+        max_output_tokens,
+    )
     resp = openai_client.responses.create(
+        model=CONFIG.openai_indexer_model,
         prompt={"id": prompt_id},
         input=input_text,
         tool_choice="none",
@@ -192,12 +226,33 @@ def _call_indexer_model(openai_client: OpenAI, prompt_id: str, items: List[Dict[
         store=False,
         metadata={"runtime": "wp7_indexer"},
     )
-    output = getattr(resp, "output_text", None) or ""
+    output = str(getattr(resp, "output_text", None) or "").strip()
+    if not output:
+        body: Any = None
+        try:
+            body = resp.model_dump()  # type: ignore[attr-defined]
+        except Exception:
+            try:
+                body = resp.to_dict()  # type: ignore[attr-defined]
+            except Exception:
+                body = None
+        output = _output_text_from_response_body(body)
+    logging.info(
+        "WP7 indexer prompt output prompt_id=%s len=%s",
+        prompt_id,
+        len(output),
+    )
     if not output:
         raise RuntimeError("Indexer returned empty output_text")
     try:
         parsed = json.loads(output)
     except Exception as e:
+        logging.error(
+            "WP7 indexer prompt returned invalid JSON prompt_id=%s err=%s output=%s",
+            prompt_id,
+            e,
+            output[:400],
+        )
         raise RuntimeError(f"Indexer output is not valid JSON: {e}")
     # Prompt may enforce `text.format: json_object` (Dashboard), so accept:
     # - object with `items[]` (preferred)
@@ -247,15 +302,11 @@ def _parse_confidence(value: Any) -> float:
 
 
 def _allowed_categories() -> set:
-    raw = os.environ.get("WP7_ALLOWED_CATEGORIES", "PE,UI,ML,LO,PS,TM,SYS,GEN,ID")
-    return {c.strip().upper() for c in (raw or "").split(",") if c.strip()}
+    return {c.upper() for c in CONFIG.wp7_allowed_categories}
 
 
 def _uncategorized_conf_threshold() -> float:
-    try:
-        return float(os.environ.get("WP7_UNCATEGORIZED_CONFIDENCE_LT", "0.6"))
-    except Exception:
-        return 0.6
+    return CONFIG.wp7_uncategorized_confidence_lt
 
 
 def _should_portfolio_uncategorized(artifact: Dict[str, Any]) -> tuple[bool, list]:
@@ -342,7 +393,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     force = _parse_bool(req.params.get("force") or (body.get("force") if isinstance(body, dict) else None))
     dry_run = _parse_bool(req.params.get("dry_run") or (body.get("dry_run") if isinstance(body, dict) else None))
 
-    prompt_id = os.environ.get("OPENAI_INDEXER_PROMPT_ID", "").strip()
+    prompt_id = CONFIG.openai_indexer_prompt_id
     if not prompt_id and not dry_run:
         return func.HttpResponse(
             json.dumps({"error": "Missing OPENAI_INDEXER_PROMPT_ID", "user_id": user_id}, ensure_ascii=False),
