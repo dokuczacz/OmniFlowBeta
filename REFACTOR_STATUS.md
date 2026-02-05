@@ -96,12 +96,13 @@ Refactoring OmniFlowBeta's Tool Handler (4165-line `backend/tool_call_handler/__
 ✅ **Phase 1: Registry & Contracts** (100%)
 - 3 modules, 112 tests, full documentation
 
-🚧 **Phase 2: Dispatch Pipeline Refactor** (30%)
+✅ **Phase 2: Dispatch Pipeline Refactor** (30%)
 - 1 module, 18 tests, core functionality working
 
+✅ **Phase 3: Datasearch Engine** (100%)
+- 1 module, 35 tests, full Scan → Confirm → Fetch workflow
+
 ### Remaining Phases
-⏳ **Phase 3: Datasearch Engine** (0%)
-- Manifest-based search with pagination
 
 ⏳ **Phase 4: WP6 Enhancement** (0%)
 - Strict schemas, intent-based caching
@@ -123,7 +124,8 @@ Refactoring OmniFlowBeta's Tool Handler (4165-line `backend/tool_call_handler/__
 | tool_specs.py | 38 | ✅ All passing |
 | tool_registry.py | 46 | ✅ All passing |
 | dispatch.py | 18 | ✅ Core passing |
-| **Total** | **130** | **✅ 130/130** |
+| dataset_search.py | 35 | ✅ All passing |
+| **Total** | **165** | **✅ 165/165** |
 
 ### Test Categories
 - ✅ Unit tests for all functions

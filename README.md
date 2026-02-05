@@ -8,15 +8,17 @@ OmniFlow Beta is a **multi-user AI agent backend** built on **Azure Functions + 
 
 - ✅ **Phase 1 Complete**: Registry & Contracts (112 tests passing)
 - 🚧 **Phase 2 In Progress**: Dispatch Pipeline (18 tests passing)
+- ✅ **Phase 3 Complete**: Datasearch Engine (35 tests passing)
 - 📊 **Status**: [REFACTOR_STATUS.md](REFACTOR_STATUS.md)
 - 📋 **Plan**: [IMPLEMENTATION_PLAN_UPDATED.md](IMPLEMENTATION_PLAN_UPDATED.md)
 
-### Phase 1 Achievements
-- ✅ Single source of truth (TOOL_SPECS registry)
+### Achievements
+- ✅ Single source of truth (TOOL_SPECS registry with 14 tools)
 - ✅ Structured error handling (ToolError with codes)
 - ✅ Parameter aliasing (backward compatibility)
 - ✅ Security field filtering
-- ✅ 130 tests passing
+- ✅ Dataset search with Scan → Confirm → Fetch workflow
+- ✅ 165 tests passing
 
 ## 📜 Privacy policy
 - [Privacy policy](docs/shared/PRIVACY_POLICY.md)
