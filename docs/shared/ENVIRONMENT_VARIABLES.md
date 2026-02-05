@@ -72,6 +72,10 @@ Copy-paste this catalog when provisioning Azure App Service settings or local `.
 | `WP7_ALLOWED_CATEGORIES` | `PE,UI,ML,LO,PS,TM,SYS,GEN,ID` | Allowed semantic categories. |
 | `WP7_UNCATEGORIZED_CONFIDENCE_LT` | `0.6` | Threshold for `uncategorized` bucket. |
 
+## 5. Shared tool handler configuration
+
+The settings listed above (especially WP6/WP7 parameters such as audit defaults, batch thresholds, gating flags, allowed categories, and semantic dedup knobs) are consumed through `backend/shared/tool_handler_config.py`. This dataclass reads the environment once at startup and exposes normalized values to `backend/tool_call_handler`, `backend/save_interaction`, `backend/wp7_indexer_timer`, `backend/wp7_indexer_run`, and the shared WP7 helpers. Keeping these variables here ensures that updating a threshold or toggle affects every consumer uniformly.
+
 ## 4. Gmail OAuth helpers
 | Name | Placeholder / default | Notes |
 | --- | --- | --- |

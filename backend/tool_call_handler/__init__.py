@@ -33,6 +33,11 @@ import types as _types
 import threading
 import random
 
+try:
+    from jsonschema import Draft202012Validator
+except Exception:  # pragma: no cover
+    Draft202012Validator = None
+
 # Allow importing shared helpers when running as a Functions app or locally
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
@@ -165,6 +170,179 @@ def _inprocess_upload_data_or_file(user_id: str, target_blob_name: str, file_con
         return {}
 
 
+_WP6_PREFERENCES_SCHEMA_FALLBACK: Dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "omniflow.wp6.preferences.v1",
+    "type": "object",
+    "additionalProperties": True,
+    "required": ["schema_version", "updated_utc"],
+    "properties": {
+        "schema_version": {"type": "string", "const": "omniflow.wp6.preferences.v1"},
+        "updated_utc": {"type": "string"},
+    },
+}
+
+_WP6_CONTEXT_PACK_SCHEMA_LEGACY: Dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "omniflow.wp6.context_pack.legacy.v0",
+    "type": "object",
+    # Keep permissive for forward-compatibility with prompt iterations.
+    "additionalProperties": True,
+    "required": [
+        "mode",
+        "summary",
+        "bullets",
+        "top_sources",
+        "pack_tokens_est",
+        "coverage",
+        "need_more_sources",
+        "created_utc",
+    ],
+    "properties": {
+        "mode": {"type": "string"},
+        "summary": {"type": "string"},
+        "bullets": {"type": "array", "items": {"type": "string"}},
+        "top_sources": {"type": "array"},
+        "pack_tokens_est": {"type": "integer", "minimum": 0},
+        "coverage": {},
+        "need_more_sources": {"type": "boolean"},
+        "created_utc": {"type": "string"},
+    },
+}
+
+_WP6_CONTEXT_BUILDER_INPUT_SCHEMA: Dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "omniflow.wp6.context_builder_input.v1",
+    "type": "object",
+    "additionalProperties": True,
+    "required": ["request", "candidate_sources", "constraints"],
+    "properties": {
+        "request": {
+            "type": "object",
+            "additionalProperties": True,
+            "required": ["user_prompt"],
+            "properties": {"user_prompt": {"type": "string"}},
+        },
+        "candidate_sources": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": True,
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "excerpt_or_snippet": {"type": "string"},
+                },
+            },
+        },
+        "constraints": {"type": "object", "additionalProperties": True},
+    },
+}
+
+_wp6_prefs_validator = None
+_wp6_pack_legacy_validator = None
+_wp6_builder_input_validator = None
+
+
+def _repo_root_dir() -> str:
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.abspath(os.path.join(backend_dir, ".."))
+
+
+def _load_schema_file(relative_path: str) -> Dict[str, Any]:
+    try:
+        schema_path = os.path.join(_repo_root_dir(), relative_path)
+        with open(schema_path, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        return schema if isinstance(schema, dict) else {}
+    except Exception:
+        return {}
+
+
+def _ensure_validator(schema: Dict[str, Any] | None):
+    if Draft202012Validator is None or not isinstance(schema, dict) or not schema:
+        return None
+    try:
+        return Draft202012Validator(schema)
+    except Exception:
+        return None
+
+
+def _validate_schema(validator, payload: Any) -> Tuple[bool, str]:
+    if validator is None:
+        # Best-effort fallback when jsonschema is unavailable.
+        return True, ""
+    try:
+        errors = sorted(validator.iter_errors(payload), key=lambda e: list(e.path))
+    except Exception as exc:
+        return False, f"validator_failed:{type(exc).__name__}"
+    if not errors:
+        return True, ""
+    err = errors[0]
+    try:
+        path = ".".join([str(x) for x in err.path]) if getattr(err, "path", None) else ""
+    except Exception:
+        path = ""
+    return False, f"{path}:{getattr(err, 'message', 'schema_validation_failed')}"
+
+
+def _wp6_preferences_validator():
+    global _wp6_prefs_validator
+    if _wp6_prefs_validator is not None:
+        return _wp6_prefs_validator
+    schema = _load_schema_file(
+        os.path.join("docs", "workflow", "wp6_context_builder", "preferences.schema.v1.json")
+    )
+    _wp6_prefs_validator = _ensure_validator(schema or _WP6_PREFERENCES_SCHEMA_FALLBACK)
+    return _wp6_prefs_validator
+
+
+def _wp6_context_pack_legacy_validator():
+    global _wp6_pack_legacy_validator
+    if _wp6_pack_legacy_validator is not None:
+        return _wp6_pack_legacy_validator
+    _wp6_pack_legacy_validator = _ensure_validator(_WP6_CONTEXT_PACK_SCHEMA_LEGACY)
+    return _wp6_pack_legacy_validator
+
+
+def _wp6_context_builder_input_validator():
+    global _wp6_builder_input_validator
+    if _wp6_builder_input_validator is not None:
+        return _wp6_builder_input_validator
+    _wp6_builder_input_validator = _ensure_validator(_WP6_CONTEXT_BUILDER_INPUT_SCHEMA)
+    return _wp6_builder_input_validator
+
+
+def _wp6_default_preferences() -> Dict[str, Any]:
+    return {
+        "schema_version": "omniflow.wp6.preferences.v1",
+        "updated_utc": datetime.datetime.utcnow().isoformat() + "Z",
+        "brevity": "medium",
+        "fast_mode": False,
+        "allowed_reads": [],
+        "disable_history_reads": False,
+    }
+
+
+def _wp6_validate_preferences(prefs: Any) -> Tuple[bool, str]:
+    if not isinstance(prefs, dict):
+        return False, "not_an_object"
+    # Validate against the published schema (or fallback).
+    return _validate_schema(_wp6_preferences_validator(), prefs)
+
+
+def _wp6_validate_context_pack(pack: Any) -> Tuple[bool, str]:
+    if not isinstance(pack, dict):
+        return False, "not_an_object"
+    return _validate_schema(_wp6_context_pack_legacy_validator(), pack)
+
+
+def _wp6_validate_context_builder_input(cb_input: Any) -> Tuple[bool, str]:
+    if not isinstance(cb_input, dict):
+        return False, "not_an_object"
+    return _validate_schema(_wp6_context_builder_input_validator(), cb_input)
+
+
 def _load_preferences(user_id: str) -> Dict[str, Any]:
     """
     Load users/{user_id}/semantics/preferences.json (best-effort).
@@ -193,6 +371,34 @@ def _load_preferences(user_id: str) -> Dict[str, Any]:
                     _best_effort_debug("prefs_json_parse_failed", user_id=uid, error=exc)
                     prefs = {}
             if isinstance(prefs, dict):
+                ok, reason = _wp6_validate_preferences(prefs)
+                if not ok:
+                    _best_effort_debug(
+                        "prefs_schema_invalid",
+                        user_id=uid,
+                        reason=reason,
+                    )
+                    if WP6_PREFERENCES_AUTO_CREATE:
+                        default_prefs = _wp6_default_preferences()
+                        try:
+                            _inprocess_upload_data_or_file(
+                                uid, "semantics/preferences.json", default_prefs
+                            )
+                            if PREFERENCES_CACHE_TTL_SECONDS > 0:
+                                with CACHE_LOCK:
+                                    _prefs_cache[uid] = {
+                                        "data": default_prefs,
+                                        "ts": time.time(),
+                                    }
+                            return default_prefs
+                        except Exception as exc:
+                            _best_effort_debug(
+                                "prefs_autocreate_failed",
+                                user_id=uid,
+                                error=exc,
+                            )
+                    return {}
+
                 if PREFERENCES_CACHE_TTL_SECONDS > 0:
                     with CACHE_LOCK:
                         _prefs_cache[uid] = {"data": prefs, "ts": time.time()}
@@ -201,14 +407,7 @@ def _load_preferences(user_id: str) -> Dict[str, Any]:
         if WP6_PREFERENCES_AUTO_CREATE and isinstance(payload, dict) and payload.get("error"):
             err_text = str(payload.get("error") or "").lower()
             if "not found" in err_text or "blobnotfound" in err_text:
-                default_prefs = {
-                    "schema_version": "omniflow.wp6.preferences.v1",
-                    "updated_utc": datetime.datetime.utcnow().isoformat() + "Z",
-                    "brevity": "medium",
-                    "fast_mode": False,
-                    "allowed_reads": [],
-                    "disable_history_reads": False,
-                }
+                default_prefs = _wp6_default_preferences()
                 try:
                     _inprocess_upload_data_or_file(uid, "semantics/preferences.json", default_prefs)
                     if PREFERENCES_CACHE_TTL_SECONDS > 0:
@@ -1372,10 +1571,13 @@ def _wp6_build_or_reuse_context_pack(
             if isinstance(pack_payload, dict) and pack_payload.get("status") == "success":
                 pack = pack_payload.get("data")
                 if isinstance(pack, dict):
-                    meta["pack_reused"] = True
-                    meta["pack_path"] = pack_path_cached
-                    meta["pack_tokens_est"] = int(pack.get("pack_tokens_est") or 0)
-                    return json.dumps(pack, ensure_ascii=False), meta
+                    ok_pack, reason = _wp6_validate_context_pack(pack)
+                    if ok_pack:
+                        meta["pack_reused"] = True
+                        meta["pack_path"] = pack_path_cached
+                        meta["pack_tokens_est"] = int(pack.get("pack_tokens_est") or 0)
+                        return json.dumps(pack, ensure_ascii=False), meta
+                    meta["pack_cache_invalid"] = reason
         except Exception as exc:
             _best_effort_debug(
                 "context_pack_cache_fetch_failed",
@@ -1400,6 +1602,12 @@ def _wp6_build_or_reuse_context_pack(
         "constraints": {"max_pack_tokens": WP6_DEEP_MAX_PACK_TOKENS, "max_bullets": 6, "max_top_sources": 5},
     }
 
+    ok_in, reason = _wp6_validate_context_builder_input(cb_input)
+    if not ok_in:
+        meta["error"] = "invalid_context_builder_input_schema"
+        meta["validation_error"] = reason
+        return "", meta
+
     cb_kwargs: Dict[str, Any] = {
         "prompt": {"id": OPENAI_CONTEXT_BUILDER_PROMPT_ID},
         # Responses API requires `input` to be a string or array of input items; provide JSON as a string.
@@ -1414,10 +1622,10 @@ def _wp6_build_or_reuse_context_pack(
     except Exception as exc:
         _best_effort_debug("context_pack_json_parse_failed", user_id=str(user_id), thread_id=str(thread_id), error=exc)
         pack = {}
-    # Accept the configured schema (mode, summary, bullets, top_sources, pack_tokens_est, coverage, need_more_sources, created_utc)
-    required_keys = ("mode", "summary", "bullets", "top_sources", "pack_tokens_est", "coverage", "need_more_sources", "created_utc")
-    if not isinstance(pack, dict) or any(k not in pack for k in required_keys):
+    ok_pack, reason = _wp6_validate_context_pack(pack)
+    if not ok_pack:
         meta["error"] = "invalid_context_pack_output_schema"
+        meta["validation_error"] = reason
         return "", meta
 
     try:
@@ -2927,6 +3135,26 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
             "update_data_entry": ["target_blob_name", "find_key", "find_value", "update_key", "update_value"],
             "upload_data_or_file": ["target_blob_name", "file_content"],
         }
+
+        # Prefer catalog-driven allowlists when available (keeps tool routing
+        # aligned with AGENT_FUNCTIONS_CATALOG.json).
+        try:
+            from shared.agent_functions_catalog import allowed_fields_for_tool
+
+            manifest_fields = [
+                field
+                for field in allowed_fields_for_tool(tool_name)
+                if field and field != "user_id"
+            ]
+            if manifest_fields:
+                DATA_EXTRACTION_REQUIRED[tool_name] = manifest_fields
+        except Exception as exc:
+            _best_effort_debug(
+                "agent_functions_catalog_load_failed",
+                user_id=str(user_id),
+                error=exc,
+                tool_name=tool_name,
+            )
 
         # Only include user_id for tool_call_handler (if enforced)
         include_user_id = tool_name == "tool_call_handler"

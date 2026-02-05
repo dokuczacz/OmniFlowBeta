@@ -640,7 +640,7 @@ def _resync_offset_to_newline(user_id: str, *, offset: int, lookback: int = 8192
 
 def _call_indexer_model(openai_client: OpenAI, prompt_id: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     input_text = _create_indexer_input(items)
-    per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 400)
+    per_item = CONFIG.wp7_max_output_tokens_per_item
     max_output_tokens = max(1024, min(4096, 128 + (max(1, len(items)) * max(60, per_item))))
     resp = openai_client.responses.create(
         model=CONFIG.openai_indexer_model,
@@ -905,7 +905,7 @@ def _run_for_user(openai_client: OpenAI, prompt_id: str, user_id: str, threshold
             iid = str(it.get("interaction_id") or "").strip()
             if iid:
                 submitted_rep_ids.append(iid)
-        per_item = _safe_int(os.environ.get("WP7_MAX_OUTPUT_TOKENS_PER_ITEM"), 400)
+        per_item = CONFIG.wp7_max_output_tokens_per_item
         planned_max_output_tokens = max(1024, min(4096, 128 + (max(1, len(rep_items)) * max(60, per_item))))
         logging.info(
             "WP7: batch_submit user_id=%s candidates=%s submitted=%s submitted_reps=%s tokens_sum=%s planned_advance_bytes=%s max_output_tokens=%s",

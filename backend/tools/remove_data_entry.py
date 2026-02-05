@@ -1,23 +1,36 @@
 # tools/remove_data_entry.py
-from remove_data_entry import main as remove_data_entry_func
+from remove_data_entry.service import remove_data_entry_core
+
+
+def _choose_blob_name(args):
+    for key in ("target_blob_name", "file_name"):
+        candidate = args.get(key)
+        if candidate is not None:
+            return str(candidate)
+    return None
+
+
+def _choose_find_key(args):
+    for key in ("key_to_find", "find_key", "key", "match_key"):
+        candidate = args.get(key)
+        if candidate is not None:
+            return str(candidate)
+    return None
+
+
+def _choose_find_value(args):
+    for key in ("value_to_find", "find_value", "value"):
+        if key in args:
+            return args.get(key)
+    return None
+
 
 def remove_data_entry(args, user_id):
-    from shared.user_manager import extract_user_id
-    import azure.functions as func
-    import json
-    class DummyReq:
-        def __init__(self, args, user_id):
-            self._args = args or {}
-            self._user_id = user_id
-            self.headers = {"x-user-id": str(user_id)}
-            self.params = dict(self._args)
-        def get_json(self):
-            return {**self._args, "user_id": self._user_id}
-        def __getitem__(self, key):
-            return self._args[key]
-    req = DummyReq(args, user_id)
-    resp = remove_data_entry_func(req)
-    try:
-        return json.loads(resp.get_body())
-    except Exception:
-        return resp.get_body()
+    result, _status = remove_data_entry_core(
+        user_id=user_id,
+        target_blob_name=_choose_blob_name(args),
+        key_to_find=_choose_find_key(args),
+        value_to_find=_choose_find_value(args),
+        raise_on_error=False,
+    )
+    return result

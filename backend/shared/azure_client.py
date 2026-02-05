@@ -118,7 +118,10 @@ class AzureBlobClient:
                 if filename:  # Skip empty names
                     filenames.append(filename)
             
-            logging.info(f"Listed {len(filenames)} blobs for user {user_id}")
+            if len(filenames) > 0:
+                logging.info(f"Listed {len(filenames)} blobs for user {user_id}")
+            else:
+                logging.debug(f"No blobs listed for user {user_id}")
             return filenames
         except AzureError as e:
             logging.error(f"Failed to list blobs for user {user_id}: {e}")
