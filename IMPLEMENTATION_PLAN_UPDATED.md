@@ -323,10 +323,50 @@ ALWAYS respect token budgets."
    - Return VALIDATION_FAILED on schema errors
    - No silent fallbacks
 
-4. Enhance caching:
-   - Intent-based cache keys
+4. Enhance caching and prompt optimization:
+   **Reference**: See `docs/PROMPT_CACHING_GUIDE.md` for details
+   
+   a) **Prompt structure for caching**:
+   ```python
+   def build_wp6_context(user_id, message, mode="AUTO"):
+       # STATIC PREFIX (cacheable - same across requests)
+       static_parts = [
+           get_system_prompt(),              # Deterministic
+           json.dumps(TOOL_SPECS, sort_keys=True),  # Consistent ordering
+           get_context_mode_instructions(mode),  # Same per mode
+           get_few_shot_examples() if mode == "DEEP" else ""
+       ]
+       
+       # DYNAMIC SUFFIX (not cached, but small and cheap)
+       dynamic_parts = [
+           get_recent_turns(user_id, max_turns=8),
+           f"User: {message}",
+           f"Timestamp: {datetime.now().isoformat()}"
+       ]
+       
+       return "\n\n".join(static_parts + dynamic_parts)
+   ```
+   
+   **Key optimizations:**
+   - TOOL_SPECS always serialized with `sort_keys=True`
+   - System prompt is deterministic (no timestamps in prefix)
+   - User-specific content moved to end
+   - Expected: >80% cache hit rate for FAST, >90% for DEEP
+   
+   b) **Intent-based cache keys** (for context packs):
    - TTL enforcement
    - Cache hit/miss metrics
+   
+   c) **Cache metrics tracking**:
+   ```python
+   # Add to _openai_call()
+   usage = response.usage
+   cached = usage.prompt_tokens_details.cached_tokens
+   total = usage.prompt_tokens
+   cache_rate = cached / total if total > 0 else 0
+   
+   logger.info(f"Cache: {cached}/{total} tokens ({cache_rate*100:.1f}%)")
+   ```
 
 5. Add tests:
    - Schema compliance tests
@@ -346,6 +386,8 @@ ALWAYS respect token budgets."
 
 **Goal**: Batch-first processing, prompt caching optimization
 
+**Reference**: See `docs/PROMPT_CACHING_GUIDE.md` for comprehensive best practices
+
 **Tasks:**
 1. Ensure batch-first semantics:
    - All WP7 paths use batching
@@ -354,17 +396,34 @@ ALWAYS respect token budgets."
 
 2. Implement prompt caching best practices:
    ```python
-   # Stable prompt prefix (cache hits)
-   system_prefix = """You are a semantic indexer...
-   [Static instructions that rarely change]
-   """
+   # CACHEABLE STRUCTURE (static prefix first, dynamic suffix last)
    
-   # Consistent tool list (cache hits)
-   tools = sorted(get_tool_list())  # Stable order
+   # 1. Static prefix (cached across batches)
+   system_prefix = get_wp7_system_prompt()  # Deterministic
+   indexer_schema = get_wp7_output_schema()  # JSON schema (static)
+   few_shot_examples = get_wp7_examples()    # Same examples every time
    
-   # Cache key generation
-   prompt_cache_key = hash(system_prefix + str(tools))
+   # 2. Dynamic suffix (varies per batch, but that's OK)
+   batch_items = json.dumps(items, sort_keys=True)  # Sorted for consistency
+   
+   # 3. Combine: static first, dynamic last
+   prompt = "\n\n".join([
+       system_prefix,
+       indexer_schema,
+       few_shot_examples,
+       f"Items to index:\n{batch_items}"
+   ])
+   
+   # Key insight: System prompt + schema + examples get cached,
+   # saving ~60-80% of input costs even though items change!
    ```
+   
+   **Best practices applied:**
+   - Static content first (system, schema, examples) → cached
+   - Dynamic content last (batch items) → not cached but cheap
+   - Tool schemas with `sort_keys=True` for determinism
+   - No timestamps/random values in static prefix
+   - Expected savings: 28-40% on API costs
 
 3. Add idempotency:
    - Unique dedup_key per interaction
