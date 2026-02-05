@@ -280,6 +280,33 @@ class TestAnalyzeCachingPotential(unittest.TestCase):
         # FAST mode should have >80% of tokens cacheable
         self.assertGreater(metrics["efficiency_ratio"], 0.80)
     
+    def test_realistic_conversation_cache_efficiency(self):
+        """Test cache efficiency with realistic conversation length"""
+        builder_input = ContextBuilderInput(
+            user_id="tester-realistic",
+            message="Can you help me analyze the Q4 financial report and extract key metrics like revenue growth, profit margins, and compare them to last year? I need this for tomorrow's meeting."
+        )
+        realistic_history = [
+            {"role": "user", "content": "I uploaded the Q4 financial report to the system earlier today"},
+            {"role": "assistant", "content": "I can see the Q4 financial report in your files. What specific analysis would you like me to perform?"},
+            {"role": "user", "content": "First, can you summarize the main sections of the report?"},
+            {"role": "assistant", "content": "The Q4 report contains the following main sections: Executive Summary, Revenue Analysis, Cost Breakdown, Profit & Loss Statement, Cash Flow Analysis, and Year-over-Year Comparison. Each section has detailed subsections with charts and tables."},
+        ]
+        
+        package = assemble_quick_context(builder_input, chat_history=realistic_history)
+        metrics = analyze_caching_potential(package)
+        
+        # Realistic conversation: ~30 word message + ~69 words history = ~130 dynamic tokens
+        # Static: ~1133 tokens
+        # Total: ~1263 tokens
+        # Expected efficiency: ~89-90%
+        self.assertGreater(metrics["efficiency_ratio"], 0.80)
+        self.assertLess(metrics["efficiency_ratio"], 0.95)  # More realistic range
+        
+        # Expected cost savings: 40-47%
+        self.assertGreater(metrics["savings_estimate"], 0.40)
+        self.assertLess(metrics["savings_estimate"], 0.50)
+    
     def test_savings_estimate_calculation(self):
         """Test that savings estimate is half of efficiency ratio"""
         builder_input = ContextBuilderInput(
