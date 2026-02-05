@@ -2,6 +2,22 @@
 
 OmniFlow Beta is a **multi-user AI agent backend** built on **Azure Functions + Azure Blob Storage**, with a **Next.js UI**.
 
+## 🚀 Major Refactor In Progress
+
+**Tool Handler Modernization** - Transforming 4165-line monolith into registry-driven architecture
+
+- ✅ **Phase 1 Complete**: Registry & Contracts (112 tests passing)
+- 🚧 **Phase 2 In Progress**: Dispatch Pipeline (18 tests passing)
+- 📊 **Status**: [REFACTOR_STATUS.md](REFACTOR_STATUS.md)
+- 📋 **Plan**: [IMPLEMENTATION_PLAN_UPDATED.md](IMPLEMENTATION_PLAN_UPDATED.md)
+
+### Phase 1 Achievements
+- ✅ Single source of truth (TOOL_SPECS registry)
+- ✅ Structured error handling (ToolError with codes)
+- ✅ Parameter aliasing (backward compatibility)
+- ✅ Security field filtering
+- ✅ 130 tests passing
+
 ## 📜 Privacy policy
 - [Privacy policy](docs/shared/PRIVACY_POLICY.md)
 
