@@ -398,6 +398,104 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
         ]
     },
     
+    "dataset_search": {
+        "description": "Search user datasets using manifest with bounded retrieval. Implements Scan → Confirm → Fetch workflow.",
+        "method": "POST",
+        "params": {
+            "q": {
+                "type": "str",
+                "required": False,
+                "description": "Text query (searches in name, description, summary)"
+            },
+            "tags_any": {
+                "type": "list",
+                "required": False,
+                "description": "Match items with ANY of these tags"
+            },
+            "tags_all": {
+                "type": "list",
+                "required": False,
+                "description": "Match items with ALL of these tags"
+            },
+            "category": {
+                "type": "str",
+                "required": False,
+                "description": "Filter by category"
+            },
+            "since": {
+                "type": "str",
+                "required": False,
+                "description": "ISO8601 timestamp - items updated after this"
+            },
+            "until": {
+                "type": "str",
+                "required": False,
+                "description": "ISO8601 timestamp - items updated before this"
+            },
+            "limit": {
+                "type": "int",
+                "required": False,
+                "default": 20,
+                "description": "Maximum results to return (max 100)"
+            },
+            "cursor": {
+                "type": "str",
+                "required": False,
+                "description": "Pagination cursor for next page"
+            },
+            "include_snippets": {
+                "type": "bool",
+                "required": False,
+                "default": True,
+                "description": "Include text snippets in results"
+            },
+            "fetch_content": {
+                "type": "bool",
+                "required": False,
+                "default": False,
+                "description": "Load full content (expensive, use sparingly)"
+            }
+        },
+        "aliases": {},
+        "examples": [
+            {
+                "input": {
+                    "q": "tax",
+                    "tags_any": ["financial", "2024"],
+                    "limit": 10
+                },
+                "output": {
+                    "status": "success",
+                    "total_matched": 45,
+                    "total_returned": 10,
+                    "items": [],
+                    "cursor": "eyJvZmZzZXQiOiAxMH0=",
+                    "has_more": True
+                }
+            },
+            {
+                "input": {
+                    "category": "documents",
+                    "since": "2024-01-01T00:00:00Z",
+                    "limit": 20
+                },
+                "output": {
+                    "status": "success",
+                    "total_matched": 15,
+                    "total_returned": 15,
+                    "items": [],
+                    "has_more": False
+                }
+            }
+        ],
+        "gotchas": [
+            "Scan → Confirm → Fetch workflow: search without fetch_content first",
+            "Cursor pagination for stable results across pages",
+            "fetch_content=true is expensive, only use after confirming items",
+            "limit max is 100 to prevent unbounded operations"
+        ]
+    },
+    
     "custom_gpt_tools": {
         "description": "Execute custom GPT tool (passthrough to custom_gpt_tools endpoint).",
         "method": "POST",
