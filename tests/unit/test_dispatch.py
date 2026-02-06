@@ -35,10 +35,10 @@ from shared.error_codes import ToolError
 class TestDispatchToolCall:
     """Test dispatch_tool_call function."""
     
-    @patch('tool_call_handler.dispatch._delegate_to_implementation')
-    def test_successful_dispatch(self, mock_delegate):
+    def test_successful_dispatch(self, monkeypatch):
         """Test successful tool dispatch."""
-        mock_delegate.return_value = {"data": "test_data"}
+        mock_delegate = Mock(return_value={"data": "test_data"})
+        monkeypatch.setattr(dispatch, '_delegate_to_implementation', mock_delegate)
         
         result = dispatch_tool_call(
             "read_blob_file",
@@ -51,10 +51,10 @@ class TestDispatchToolCall:
         assert result["user_id"] == "user123"
         assert "result" in result
         
-    @patch('tool_call_handler.dispatch._delegate_to_implementation')
-    def test_dispatch_with_alias(self, mock_delegate):
+    def test_dispatch_with_alias(self, monkeypatch):
         """Test dispatch with parameter alias."""
-        mock_delegate.return_value = {"data": "test"}
+        mock_delegate = Mock(return_value={"data": "test"})
+        monkeypatch.setattr(dispatch, '_delegate_to_implementation', mock_delegate)
         
         result = dispatch_tool_call(
             "read_blob_file",
@@ -68,10 +68,10 @@ class TestDispatchToolCall:
         call_args = mock_delegate.call_args
         assert call_args[0][1]["file_name"] == "test.json"
         
-    @patch('tool_call_handler.dispatch._delegate_to_implementation')
-    def test_dispatch_with_trace_id(self, mock_delegate):
+    def test_dispatch_with_trace_id(self, monkeypatch):
         """Test dispatch with trace_id in context."""
-        mock_delegate.return_value = {"data": "test"}
+        mock_delegate = Mock(return_value={"data": "test"})
+        monkeypatch.setattr(dispatch, '_delegate_to_implementation', mock_delegate)
         
         result = dispatch_tool_call(
             "read_blob_file",
@@ -105,10 +105,10 @@ class TestDispatchToolCall:
         assert result["status"] == "error"
         assert result["code"] == "INVALID_TOOL"
         
-    @patch('tool_call_handler.dispatch._delegate_to_implementation')
-    def test_dispatch_filters_bad_fields(self, mock_delegate):
+    def test_dispatch_filters_bad_fields(self, monkeypatch):
         """Test that dispatch filters out malicious fields."""
-        mock_delegate.return_value = {"data": "test"}
+        mock_delegate = Mock(return_value={"data": "test"})
+        monkeypatch.setattr(dispatch, '_delegate_to_implementation', mock_delegate)
         
         result = dispatch_tool_call(
             "read_blob_file",
@@ -128,10 +128,10 @@ class TestDispatchToolCall:
         assert "malicious_field" not in params
         assert "file_name" in params
         
-    @patch('tool_call_handler.dispatch._delegate_to_implementation')
-    def test_dispatch_case_insensitive_tool_name(self, mock_delegate):
+    def test_dispatch_case_insensitive_tool_name(self, monkeypatch):
         """Test dispatch with case-insensitive tool name."""
-        mock_delegate.return_value = {"data": "test"}
+        mock_delegate = Mock(return_value={"data": "test"})
+        monkeypatch.setattr(dispatch, '_delegate_to_implementation', mock_delegate)
         
         result = dispatch_tool_call(
             "READ_BLOB_FILE",  # uppercase
@@ -142,10 +142,10 @@ class TestDispatchToolCall:
         assert result["status"] == "success"
         assert result["tool"] == "read_blob_file"  # canonicalized
         
-    @patch('tool_call_handler.dispatch._delegate_to_implementation')
-    def test_dispatch_exception_handling(self, mock_delegate):
+    def test_dispatch_exception_handling(self, monkeypatch):
         """Test dispatch handles unexpected exceptions."""
-        mock_delegate.side_effect = RuntimeError("Unexpected error")
+        mock_delegate = Mock(side_effect=RuntimeError("Unexpected error"))
+        monkeypatch.setattr(dispatch, '_delegate_to_implementation', mock_delegate)
         
         result = dispatch_tool_call(
             "read_blob_file",
@@ -308,10 +308,10 @@ class TestNormalizeResponse:
 class TestDispatchIntegration:
     """Test dispatch integration with Phase 1 registry."""
     
-    @patch('tool_call_handler.dispatch._delegate_to_implementation')
-    def test_full_pipeline(self, mock_delegate):
+    def test_full_pipeline(self, monkeypatch):
         """Test full dispatch pipeline."""
-        mock_delegate.return_value = {"count": 5, "items": []}
+        mock_delegate = Mock(return_value={"count": 5, "items": []})
+        monkeypatch.setattr(dispatch, '_delegate_to_implementation', mock_delegate)
         
         # Use aliases, case-insensitive, extra fields
         result = dispatch_tool_call(
@@ -341,10 +341,10 @@ class TestDispatchIntegration:
         assert "target_blob_name" in params  # alias applied
         assert "bad_field" not in params  # filtered out
         
-    @patch('tool_call_handler.dispatch._delegate_to_implementation')
-    def test_dispatch_preserves_optional_params(self, mock_delegate):
+    def test_dispatch_preserves_optional_params(self, monkeypatch):
         """Test that optional params are preserved."""
-        mock_delegate.return_value = {"blobs": []}
+        mock_delegate = Mock(return_value={"blobs": []})
+        monkeypatch.setattr(dispatch, '_delegate_to_implementation', mock_delegate)
         
         result = dispatch_tool_call(
             "list_blobs",
@@ -363,10 +363,10 @@ class TestDispatchIntegration:
 class TestDispatchContract:
     """Test that dispatch follows standard contracts."""
     
-    @patch('tool_call_handler.dispatch._delegate_to_implementation')
-    def test_success_envelope_structure(self, mock_delegate):
+    def test_success_envelope_structure(self, monkeypatch):
         """Test that success envelope has required fields."""
-        mock_delegate.return_value = {"data": "test"}
+        mock_delegate = Mock(return_value={"data": "test"})
+        monkeypatch.setattr(dispatch, '_delegate_to_implementation', mock_delegate)
         
         result = dispatch_tool_call(
             "read_blob_file",
@@ -394,12 +394,12 @@ class TestDispatchContract:
         assert "message" in result
         assert result["status"] == "error"
         
-    @patch('tool_call_handler.dispatch._delegate_to_implementation')
-    def test_response_is_json_serializable(self, mock_delegate):
+    def test_response_is_json_serializable(self, monkeypatch):
         """Test that response can be JSON serialized."""
         import json
         
-        mock_delegate.return_value = {"data": "test", "count": 1}
+        mock_delegate = Mock(return_value={"data": "test", "count": 1})
+        monkeypatch.setattr(dispatch, '_delegate_to_implementation', mock_delegate)
         
         result = dispatch_tool_call(
             "list_blobs",

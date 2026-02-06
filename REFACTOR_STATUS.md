@@ -100,7 +100,7 @@ Refactoring OmniFlowBeta's Tool Handler (4165-line `backend/tool_call_handler/__
 - ✅ get_tool_info() - Tool discovery function
 - ✅ _normalize_response() - Standard envelope normalization
 - ✅ _delegate_to_implementation() - Bridge to existing tools
-- ✅ **18 passing tests** (core functionality)
+- ✅ **28 passing tests** (all test classes passing: dispatch, validation, info, normalization, integration, contracts)
 
 **2. Integration** (`backend/tool_call_handler/__init__.py`)
 - ✅ Registry dispatch integrated as primary dispatch method
@@ -116,11 +116,12 @@ Refactoring OmniFlowBeta's Tool Handler (4165-line `backend/tool_call_handler/__
 5. ✅ Normalize response envelope
 
 ### Phase 2 Metrics (Final)
-- ✅ **18 tests passing** (core unit tests)
-- ✅ Integrated into main tool_call_handler
+- ✅ **28 comprehensive tests passing** (core unit + integration tests)
+- ✅ All 6 test classes passing (dispatch, validation, info, normalization, integration, contracts)
+- ✅ Integrated into main tool_call_handler with fallback chain
 - ✅ Clean separation between registry and implementation
 - ✅ Backward compatible with existing tools
-- ✅ Graceful fallback to legacy dispatch
+- ✅ Graceful fallback to legacy dispatch → proxy router
 
 ---
 
@@ -317,14 +318,14 @@ def build_cacheable_prompt(interactions):
 | error_codes.py | 28 | ✅ All passing |
 | tool_specs.py | 38 | ✅ All passing |
 | tool_registry.py | 46 | ✅ All passing |
-| dispatch.py | 18 | ✅ All passing |
+| dispatch.py | 28 | ✅ All passing |
 | dataset_search.py | 35 | ✅ All passing |
 | wp6/schemas.py | 24 | ✅ All passing |
 | wp6/fast_context.py | 12 | ✅ All passing |
 | wp6/deep_context.py | 10 | ✅ All passing |
 | wp6/routing.py | 24 | ✅ All passing |
 | wp7/indexer.py | 33 | ✅ All passing |
-| **Total** | **268** | **✅ 268/268** |
+| **Total** | **278** | **✅ 278/278** |
 
 ### Test Categories
 - ✅ Unit tests for all functions
@@ -546,7 +547,7 @@ pytest tests/unit/test_error_codes.py tests/unit/test_tool_specs.py tests/unit/t
 ## Timeline
 
 **Phase 1**: Completed 2026-02-05 (3 work units, 112 tests)
-**Phase 2**: Completed 2026-02-06 (Integration complete, 18 tests)
+**Phase 2**: Completed 2026-02-06 (Integration complete, 28 tests)
 **Phase 3**: Completed 2026-02-05 (1 work unit, 35 tests)
 **Phase 4**: Completed 2026-02-05 (4 work units, 70 tests)
 **Phase 5**: Completed 2026-02-06 (3 work units, 33 tests)
@@ -564,7 +565,7 @@ pytest tests/unit/test_error_codes.py tests/unit/test_tool_specs.py tests/unit/t
 - Complete README updates
 
 **Current Status**: 
-- ✅ 268 tests passing (5 phases complete)
+- ✅ 278 tests passing (5 phases complete)
 - ✅ Dual-mode architecture (REALTIME + BATCH)
 - ✅ Prompt caching optimization (80-90% efficiency)
 - ✅ Registry-driven dispatch integrated
@@ -583,4 +584,4 @@ For questions or issues:
 
 **Last Updated**: 2026-02-06
 **Status**: ✅ Phases 1, 2, 3, 4, & 5 Complete
-**Total Tests**: 268 passing (112+18+35+70+33)
+**Total Tests**: 278 passing (112+28+35+70+33)
