@@ -33,6 +33,7 @@ from azure.storage.blob import BlobClient
 
 from .azure_client import AzureBlobClient
 from .config import AzureConfig, UserNamespace
+from .tool_handler_config import DEFAULT_TOOL_HANDLER_CONFIG as TOOL_HANDLER_CONFIG
 
 
 WP7_QUEUE_BLOB_NAME = "interactions/indexer_queue.jsonl"
@@ -49,19 +50,15 @@ WP7_SEMANTIC_INDEX_SCHEMA_V1 = "omniflow.wp7.semantic_index.v1"
 WP7_UNCATEGORIZED_SCHEMA_V1 = "omniflow.wp7.uncategorized.v1"
 WP7_BATCH_AUDIT_SCHEMA_V1 = "omniflow.wp7.batch_audit.v1"
 
+CONFIG = TOOL_HANDLER_CONFIG
+
 # WP7 semantic index burst-dedup (reduces noise in index.jsonl; does not modify raw interaction logs).
 # Dedup key is computed from: category + summary_short (normalized) + tags (sorted).
-WP7_SEMANTIC_DEDUP_ENABLED = str(os.environ.get("WP7_SEMANTIC_DEDUP_ENABLED") or "1").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "y",
-    "on",
-)
-WP7_SEMANTIC_DEDUP_WINDOW_SECONDS = int(os.environ.get("WP7_SEMANTIC_DEDUP_WINDOW_SECONDS", "300") or 300)
-WP7_SEMANTIC_DEDUP_TAIL_BYTES = int(os.environ.get("WP7_SEMANTIC_DEDUP_TAIL_BYTES", "65536") or 65536)
-WP7_SEMANTIC_DEDUP_MAX_LINES = int(os.environ.get("WP7_SEMANTIC_DEDUP_MAX_LINES", "200") or 200)
-WP7_SEMANTIC_DEDUP_MAX_MATCHES = int(os.environ.get("WP7_SEMANTIC_DEDUP_MAX_MATCHES", "50") or 50)
+WP7_SEMANTIC_DEDUP_ENABLED = CONFIG.wp7_semantic_dedup_enabled
+WP7_SEMANTIC_DEDUP_WINDOW_SECONDS = CONFIG.wp7_semantic_dedup_window_seconds
+WP7_SEMANTIC_DEDUP_TAIL_BYTES = CONFIG.wp7_semantic_dedup_tail_bytes
+WP7_SEMANTIC_DEDUP_MAX_LINES = CONFIG.wp7_semantic_dedup_max_lines
+WP7_SEMANTIC_DEDUP_MAX_MATCHES = CONFIG.wp7_semantic_dedup_max_matches
 
 WP7_INTERACTION_ITEMS_SCHEMA_V1 = {
     "type": "object",
@@ -847,10 +844,15 @@ def _ensure_append_blob(client: BlobClient, *, user_id: str, blob_label: str) ->
     )
 
 
-def _append_jsonl_line(client: BlobClient, line: str, *, user_id: str, blob_label: str) -> None:
-    """Append a JSONL line using Append Blob operations; migrate if blob exists as Block Blob."""
+def _append_jsonl_line(client: BlobClient, line: str, user_id: str = None, blob_label: str = None) -> None:
+    """Append a JSONL line using Append Blob operations; migrate if blob exists as Block Blob.
+
+    Backwards compatible: accept `user_id`/`blob_label` as either positional or keyword args
+    because older runtime snapshots called this helper positionally.
+    """
     data = line.encode("utf-8")
 
+    # Support callers that may pass user_id/blob_label positionally (older codepaths).
     _ensure_append_blob(client, user_id=user_id, blob_label=blob_label)
 
     try:

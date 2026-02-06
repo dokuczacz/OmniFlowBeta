@@ -22,6 +22,19 @@ type RunLog = {
 
 type StreamChunk = Record<string, unknown>;
 
+type RunProgress = {
+  schema_version?: string;
+  user_id?: string;
+  thread_id?: string;
+  run_id?: string;
+  trace_id?: string;
+  status?: string;
+  stage?: string;
+  message?: string;
+  seq?: number;
+  ts_utc?: string;
+};
+
 function normalizeStreamChunk(chunk: StreamChunk): StreamChunk {
   if (!("data" in chunk)) {
     return chunk;
@@ -157,6 +170,11 @@ export function MVPChat({
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const [stickToBottom, setStickToBottom] = useState(true);
 
+  const threadIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    threadIdRef.current = threadId;
+  }, [threadId]);
+
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (!activeUser) {
@@ -242,6 +260,31 @@ export function MVPChat({
     return 0;
   };
 
+  const ensureThreadId = () => {
+    if (threadIdRef.current) return threadIdRef.current;
+    const next = `handle_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+    setThreadId(next);
+    threadIdRef.current = next;
+    return next;
+  };
+
+  const pollRunProgress = async (
+    activeThreadId: string,
+    abortSignal: AbortSignal
+  ): Promise<RunProgress | null> => {
+    const params = new URLSearchParams({ thread_id: activeThreadId });
+    if (backendUrl?.trim()) params.set("backend_url", backendUrl.trim());
+    if (activeUser?.trim()) params.set("user_id", activeUser.trim());
+    const resp = await fetch(`/api/progress?${params.toString()}`, {
+      method: "GET",
+      signal: abortSignal,
+    });
+    const data = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
+    const rp = data?.run_progress;
+    if (!rp || typeof rp !== "object") return null;
+    return rp as RunProgress;
+  };
+
   useEffect(() => {
     if (!stickToBottom) return;
     const el = historyRef.current;
@@ -266,6 +309,7 @@ export function MVPChat({
     setStatus("sending");
     setError("");
     setLatencyMs(null);
+    const activeThreadId = ensureThreadId();
     const ts = new Date().toLocaleTimeString();
     const userMsg: ChatMessage = {
       id: crypto.randomUUID(),
@@ -288,9 +332,40 @@ export function MVPChat({
     setInput("");
 
     const started = performance.now();
-    let nextThreadId = threadId;
+    let nextThreadId = activeThreadId;
     onStatusUpdate?.("User message sent... waiting for backend", nextThreadId);
     onStatusUpdate?.("Agent is thinking...", nextThreadId);
+
+    const progressAbort = new AbortController();
+    let progressTimer: number | null = null;
+    let lastSeq = 0;
+    const stageLabel = (stage: string) => {
+      const key = stage.trim();
+      if (key === "grasping_context") return "Grasping context";
+      if (key === "looking_more_data") return "Looking for more data (DEEP)";
+      if (key === "calling_tools") return "Calling tools";
+      if (key === "done") return "Done";
+      return stage.trim() || "Working";
+    };
+    const startProgressPolling = () => {
+      const tick = async () => {
+        try {
+          const rp = await pollRunProgress(nextThreadId, progressAbort.signal);
+          if (!rp) return;
+          const seq = typeof rp.seq === "number" ? rp.seq : 0;
+          if (seq <= lastSeq) return;
+          lastSeq = seq;
+          const label = stageLabel(String(rp.stage || ""));
+          const msg = String(rp.message || "").trim();
+          onStatusUpdate?.(msg ? `${label}: ${msg}` : `${label}...`, nextThreadId);
+        } catch {
+          // ignore transient polling failures
+        }
+      };
+      void tick();
+      progressTimer = window.setInterval(() => void tick(), 800);
+    };
+    startProgressPolling();
     try {
       const requestStream = streamMode === "backend";
       const resp = await fetch("/api/omni", {
@@ -298,7 +373,7 @@ export function MVPChat({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: trimmed,
-          thread_id: threadId,
+          thread_id: nextThreadId,
           runtime: "responses",
           backend_url: backendUrl || null,
           user_id: activeUser || null,
@@ -350,6 +425,7 @@ export function MVPChat({
         if (typeof data.thread_id === "string" && data.thread_id) {
           nextThreadId = data.thread_id;
           setThreadId(data.thread_id);
+          threadIdRef.current = data.thread_id;
         }
 
         const toolsCount = toolCallsCount(data);
@@ -385,6 +461,7 @@ export function MVPChat({
         if (typeof candidate === "string" && candidate) {
           nextThreadId = candidate;
           setThreadId(candidate);
+          threadIdRef.current = candidate;
         }
       };
 
@@ -479,6 +556,13 @@ export function MVPChat({
       appendRun("error", elapsed, nextThreadId, trimmed);
       onStatusUpdate?.("Assistant finished (error).", nextThreadId);
       onStatusUpdate?.("Waiting for input...", nextThreadId);
+    } finally {
+      try {
+        progressAbort.abort();
+      } catch {}
+      if (progressTimer) {
+        window.clearInterval(progressTimer);
+      }
     }
   };
 

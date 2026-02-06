@@ -2,6 +2,30 @@
 
 OmniFlow Beta is a **multi-user AI agent backend** built on **Azure Functions + Azure Blob Storage**, with a **Next.js UI**.
 
+## ✅ Tool Handler Refactor Complete (v2.0)
+
+**Registry-Driven Architecture** - Transformed 4165-line monolith into modular, testable system
+
+- ✅ **Phase 1**: Registry & Contracts (112 tests)
+- ✅ **Phase 2**: Dispatch Pipeline Integration (28 tests)
+- ✅ **Phase 3**: Datasearch Engine (35 tests)
+- ✅ **Phase 4**: WP6 Context Builders (70 tests)
+- ✅ **Phase 5**: WP7 Dual-Mode Indexing (33 tests)
+- ✅ **Phase 6**: Documentation & Contracts (Complete)
+- 📊 **Total**: 278 tests passing | [REFACTOR_STATUS.md](REFACTOR_STATUS.md)
+- 📋 **Contracts**: [docs/TOOL_HANDLER_CONTRACTS.md](docs/TOOL_HANDLER_CONTRACTS.md)
+- 🔄 **Migration**: [docs/MIGRATION_GUIDE.md](docs/MIGRATION_GUIDE.md)
+
+### Key Achievements
+- ✅ **Registry System**: TOOL_SPECS as single source of truth (14 tools)
+- ✅ **Structured Errors**: ToolError with standardized error codes
+- ✅ **Backward Compatible**: Parameter aliasing + graceful fallbacks
+- ✅ **Security**: Field filtering prevents data leaks
+- ✅ **Dataset Search**: Bounded retrieval (Scan → Confirm → Fetch)
+- ✅ **Prompt Caching**: 80-90% efficiency (WP6 FAST/DEEP, WP7 REALTIME/BATCH)
+- ✅ **Cost Savings**: 28-40% reduction (~$30K/year at scale)
+- ✅ **278 Tests**: Comprehensive coverage (112+28+35+70+33)
+
 ## 📜 Privacy policy
 - [Privacy policy](docs/shared/PRIVACY_POLICY.md)
 
@@ -39,13 +63,33 @@ Legend: OK  X  Pending  Available/Needs constraints
 
 ---
 
-## Live demo
+## 📁 Project Structure
 
-- Streamlit (legacy LAB): https://omniflowbeta-gjv5gjhezwbfg7pb7pucwe.streamlit.app/
+```
+OmniFlowBeta/
+├── backend/              # Azure Functions (legacy, deprecated)
+├── OmniFlowCentral/      # Azure Functions (App2, active deployment)
+├── ai-chatbot/           # Main UI (Next.js, actively maintained)
+├── frontend/             # Lab UI (Streamlit, for testing)
+├── data/                 # Local data files (gitignored)
+├── docs/                 # Documentation (selective tracking)
+├── experiments/          # Experimental features (untracked)
+├── external/             # External templates/dependencies
+├── logs/                 # Runtime logs (gitignored)
+├── scripts/              # Automation scripts
+├── tests/                # Test suites
+├── tools/                # Local tooling (gitignored)
+├── ui_archived/          # Archived UI proposals (gitignored)
+│   ├── ui_next_proposal/ # Future Next.js UI proposal
+│   └── ui_shiny/         # Archived Shiny UI
+└── .azurite/             # Azurite emulator data (gitignored)
+```
 
 ---
 
 ## Known limitations
+
+## Live demo
 
 - WP6: `DEEP` not deterministically forceable end-to-end.
 - Streamlit UI is legacy/LAB only (primary UI is Next.js).

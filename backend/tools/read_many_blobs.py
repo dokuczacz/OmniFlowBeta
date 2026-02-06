@@ -1,27 +1,17 @@
 # tools/read_many_blobs.py
-from read_many_blobs import main as read_many_blobs_func
+from read_many_blobs.service import read_many_blobs_core
 
 
 def read_many_blobs(args, user_id):
-    import json
-
-    class DummyReq:
-        def __init__(self, args, user_id):
-            self._args = args or {}
-            self._user_id = user_id
-            self.headers = {"x-user-id": str(user_id)}
-            self.params = dict(self._args)
-
-        def get_json(self):
-            return {**self._args, "user_id": self._user_id}
-
-        def __getitem__(self, key):
-            return self._args[key]
-
-    req = DummyReq(args, user_id)
-    resp = read_many_blobs_func(req)
-    try:
-        return json.loads(resp.get_body())
-    except Exception:
-        return resp.get_body()
+    files = args.get("files") or args.get("file_names") or []
+    params = {
+        "files": files,
+        "tail_lines": args.get("tail_lines"),
+        "tail_bytes": args.get("tail_bytes"),
+        "max_bytes_per_file": args.get("max_bytes_per_file"),
+        "parse_json": args.get("parse_json"),
+        "max_files": args.get("max_files"),
+    }
+    result, _ = read_many_blobs_core(user_id=user_id, **params, raise_on_error=False)
+    return result
 

@@ -50,6 +50,9 @@ external/
 data/
 tools/
 
+# Archived UI components (not actively maintained)
+ui_archived/
+
 # Keep local tests untracked (repo focuses on deployment artifacts/docs)
 ai-chatbot/tests/
 backend/**/test_*.py
@@ -102,6 +105,9 @@ docs/*
 !docs/README.md
 !docs/PATCH_2_STATUS.md
 !docs/WP7_Indexer_Batch.md
+!docs/BEST_PRACTICES_REFERENCE.md
+!docs/ARCHITECTURE_ANALYSIS.md
+!docs/PROMPT_CACHING_GUIDE.md
 !docs/workflow/
 !docs/workflow/wp6_context_builder/
 !docs/workflow/wp6_context_builder/**

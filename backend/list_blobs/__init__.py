@@ -1,113 +1,36 @@
 import json
 import logging
-import azure.functions as func
-from azure.storage.blob import BlobServiceClient
-from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
-import os
 import time
-from shared.config import AzureConfig
+import azure.functions as func
+
+from .service import list_blobs_core
 
 
-def main(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    List blobs in the user's namespace.
-    
-    Parameters:
-    - prefix (optional): Additional prefix filter within user's namespace
-    - user_id (optional): User ID (extracted from header/query/body)
-    
-    Returns:
-    - JSON array of blob names (relative to user's namespace)
-    """
-    # Extract user_id in priority order
-    user_id = (
-        req.headers.get("x-user-id")
-        or req.params.get("user_id")
-    )
+def _resolve_user_id(req: func.HttpRequest) -> str:
+    user_id = req.headers.get("x-user-id") or req.params.get("user_id")
     if not user_id:
         try:
             body = req.get_json()
             user_id = body.get("user_id")
-        except (ValueError, AttributeError):
+        except ValueError:
             pass
-    user_id = user_id or "default"
-    user_id = str(user_id).strip()
-    
-    prefix = req.params.get("prefix", "")
-    include_meta = str(req.params.get("include_meta", "") or "").strip().lower() in ("1", "true", "yes", "y", "on")
-    
-    start_t = time.perf_counter()
-    logging.info(f"list_blobs: user_id={user_id}, prefix={prefix}")
-    
-    try:
-        connect_str = AzureConfig.CONNECTION_STRING
-        container_name = AzureConfig.CONTAINER_NAME
-        
-        if not connect_str or not container_name:
-            return func.HttpResponse(
-                json.dumps({"error": "Missing Azure Storage configuration", "user_id": user_id}),
-                status_code=500,
-                mimetype="application/json"
-            )
-        
-        blob_service_client = BlobServiceClient.from_connection_string(connect_str)
-        container_client = blob_service_client.get_container_client(container_name)
-        try:
-            container_client.get_container_properties()
-        except ResourceNotFoundError:
-            logging.warning(f"list_blobs: container not found ({container_name}); creating")
-            try:
-                blob_service_client.create_container(container_name)
-            except ResourceExistsError:
-                pass
-            container_client = blob_service_client.get_container_client(container_name)
-        
-        # Build full prefix: users/{user_id}/{optional_prefix}
-        user_namespace_prefix = f"users/{user_id}/"
-        full_prefix = user_namespace_prefix + prefix if prefix else user_namespace_prefix
-        
-        # List blobs in user's namespace
-        blob_list = []
-        blob_meta = []
-        blobs = container_client.list_blobs(name_starts_with=full_prefix)
-        for blob in blobs:
-            # Return blob name relative to user's namespace (strip users/{user_id}/)
-            relative_name = blob.name[len(user_namespace_prefix):]
-            blob_list.append(relative_name)
-            if include_meta:
-                try:
-                    blob_meta.append(
-                        {
-                            "name": relative_name,
-                            "size": int(getattr(blob, "size", 0) or 0),
-                            "last_modified": getattr(blob, "last_modified", None).isoformat().replace("+00:00", "Z")
-                            if getattr(blob, "last_modified", None)
-                            else None,
-                        }
-                    )
-                except Exception:
-                    blob_meta.append({"name": relative_name})
-        
-        response = {
-            "status": "success",
-            "user_id": user_id,
-            "blobs": blob_list,
-            "count": len(blob_list),
-            "blobs_meta": blob_meta if include_meta else None
-        }
-        dur_ms = int((time.perf_counter() - start_t) * 1000)
-        logging.info(f"list_blobs: OK user_id={user_id} prefix={prefix} count={len(blob_list)} dur_ms={dur_ms}")
-        
-        return func.HttpResponse(
-            json.dumps(response, ensure_ascii=False),
-            mimetype="application/json",
-            status_code=200
-        )
+    return str(user_id or "default").strip()
 
-    except Exception as e:
-        logging.error(f"Error listing blobs: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"error": f"Error listing blobs: {str(e)}", "user_id": user_id}),
-            status_code=500,
-            mimetype="application/json"
-        )
+
+def _parse_include_meta(req: func.HttpRequest) -> bool:
+    value = str(req.params.get("include_meta") or "").strip().lower()
+    return value in ("1", "true", "yes", "y", "on")
+
+
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info("list_blobs: received request")
+    user_id = _resolve_user_id(req)
+    prefix = req.params.get("prefix", "")
+    include_meta = _parse_include_meta(req)
+    response = list_blobs_core(user_id, prefix=prefix, include_meta=include_meta, raise_on_error=True)
+    status_code = 200 if response.get("status") == "success" else 500
+    return func.HttpResponse(
+        json.dumps(response, ensure_ascii=False),
+        status_code=status_code,
+        mimetype="application/json",
+    )

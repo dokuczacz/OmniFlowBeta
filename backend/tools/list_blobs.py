@@ -1,24 +1,20 @@
-# tools/list_blobs.py
-from list_blobs import main as list_blobs_func
+from list_blobs.service import list_blobs_core
+
+
+def _coerce_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower().strip() in ("1", "true", "yes", "y", "on")
+    return bool(value)
+
 
 def list_blobs(args, user_id):
-    from shared.user_manager import extract_user_id
-    import azure.functions as func
-    import json
-    class DummyReq:
-        def __init__(self, args, user_id):
-            self._args = args or {}
-            self._user_id = user_id
-            self.headers = {"x-user-id": str(user_id)}
-            # params expected by many backend functions
-            self.params = dict(self._args)
-        def get_json(self):
-            return {**self._args, "user_id": self._user_id}
-        def __getitem__(self, key):
-            return self._args[key]
-    req = DummyReq(args, user_id)
-    resp = list_blobs_func(req)
-    try:
-        return json.loads(resp.get_body())
-    except Exception:
-        return resp.get_body()
+    prefix = str(args.get("prefix") or "").strip()
+    include_meta = _coerce_bool(args.get("include_meta"))
+    return list_blobs_core(
+        user_id=user_id,
+        prefix=prefix,
+        include_meta=include_meta,
+        raise_on_error=False,
+    )

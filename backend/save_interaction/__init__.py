@@ -2,40 +2,18 @@ import logging
 import json
 import sys
 import os
-from datetime import datetime
 import azure.functions as func
-from azure.core.exceptions import ResourceNotFoundError, AzureError
+from azure.core.exceptions import AzureError
 
 # Add parent directory to path for shared imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from shared.azure_client import AzureBlobClient
-from shared.config import AzureConfig
+from shared.tool_handler_config import DEFAULT_TOOL_HANDLER_CONFIG as TOOL_HANDLER_CONFIG
 from shared.user_manager import extract_user_id
 from shared.wp7_indexer import QueueThresholds, append_queue_item, build_queue_item
+from .service import save_interaction_entry
 
-
-def _is_duplicate_interaction(existing_logs: list, candidate: dict, *, max_age_seconds: int = 30) -> bool:
-    if not existing_logs:
-        return False
-    try:
-        last = existing_logs[-1] if isinstance(existing_logs, list) else None
-        if not isinstance(last, dict):
-            return False
-        same_thread = (last.get("thread_id") or None) == (candidate.get("thread_id") or None)
-        same_user_msg = (last.get("user_message") or "") == (candidate.get("user_message") or "")
-        same_assistant = (last.get("assistant_response") or "") == (candidate.get("assistant_response") or "")
-        if not (same_thread and same_user_msg and same_assistant):
-            return False
-        last_ts = last.get("timestamp")
-        cand_ts = candidate.get("timestamp")
-        if not (last_ts and cand_ts):
-            return True
-        last_dt = datetime.fromisoformat(str(last_ts).replace("Z", "+00:00"))
-        cand_dt = datetime.fromisoformat(str(cand_ts).replace("Z", "+00:00"))
-        return abs((cand_dt - last_dt).total_seconds()) <= max_age_seconds
-    except Exception:
-        return False
+CONFIG = TOOL_HANDLER_CONFIG
 
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
@@ -93,156 +71,75 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     logging.info(f"save_interaction: user_id={user_id}, thread_id={thread_id}")
     
     try:
-        # Save-only approach: do not attempt to GET existing blob contents.
-        # Build a new logs list containing the single new interaction and upload it.
-        target_blob_name = "interaction_logs.json"
-        blob_client = AzureBlobClient.get_blob_client(target_blob_name, user_id)
-
-        now = datetime.utcnow()
-        interaction_entry = {
-            "interaction_id": f"INT_{now.strftime('%Y%m%d_%H%M%S_%f')}",
-            "timestamp": now.isoformat(),
-            "user_id": user_id,
-            "thread_id": thread_id,
-            "user_message": user_message,
-            "assistant_response": assistant_response,
-            "tool_calls": tool_calls,
-            "metadata": metadata
-        }
-
-        # Read existing logs (if any) and append the new interaction to preserve history
-        try:
-            existing_logs = []
-            try:
-                # Try to download existing blob; if not found, we'll create a new list
-                if AzureBlobClient.blob_exists(target_blob_name, user_id):
-                    downloader = blob_client.download_blob()
-                    raw = downloader.readall()
-                    try:
-                        existing_logs = json.loads(raw.decode('utf-8'))
-                        if not isinstance(existing_logs, list):
-                            existing_logs = [existing_logs]
-                    except Exception:
-                        existing_logs = []
-                else:
-                    existing_logs = []
-            except ResourceNotFoundError:
-                existing_logs = []
-
-            if _is_duplicate_interaction(existing_logs, interaction_entry):
-                response_data = {
-                    "success": True,
-                    "message": "Duplicate interaction skipped",
-                    "code": "duplicate_skipped",
-                    "interaction_id": interaction_entry["interaction_id"],
-                    "timestamp": interaction_entry["timestamp"],
-                    "total_interactions": len(existing_logs),
-                    "user_id": user_id,
-                    "storage_location": blob_client.blob_name,
-                }
-                return func.HttpResponse(
-                    json.dumps(response_data, ensure_ascii=False),
-                    mimetype="application/json",
-                    status_code=200,
-                )
-
-            logs = list(existing_logs) + [interaction_entry]
-            upload_data = json.dumps(logs, indent=2, ensure_ascii=False)
-
-            # Try upload, on container-not-found attempt to create container then retry
-            upload_success = False
-            try:
-                blob_client.upload_blob(upload_data.encode('utf-8'), overwrite=True)
-                upload_success = True
-            except ResourceNotFoundError as e:
-                logging.warning(f"Upload failed with ResourceNotFoundError; attempting to create container: {e}")
-                try:
-                    service = AzureBlobClient.get_service_client()
-                    service.create_container(AzureConfig.CONTAINER_NAME)
-                    logging.info(f"Created missing container: {AzureConfig.CONTAINER_NAME}")
-                    # Re-acquire blob client and retry upload once
-                    blob_client = AzureBlobClient.get_blob_client(target_blob_name, user_id)
-                    blob_client.upload_blob(upload_data.encode('utf-8'), overwrite=True)
-                    upload_success = True
-                except Exception as create_exc:
-                    logging.error(f"Failed to create container: {create_exc}")
-                    return func.HttpResponse(
-                        json.dumps({
-                            "success": False,
-                            "message": "Failed to create container for user interaction log.",
-                            "code": "container_create_failed",
-                            "details": str(create_exc)[:200]
-                        }),
-                        status_code=500,
-                        mimetype="application/json"
-                    )
-            except AzureError as e:
-                logging.error(f"Azure error in save_interaction: {str(e)}")
-                return func.HttpResponse(
-                    json.dumps({
-                        "success": False,
-                        "message": "Azure storage error during save_interaction.",
-                        "code": "azure_error",
-                        "details": str(e)[:200]
-                    }),
-                    status_code=500,
-                    mimetype="application/json"
-                )
-        except Exception as e:
-            logging.error(f"Unexpected error preparing upload data: {e}")
-            return func.HttpResponse(
-                json.dumps({
-                    "success": False,
-                    "message": "Server error preparing interaction log.",
-                    "code": "server_error",
-                    "details": str(e)[:200]
-                }),
-                status_code=500,
-                mimetype="application/json"
-            )
-
-        if upload_success:
-            # WP7: enqueue a sanitized item for the batch indexer (append-only JSONL).
-            try:
-                thresholds = QueueThresholds(
-                    target_tokens=int(os.environ.get("WP7_TARGET_BATCH_TOKENS", "1000") or 1000)
-                    * max(1, int(os.environ.get("WP7_BATCH_SIZE_MULTIPLIER", "9") or 9)),
-                    hard_min_tokens=int(os.environ.get("WP7_HARD_MIN_BATCH_TOKENS", "600") or 600)
-                    * max(1, int(os.environ.get("WP7_BATCH_SIZE_MULTIPLIER", "9") or 9)),
-                    max_wait_seconds=int(os.environ.get("WP7_MAX_WAIT_SECONDS", "300") or 300),
-                    max_items_per_run=min(int(os.environ.get("WP7_MAX_ITEMS_PER_RUN", "25") or 25), 25),
-                )
-                queue_item = build_queue_item(interaction_entry, user_id=user_id, thresholds=thresholds)
-                append_queue_item(user_id, queue_item)
-            except Exception as enqueue_exc:
-                logging.warning(f"WP7 queue enqueue failed (non-fatal): {enqueue_exc}")
-
+        result = save_interaction_entry(
+            user_id=user_id,
+            user_message=user_message,
+            assistant_response=assistant_response,
+            thread_id=thread_id,
+            tool_calls=tool_calls,
+            metadata=metadata,
+        )
+        if result.get("duplicate"):
             response_data = {
                 "success": True,
-                "message": "Interaction successfully saved",
-                "code": "ok",
-                "interaction_id": interaction_entry["interaction_id"],
-                "timestamp": interaction_entry["timestamp"],
-                "total_interactions": len(logs),
+                "message": "Duplicate interaction skipped",
+                "code": "duplicate_skipped",
+                "interaction_id": result["interaction_entry"]["interaction_id"],
+                "timestamp": result["interaction_entry"]["timestamp"],
+                "total_interactions": result.get("total_interactions", 0),
                 "user_id": user_id,
-                "storage_location": blob_client.blob_name
+                "storage_location": result.get("interaction_blob"),
             }
             return func.HttpResponse(
                 json.dumps(response_data, ensure_ascii=False),
                 mimetype="application/json",
-                status_code=200
+                status_code=200,
             )
-        else:
-            return func.HttpResponse(
-                json.dumps({
-                    "success": False,
-                    "message": "Unknown error: upload did not succeed.",
-                    "code": "unknown_error",
-                    "details": "Upload did not complete successfully."
-                }),
-                status_code=500,
-                mimetype="application/json"
+
+        interaction_entry = result["interaction_entry"]
+        total_interactions = result.get("total_interactions", 1)
+        storage_location = result.get("interaction_blob")
+
+        try:
+            batch_multiplier = max(1, CONFIG.wp7_batch_size_multiplier)
+            thresholds = QueueThresholds(
+                target_tokens=CONFIG.wp7_target_batch_tokens * batch_multiplier,
+                hard_min_tokens=CONFIG.wp7_hard_min_batch_tokens * batch_multiplier,
+                max_wait_seconds=CONFIG.wp7_max_wait_seconds,
+                max_items_per_run=min(CONFIG.wp7_max_items_per_run, 25),
             )
+            queue_item = build_queue_item(interaction_entry, user_id=user_id, thresholds=thresholds)
+            append_queue_item(user_id, queue_item)
+        except Exception as enqueue_exc:
+            logging.warning(f"WP7 queue enqueue failed (non-fatal): {enqueue_exc}")
+
+        response_data = {
+            "success": True,
+            "message": "Interaction successfully saved",
+            "code": "ok",
+            "interaction_id": interaction_entry["interaction_id"],
+            "timestamp": interaction_entry["timestamp"],
+            "total_interactions": total_interactions,
+            "user_id": user_id,
+            "storage_location": storage_location,
+        }
+        return func.HttpResponse(
+            json.dumps(response_data, ensure_ascii=False),
+            mimetype="application/json",
+            status_code=200
+        )
+    except AzureError as e:
+        logging.error(f"Azure error in save_interaction: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({
+                "success": False,
+                "message": "Azure storage error during save_interaction.",
+                "code": "azure_error",
+                "details": str(e)[:200]
+            }),
+            status_code=500,
+            mimetype="application/json"
+        )
     except Exception as e:
         logging.error(f"Unexpected error in save_interaction: {str(e)}")
         return func.HttpResponse(

@@ -33,6 +33,11 @@ import types as _types
 import threading
 import random
 
+try:
+    from jsonschema import Draft202012Validator
+except Exception:  # pragma: no cover
+    Draft202012Validator = None
+
 # Allow importing shared helpers when running as a Functions app or locally
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
@@ -43,6 +48,13 @@ except Exception:
     detach_file_handler = None
 from shared.http_client import requests_get, requests_post
 from shared.mock_agent import build_mock_agent_response, mock_marker, mock_user_id
+
+# Phase 2: Import registry-driven dispatch pipeline
+try:
+    from tool_call_handler.dispatch import dispatch_tool_call as registry_dispatch
+    REGISTRY_DISPATCH_AVAILABLE = True
+except ImportError:
+    REGISTRY_DISPATCH_AVAILABLE = False
 
 # Config
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -165,6 +177,179 @@ def _inprocess_upload_data_or_file(user_id: str, target_blob_name: str, file_con
         return {}
 
 
+_WP6_PREFERENCES_SCHEMA_FALLBACK: Dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "omniflow.wp6.preferences.v1",
+    "type": "object",
+    "additionalProperties": True,
+    "required": ["schema_version", "updated_utc"],
+    "properties": {
+        "schema_version": {"type": "string", "const": "omniflow.wp6.preferences.v1"},
+        "updated_utc": {"type": "string"},
+    },
+}
+
+_WP6_CONTEXT_PACK_SCHEMA_LEGACY: Dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "omniflow.wp6.context_pack.legacy.v0",
+    "type": "object",
+    # Keep permissive for forward-compatibility with prompt iterations.
+    "additionalProperties": True,
+    "required": [
+        "mode",
+        "summary",
+        "bullets",
+        "top_sources",
+        "pack_tokens_est",
+        "coverage",
+        "need_more_sources",
+        "created_utc",
+    ],
+    "properties": {
+        "mode": {"type": "string"},
+        "summary": {"type": "string"},
+        "bullets": {"type": "array", "items": {"type": "string"}},
+        "top_sources": {"type": "array"},
+        "pack_tokens_est": {"type": "integer", "minimum": 0},
+        "coverage": {},
+        "need_more_sources": {"type": "boolean"},
+        "created_utc": {"type": "string"},
+    },
+}
+
+_WP6_CONTEXT_BUILDER_INPUT_SCHEMA: Dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "omniflow.wp6.context_builder_input.v1",
+    "type": "object",
+    "additionalProperties": True,
+    "required": ["request", "candidate_sources", "constraints"],
+    "properties": {
+        "request": {
+            "type": "object",
+            "additionalProperties": True,
+            "required": ["user_prompt"],
+            "properties": {"user_prompt": {"type": "string"}},
+        },
+        "candidate_sources": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": True,
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "excerpt_or_snippet": {"type": "string"},
+                },
+            },
+        },
+        "constraints": {"type": "object", "additionalProperties": True},
+    },
+}
+
+_wp6_prefs_validator = None
+_wp6_pack_legacy_validator = None
+_wp6_builder_input_validator = None
+
+
+def _repo_root_dir() -> str:
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.abspath(os.path.join(backend_dir, ".."))
+
+
+def _load_schema_file(relative_path: str) -> Dict[str, Any]:
+    try:
+        schema_path = os.path.join(_repo_root_dir(), relative_path)
+        with open(schema_path, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        return schema if isinstance(schema, dict) else {}
+    except Exception:
+        return {}
+
+
+def _ensure_validator(schema: Dict[str, Any] | None):
+    if Draft202012Validator is None or not isinstance(schema, dict) or not schema:
+        return None
+    try:
+        return Draft202012Validator(schema)
+    except Exception:
+        return None
+
+
+def _validate_schema(validator, payload: Any) -> Tuple[bool, str]:
+    if validator is None:
+        # Best-effort fallback when jsonschema is unavailable.
+        return True, ""
+    try:
+        errors = sorted(validator.iter_errors(payload), key=lambda e: list(e.path))
+    except Exception as exc:
+        return False, f"validator_failed:{type(exc).__name__}"
+    if not errors:
+        return True, ""
+    err = errors[0]
+    try:
+        path = ".".join([str(x) for x in err.path]) if getattr(err, "path", None) else ""
+    except Exception:
+        path = ""
+    return False, f"{path}:{getattr(err, 'message', 'schema_validation_failed')}"
+
+
+def _wp6_preferences_validator():
+    global _wp6_prefs_validator
+    if _wp6_prefs_validator is not None:
+        return _wp6_prefs_validator
+    schema = _load_schema_file(
+        os.path.join("docs", "workflow", "wp6_context_builder", "preferences.schema.v1.json")
+    )
+    _wp6_prefs_validator = _ensure_validator(schema or _WP6_PREFERENCES_SCHEMA_FALLBACK)
+    return _wp6_prefs_validator
+
+
+def _wp6_context_pack_legacy_validator():
+    global _wp6_pack_legacy_validator
+    if _wp6_pack_legacy_validator is not None:
+        return _wp6_pack_legacy_validator
+    _wp6_pack_legacy_validator = _ensure_validator(_WP6_CONTEXT_PACK_SCHEMA_LEGACY)
+    return _wp6_pack_legacy_validator
+
+
+def _wp6_context_builder_input_validator():
+    global _wp6_builder_input_validator
+    if _wp6_builder_input_validator is not None:
+        return _wp6_builder_input_validator
+    _wp6_builder_input_validator = _ensure_validator(_WP6_CONTEXT_BUILDER_INPUT_SCHEMA)
+    return _wp6_builder_input_validator
+
+
+def _wp6_default_preferences() -> Dict[str, Any]:
+    return {
+        "schema_version": "omniflow.wp6.preferences.v1",
+        "updated_utc": datetime.datetime.utcnow().isoformat() + "Z",
+        "brevity": "medium",
+        "fast_mode": False,
+        "allowed_reads": [],
+        "disable_history_reads": False,
+    }
+
+
+def _wp6_validate_preferences(prefs: Any) -> Tuple[bool, str]:
+    if not isinstance(prefs, dict):
+        return False, "not_an_object"
+    # Validate against the published schema (or fallback).
+    return _validate_schema(_wp6_preferences_validator(), prefs)
+
+
+def _wp6_validate_context_pack(pack: Any) -> Tuple[bool, str]:
+    if not isinstance(pack, dict):
+        return False, "not_an_object"
+    return _validate_schema(_wp6_context_pack_legacy_validator(), pack)
+
+
+def _wp6_validate_context_builder_input(cb_input: Any) -> Tuple[bool, str]:
+    if not isinstance(cb_input, dict):
+        return False, "not_an_object"
+    return _validate_schema(_wp6_context_builder_input_validator(), cb_input)
+
+
 def _load_preferences(user_id: str) -> Dict[str, Any]:
     """
     Load users/{user_id}/semantics/preferences.json (best-effort).
@@ -193,6 +378,34 @@ def _load_preferences(user_id: str) -> Dict[str, Any]:
                     _best_effort_debug("prefs_json_parse_failed", user_id=uid, error=exc)
                     prefs = {}
             if isinstance(prefs, dict):
+                ok, reason = _wp6_validate_preferences(prefs)
+                if not ok:
+                    _best_effort_debug(
+                        "prefs_schema_invalid",
+                        user_id=uid,
+                        reason=reason,
+                    )
+                    if WP6_PREFERENCES_AUTO_CREATE:
+                        default_prefs = _wp6_default_preferences()
+                        try:
+                            _inprocess_upload_data_or_file(
+                                uid, "semantics/preferences.json", default_prefs
+                            )
+                            if PREFERENCES_CACHE_TTL_SECONDS > 0:
+                                with CACHE_LOCK:
+                                    _prefs_cache[uid] = {
+                                        "data": default_prefs,
+                                        "ts": time.time(),
+                                    }
+                            return default_prefs
+                        except Exception as exc:
+                            _best_effort_debug(
+                                "prefs_autocreate_failed",
+                                user_id=uid,
+                                error=exc,
+                            )
+                    return {}
+
                 if PREFERENCES_CACHE_TTL_SECONDS > 0:
                     with CACHE_LOCK:
                         _prefs_cache[uid] = {"data": prefs, "ts": time.time()}
@@ -201,14 +414,7 @@ def _load_preferences(user_id: str) -> Dict[str, Any]:
         if WP6_PREFERENCES_AUTO_CREATE and isinstance(payload, dict) and payload.get("error"):
             err_text = str(payload.get("error") or "").lower()
             if "not found" in err_text or "blobnotfound" in err_text:
-                default_prefs = {
-                    "schema_version": "omniflow.wp6.preferences.v1",
-                    "updated_utc": datetime.datetime.utcnow().isoformat() + "Z",
-                    "brevity": "medium",
-                    "fast_mode": False,
-                    "allowed_reads": [],
-                    "disable_history_reads": False,
-                }
+                default_prefs = _wp6_default_preferences()
                 try:
                     _inprocess_upload_data_or_file(uid, "semantics/preferences.json", default_prefs)
                     if PREFERENCES_CACHE_TTL_SECONDS > 0:
@@ -1372,10 +1578,13 @@ def _wp6_build_or_reuse_context_pack(
             if isinstance(pack_payload, dict) and pack_payload.get("status") == "success":
                 pack = pack_payload.get("data")
                 if isinstance(pack, dict):
-                    meta["pack_reused"] = True
-                    meta["pack_path"] = pack_path_cached
-                    meta["pack_tokens_est"] = int(pack.get("pack_tokens_est") or 0)
-                    return json.dumps(pack, ensure_ascii=False), meta
+                    ok_pack, reason = _wp6_validate_context_pack(pack)
+                    if ok_pack:
+                        meta["pack_reused"] = True
+                        meta["pack_path"] = pack_path_cached
+                        meta["pack_tokens_est"] = int(pack.get("pack_tokens_est") or 0)
+                        return json.dumps(pack, ensure_ascii=False), meta
+                    meta["pack_cache_invalid"] = reason
         except Exception as exc:
             _best_effort_debug(
                 "context_pack_cache_fetch_failed",
@@ -1400,6 +1609,12 @@ def _wp6_build_or_reuse_context_pack(
         "constraints": {"max_pack_tokens": WP6_DEEP_MAX_PACK_TOKENS, "max_bullets": 6, "max_top_sources": 5},
     }
 
+    ok_in, reason = _wp6_validate_context_builder_input(cb_input)
+    if not ok_in:
+        meta["error"] = "invalid_context_builder_input_schema"
+        meta["validation_error"] = reason
+        return "", meta
+
     cb_kwargs: Dict[str, Any] = {
         "prompt": {"id": OPENAI_CONTEXT_BUILDER_PROMPT_ID},
         # Responses API requires `input` to be a string or array of input items; provide JSON as a string.
@@ -1414,10 +1629,10 @@ def _wp6_build_or_reuse_context_pack(
     except Exception as exc:
         _best_effort_debug("context_pack_json_parse_failed", user_id=str(user_id), thread_id=str(thread_id), error=exc)
         pack = {}
-    # Accept the configured schema (mode, summary, bullets, top_sources, pack_tokens_est, coverage, need_more_sources, created_utc)
-    required_keys = ("mode", "summary", "bullets", "top_sources", "pack_tokens_est", "coverage", "need_more_sources", "created_utc")
-    if not isinstance(pack, dict) or any(k not in pack for k in required_keys):
+    ok_pack, reason = _wp6_validate_context_pack(pack)
+    if not ok_pack:
         meta["error"] = "invalid_context_pack_output_schema"
+        meta["validation_error"] = reason
         return "", meta
 
     try:
@@ -1860,6 +2075,146 @@ def _save_handles(user_id: str, handles: Dict[str, Any], async_save: bool = Fals
         pass
 
 
+RUN_PROGRESS_MAX_EVENTS = int(os.environ.get("RUN_PROGRESS_MAX_EVENTS", "25") or 25)
+RUN_PROGRESS_MIN_WRITE_INTERVAL_S = float(os.environ.get("RUN_PROGRESS_MIN_WRITE_INTERVAL_S", "0.35") or 0.35)
+_RUN_PROGRESS_LOCK = threading.Lock()
+_run_progress_last_write_s: Dict[str, float] = {}
+
+
+def _utc_now_iso() -> str:
+    return datetime.datetime.utcnow().isoformat() + "Z"
+
+
+def _get_run_progress(handles: Dict[str, Any], thread_id: str) -> Dict[str, Any] | None:
+    if not (isinstance(handles, dict) and thread_id):
+        return None
+    state = handles.get(thread_id)
+    if not isinstance(state, dict):
+        return None
+    rp = state.get("run_progress")
+    return rp if isinstance(rp, dict) else None
+
+
+def _update_run_progress_in_handles(
+    *,
+    handles: Dict[str, Any],
+    user_id: str,
+    thread_id: str,
+    run_id: str,
+    trace_id: str,
+    status: str,
+    stage: str,
+    message: str,
+    tool_name: str = "",
+) -> Dict[str, Any] | None:
+    """
+    Store a minimal "quasi streaming" milestone state in `handles.json` under:
+      handles[thread_id]["run_progress"].
+    """
+    if not (isinstance(handles, dict) and thread_id):
+        return None
+    thread_state = handles.get(thread_id, {}) if isinstance(handles.get(thread_id), dict) else {}
+    prev = thread_state.get("run_progress") if isinstance(thread_state.get("run_progress"), dict) else {}
+    prev_events = prev.get("events") if isinstance(prev.get("events"), list) else []
+
+    try:
+        seq = int(prev.get("seq") or 0) + 1
+    except Exception:
+        seq = 1
+
+    ts_utc = _utc_now_iso()
+    event = {
+        "seq": seq,
+        "ts_utc": ts_utc,
+        "status": str(status or ""),
+        "stage": str(stage or ""),
+        "message": str(message or ""),
+        **({"tool": str(tool_name)} if tool_name else {}),
+    }
+    events = [e for e in prev_events if isinstance(e, dict)]
+    events.append(event)
+    if RUN_PROGRESS_MAX_EVENTS > 0 and len(events) > RUN_PROGRESS_MAX_EVENTS:
+        events = events[-RUN_PROGRESS_MAX_EVENTS:]
+
+    rp = {
+        "schema_version": "omniflow.run_progress.v1",
+        "user_id": str(user_id or ""),
+        "thread_id": str(thread_id or ""),
+        "run_id": str(run_id or ""),
+        "trace_id": str(trace_id or ""),
+        "status": str(status or ""),
+        "stage": str(stage or ""),
+        "message": str(message or ""),
+        "seq": seq,
+        "ts_utc": ts_utc,
+        "events": events,
+    }
+
+    handles[thread_id] = {
+        **thread_state,
+        "run_progress": rp,
+        "updated_at": ts_utc,
+    }
+    return rp
+
+
+def _emit_run_progress(
+    *,
+    user_id: str,
+    thread_id: str,
+    run_id: str,
+    trace_id: str = "",
+    status: str,
+    stage: str,
+    message: str,
+    tool_name: str = "",
+    async_save: bool = True,
+    handles: Dict[str, Any] | None = None,
+) -> Dict[str, Any] | None:
+    """Best-effort progress emitter; never raises."""
+    uid = str(user_id or "").strip()
+    tid = str(thread_id or "").strip()
+    if not (uid and tid):
+        return None
+
+    now_s = time.time()
+    key = f"{uid}:{tid}"
+    try:
+        with _RUN_PROGRESS_LOCK:
+            last = float(_run_progress_last_write_s.get(key) or 0.0)
+            if (now_s - last) < RUN_PROGRESS_MIN_WRITE_INTERVAL_S:
+                return None
+            _run_progress_last_write_s[key] = now_s
+    except Exception:
+        pass
+
+    try:
+        local_handles = handles if isinstance(handles, dict) else _load_handles(uid)
+        rp = _update_run_progress_in_handles(
+            handles=local_handles,
+            user_id=uid,
+            thread_id=tid,
+            run_id=str(run_id or ""),
+            trace_id=str(trace_id or ""),
+            status=status,
+            stage=stage,
+            message=message,
+            tool_name=tool_name,
+        )
+        if isinstance(local_handles, dict):
+            _save_handles(uid, local_handles, async_save=async_save)
+        return rp
+    except Exception as exc:
+        _best_effort_debug(
+            "emit_run_progress_failed",
+            user_id=uid,
+            thread_id=tid,
+            error=exc,
+            stage=stage,
+        )
+        return None
+
+
 def _extract_response_function_calls(response: Any) -> list:
     calls = []
     for item in (getattr(response, "output", None) or []):
@@ -1937,6 +2292,8 @@ def run_responses(
     *,
     persist_handles: bool = True,
     recent_turns: list[str] | None = None,
+    run_id: str = "",
+    trace_id: str = "",
 ) -> Tuple[str, list, Dict[str, Any], str]:
     """Responses API deterministic tool loop using a Prompt ID (dual-runtime mode)."""
     if not thread_id:
@@ -2113,6 +2470,18 @@ def run_responses(
         for call in function_calls:
             name = call.get("name") or ""
             args = _safe_load_json(call.get("arguments") or "")
+            _emit_run_progress(
+                user_id=user_id,
+                thread_id=thread_id,
+                run_id=str(run_id or ""),
+                trace_id=str(trace_id or ""),
+                status="in_progress",
+                stage="calling_tools",
+                message=f"Calling tool: {name}",
+                tool_name=str(name or ""),
+                async_save=True,
+                handles=handles if isinstance(handles, dict) else None,
+            )
             result_str, info = execute_tool_call(name, args, user_id)
             info = dict(info or {})
             info["call_id"] = call.get("call_id")
@@ -2657,7 +3026,7 @@ def finalize_response(
         logging.debug("Failed to emit concise interaction summary")
 
     if log_interaction:
-        save_interaction_log(
+        save_interaction_log_inprocess(
             user_id=user_id,
             user_message=user_message,
             assistant_response=assistant_response,
@@ -2744,7 +3113,46 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
     except Exception as exc:
         _best_effort_debug("preferences_enforcement_failed", user_id=str(user_id), error=exc, tool_name=tool_name)
 
-    # Try in-process dispatch first
+    # Phase 2: Try registry-driven dispatch first (if available)
+    if REGISTRY_DISPATCH_AVAILABLE:
+        try:
+            context = {"trace_id": f"tool-{tool_name}-{user_id[:8]}"}
+            result = registry_dispatch(
+                tool_name=tool_name,
+                params=normalized_args,
+                user_id=user_id,
+                context=context
+            )
+            duration_ms = (time.time() - start_time) * 1000
+            
+            # Handle registry dispatch response
+            if result.get("status") == "error":
+                # Error from registry dispatch
+                info = {
+                    "tool_name": tool_name,
+                    "arguments": dispatch_args,
+                    "status": "failed",
+                    "duration_ms": duration_ms,
+                    "error": result.get("error", "Unknown error"),
+                    "code": result.get("code", "INTERNAL_ERROR"),
+                }
+                return json.dumps(result), info
+            else:
+                # Success from registry dispatch
+                info = {
+                    "tool_name": tool_name,
+                    "arguments": dispatch_args,
+                    "result": result.get("result", result),
+                    "status": "success",
+                    "duration_ms": duration_ms
+                }
+                logging.info(f"Tool {tool_name} OK via registry dispatch in {duration_ms:.1f}ms")
+                # Return the result payload (unwrap if needed)
+                return json.dumps(result.get("result", result)), info
+        except Exception as e:
+            logging.warning(f"Registry dispatch failed for {tool_name}: {e}. Falling back to legacy dispatch.")
+    
+    # Fallback: Try legacy in-process dispatch
     try:
         from tools import dispatch_tool
         inprocess_args = dict(dispatch_args or {})
@@ -2773,6 +3181,26 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
             "update_data_entry": ["target_blob_name", "find_key", "find_value", "update_key", "update_value"],
             "upload_data_or_file": ["target_blob_name", "file_content"],
         }
+
+        # Prefer catalog-driven allowlists when available (keeps tool routing
+        # aligned with AGENT_FUNCTIONS_CATALOG.json).
+        try:
+            from shared.agent_functions_catalog import allowed_fields_for_tool
+
+            manifest_fields = [
+                field
+                for field in allowed_fields_for_tool(tool_name)
+                if field and field != "user_id"
+            ]
+            if manifest_fields:
+                DATA_EXTRACTION_REQUIRED[tool_name] = manifest_fields
+        except Exception as exc:
+            _best_effort_debug(
+                "agent_functions_catalog_load_failed",
+                user_id=str(user_id),
+                error=exc,
+                tool_name=tool_name,
+            )
 
         # Only include user_id for tool_call_handler (if enforced)
         include_user_id = tool_name == "tool_call_handler"
@@ -2994,6 +3422,36 @@ def save_interaction_log(user_id: str, user_message: str, assistant_response: st
         logging.warning(f"save_interaction_log failed: {e}")
 
 
+def save_interaction_log_inprocess(
+    user_id: str,
+    user_message: str,
+    assistant_response: str,
+    thread_id: str,
+    tool_calls_info: list,
+):
+    if not ENABLE_SAVE_INTERACTION:
+        return
+
+    def _fire_and_forget():
+        try:
+            from save_interaction.service import save_interaction_entry
+
+            result = save_interaction_entry(
+                user_id=str(user_id),
+                user_message=str(user_message or ""),
+                assistant_response=str(assistant_response or ""),
+                thread_id=str(thread_id or "") if thread_id is not None else None,
+                tool_calls=tool_calls_info or [],
+                metadata={"assistant_id": ASSISTANT_ID, "source": "tool_call_handler"},
+            )
+            if DEBUG_TOOL_CALL_HANDLER:
+                logging.debug(f"[DEBUG] save_interaction in-process result={_redact_sensitive(result)}")
+        except Exception as exc:
+            logging.warning(f"save_interaction_log failed (in-process): {exc}")
+
+    threading.Thread(target=_fire_and_forget, daemon=True).start()
+
+
 def main(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("=" * 60)
     logging.info("TOOL_CALL_HANDLER start")
@@ -3017,12 +3475,32 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         action = body.get("action")
         params = body.get("params", {})
         log_interaction = bool(body.get("log_interaction", True))
+        trace_id = str(body.get("trace_id") or "").strip()
 
         # Direct actions bypass agent/tool loop
         if action in ["save_interaction", "get_interaction_history"]:
             resp_direct = handle_direct_actions(req, body, action, user_id)
             if resp_direct is not None:
                 return resp_direct
+
+        if action == "get_run_progress":
+            if not user_id:
+                return _make_response({"error": "user_id is required", "action": action}, status_code=400)
+            if not thread_id:
+                return _make_response({"error": "thread_id is required", "action": action}, status_code=400)
+            handles = _load_handles(str(user_id))
+            rp = _get_run_progress(handles if isinstance(handles, dict) else {}, str(thread_id))
+            return _make_response(
+                {
+                    "status": "success",
+                    "action": action,
+                    "user_id": str(user_id),
+                    "thread_id": str(thread_id),
+                    "has_progress": bool(isinstance(rp, dict) and rp),
+                    "run_progress": rp or {},
+                },
+                status_code=200,
+            )
 
         if action in ["wp7_prepare_audit", "wp7_run_audit"]:
             if not user_id:
@@ -3212,6 +3690,17 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 wp6_meta: Dict[str, Any] = {}
                 if not thread_id:
                     thread_id = f"handle_{uuid.uuid4().hex[:12]}"
+                run_id = uuid.uuid4().hex[:12]
+                _emit_run_progress(
+                    user_id=str(user_id),
+                    thread_id=str(thread_id),
+                    run_id=run_id,
+                    trace_id=trace_id,
+                    status="in_progress",
+                    stage="grasping_context",
+                    message="Starting: building context",
+                    async_save=True,
+                )
 
                 recent_turns = _wp6_update_recent_user_turns(user_id, str(thread_id), user_message)
                 recent_block = _wp6_format_recent_turns(recent_turns)
@@ -3405,6 +3894,16 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         mode_reason = "deep_skipped_insufficient_inputs"
                         model_input_message = fast_input_message
 
+                _emit_run_progress(
+                    user_id=str(user_id),
+                    thread_id=str(thread_id),
+                    run_id=run_id,
+                    trace_id=trace_id,
+                    status="in_progress",
+                    stage=("looking_more_data" if mode_initial == "DEEP" else "grasping_context"),
+                    message=("Routing to DEEP" if mode_initial == "DEEP" else "Routing to FAST"),
+                    async_save=True,
+                )
                 assistant_response, all_tool_calls, responses_meta, thread_id = run_responses(
                     openai_client=openai_client,
                     user_id=user_id,
@@ -3412,6 +3911,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     thread_id=thread_id,
                     persist_handles=persist_in_run,
                     recent_turns=recent_turns,
+                    run_id=run_id,
+                    trace_id=trace_id,
                 )
 
                 # Phase 2 (AUTO only): parse FAST response signal and optionally escalate to DEEP once.
@@ -3430,6 +3931,16 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                             deep_input_message, pack_meta = _build_deep_input_message()
                             wp6_meta.update(pack_meta)
                             if deep_input_message:
+                                _emit_run_progress(
+                                    user_id=str(user_id),
+                                    thread_id=str(thread_id),
+                                    run_id=run_id,
+                                    trace_id=trace_id,
+                                    status="in_progress",
+                                    stage="looking_more_data",
+                                    message="Escalating: building DEEP context",
+                                    async_save=True,
+                                )
                                 mode_used = "DEEP"
                                 mode_reason = "agent_need_deep"
                                 wp6_meta["routing"]["escalated"] = True
@@ -3441,6 +3952,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                                     thread_id=thread_id,
                                     persist_handles=persist_in_run,
                                     recent_turns=recent_turns,
+                                    run_id=run_id,
+                                    trace_id=trace_id,
                                 )
                                 deep_signal, deep_cleaned = _wp6_parse_need_deep_signal(deep_resp or "")
                                 wp6_meta["need_deep_signal_deep"] = deep_signal
@@ -3557,6 +4070,16 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     responses_meta["wp6"] = wp6_meta
             except Exception:
                 pass
+            _emit_run_progress(
+                user_id=str(user_id),
+                thread_id=str(thread_id),
+                run_id=run_id,
+                trace_id=trace_id,
+                status="completed",
+                stage="done",
+                message="Done",
+                async_save=False,
+            )
             return finalize_response(
                 openai_client=openai_client,
                 thread_id=thread_id,
