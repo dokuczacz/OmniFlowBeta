@@ -131,3 +131,6 @@ docs/shared/*
 /COMMIT_INSTRUCTIONS.txt
 /IMPLEMENTER_AGENT.md
 headers.txt
+
+# Generated agent catalog (source of truth: backend/shared/tool_specs.py)
+AGENT_FUNCTIONS_CATALOG.json
