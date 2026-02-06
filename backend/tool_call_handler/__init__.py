@@ -49,6 +49,13 @@ except Exception:
 from shared.http_client import requests_get, requests_post
 from shared.mock_agent import build_mock_agent_response, mock_marker, mock_user_id
 
+# Phase 2: Import registry-driven dispatch pipeline
+try:
+    from tool_call_handler.dispatch import dispatch_tool_call as registry_dispatch
+    REGISTRY_DISPATCH_AVAILABLE = True
+except ImportError:
+    REGISTRY_DISPATCH_AVAILABLE = False
+
 # Config
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 ASSISTANT_ID = os.environ.get("OPENAI_ASSISTANT_ID", "")
@@ -3106,7 +3113,46 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
     except Exception as exc:
         _best_effort_debug("preferences_enforcement_failed", user_id=str(user_id), error=exc, tool_name=tool_name)
 
-    # Try in-process dispatch first
+    # Phase 2: Try registry-driven dispatch first (if available)
+    if REGISTRY_DISPATCH_AVAILABLE:
+        try:
+            context = {"trace_id": f"tool-{tool_name}-{user_id[:8]}"}
+            result = registry_dispatch(
+                tool_name=tool_name,
+                params=normalized_args,
+                user_id=user_id,
+                context=context
+            )
+            duration_ms = (time.time() - start_time) * 1000
+            
+            # Handle registry dispatch response
+            if result.get("status") == "error":
+                # Error from registry dispatch
+                info = {
+                    "tool_name": tool_name,
+                    "arguments": dispatch_args,
+                    "status": "failed",
+                    "duration_ms": duration_ms,
+                    "error": result.get("error", "Unknown error"),
+                    "code": result.get("code", "INTERNAL_ERROR"),
+                }
+                return json.dumps(result), info
+            else:
+                # Success from registry dispatch
+                info = {
+                    "tool_name": tool_name,
+                    "arguments": dispatch_args,
+                    "result": result.get("result", result),
+                    "status": "success",
+                    "duration_ms": duration_ms
+                }
+                logging.info(f"Tool {tool_name} OK via registry dispatch in {duration_ms:.1f}ms")
+                # Return the result payload (unwrap if needed)
+                return json.dumps(result.get("result", result)), info
+        except Exception as e:
+            logging.warning(f"Registry dispatch failed for {tool_name}: {e}. Falling back to legacy dispatch.")
+    
+    # Fallback: Try legacy in-process dispatch
     try:
         from tools import dispatch_tool
         inprocess_args = dict(dispatch_args or {})
