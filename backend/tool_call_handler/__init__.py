@@ -60,6 +60,7 @@ except ImportError:
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 ASSISTANT_ID = os.environ.get("OPENAI_ASSISTANT_ID", "")
 OPENAI_PROMPT_ID = os.environ.get("OPENAI_PROMPT_ID", "")
+OPENAI_PROMPT_VERSION = str(os.environ.get("OPENAI_PROMPT_VERSION", "") or "").strip()
 OPENAI_RUNTIME_INSTRUCTIONS = os.environ.get(
     "OPENAI_RUNTIME_INSTRUCTIONS",
     (
@@ -117,6 +118,9 @@ _prefs_loading = threading.local()
 WP6_FAST_MAX_INPUT_TOKENS = int(os.environ.get("WP6_FAST_MAX_INPUT_TOKENS", "2000") or 2000)
 WP6_FAST_MAX_SOURCES = int(os.environ.get("WP6_FAST_MAX_SOURCES", "4") or 4)
 WP6_FAST_MAX_RAW_BYTES = int(os.environ.get("WP6_FAST_MAX_RAW_BYTES", "64000") or 64000)
+WP6_AUTO_DEEP_COMPLEXITY_THRESHOLD = int(
+    os.environ.get("WP6_AUTO_DEEP_COMPLEXITY_THRESHOLD", "35") or 35
+)
 WP6_DEEP_MAX_PACK_TOKENS = int(os.environ.get("WP6_DEEP_MAX_PACK_TOKENS", "16000") or 16000)
 WP6_DEEP_MAX_CANDIDATE_SOURCES = int(os.environ.get("WP6_DEEP_MAX_CANDIDATE_SOURCES", "12") or 12)
 WP6_DEEP_MIN_SEMANTIC_SELECTED = int(os.environ.get("WP6_DEEP_MIN_SEMANTIC_SELECTED", "3") or 3)
@@ -124,6 +128,9 @@ WP6_DEEP_MIN_SEMANTIC_CANDIDATES = int(os.environ.get("WP6_DEEP_MIN_SEMANTIC_CAN
 WP6_CONTEXT_PACK_TTL_SECONDS = int(os.environ.get("WP6_CONTEXT_PACK_TTL_SECONDS", "300") or 300)
 WP6_DEEP_COOLDOWN_SECONDS = int(os.environ.get("WP6_DEEP_COOLDOWN_SECONDS", "600") or 600)
 OPENAI_CONTEXT_BUILDER_PROMPT_ID = os.environ.get("OPENAI_CONTEXT_BUILDER_PROMPT_ID", "")
+OPENAI_CONTEXT_BUILDER_PROMPT_VERSION = str(
+    os.environ.get("OPENAI_CONTEXT_BUILDER_PROMPT_VERSION", "") or ""
+).strip()
 
 def _best_effort_debug(code: str, *, user_id: str = "", thread_id: str = "", error: Exception | None = None, **ctx: Any) -> None:
     logger = logging.getLogger()
@@ -538,6 +545,60 @@ def _wp6_allowed_to_read(tool_name: str, normalized_args: Dict[str, Any], prefs:
 
 def _wp6_est_tokens_from_text(text: str) -> int:
     return int((len(text or "") + 3) // 4)
+
+
+def _wp6_analyze_query_complexity_local(message: str) -> Dict[str, Any]:
+    """Lightweight complexity heuristic without importing wp6/routing."""
+    text = str(message or "")
+    words = text.split()
+    word_count = len(words)
+    has_question_marks = "?" in text
+    sentences = [
+        s.strip()
+        for s in text.replace("?", ".").replace("!", ".").split(".")
+        if s.strip()
+    ]
+    has_multi_part = len(sentences) > 1
+    technical_terms = (
+        "analyze",
+        "compare",
+        "explain",
+        "detail",
+        "comprehensive",
+        "complex",
+        "relationship",
+        "pattern",
+        "trend",
+        "summarize",
+        "integrate",
+        "correlation",
+        "implication",
+        "evaluate",
+    )
+    text_lower = text.lower()
+    technical_keywords = sum(1 for term in technical_terms if term in text_lower)
+
+    complexity_score = 0
+    if word_count > 50:
+        complexity_score += 30
+    elif word_count > 30:
+        complexity_score += 20
+    elif word_count > 15:
+        complexity_score += 10
+    if has_multi_part:
+        complexity_score += 25
+    complexity_score += min(technical_keywords * 10, 30)
+    if has_question_marks:
+        question_count = text.count("?")
+        complexity_score += 15 if question_count > 2 else (10 if question_count > 1 else 5)
+
+    return {
+        "word_count": word_count,
+        "has_question_marks": has_question_marks,
+        "has_multi_part": has_multi_part,
+        "technical_keywords": technical_keywords,
+        "complexity_score": min(complexity_score, 100),
+    }
 
 
 def _wp6_norm_intent_key(user_message: str) -> str:
@@ -1526,11 +1587,28 @@ def _wp6_route_context_mode(body: Dict[str, Any], user_message: str) -> Tuple[st
         requested = "AUTO"
 
     est_prompt_tokens = _wp6_est_tokens_from_text(user_message or "")
+    msg_norm = str(user_message or "").strip().lower()
+    recap_markers = (
+        "co robiliśmy",
+        "co robilismy",
+        "podsumuj",
+        "summary of our chat",
+        "summarize our chat",
+        "session recap",
+        "what did we do",
+    )
+
+    complexity = _wp6_analyze_query_complexity_local(user_message or "")
+    complexity_score = int(complexity.get("complexity_score") or 0)
+    has_multi_part = bool(complexity.get("has_multi_part"))
+
     meta = {
         "context_mode_requested": requested,
         "context_mode_source": ("request" if requested_raw else "env_default"),
         "prompt_chars": len(user_message or ""),
         "prompt_tokens_est": est_prompt_tokens,
+        "complexity_score": complexity_score,
+        "has_multi_part": has_multi_part,
     }
 
     if requested == "DEEP":
@@ -1538,7 +1616,13 @@ def _wp6_route_context_mode(body: Dict[str, Any], user_message: str) -> Tuple[st
     if requested == "FAST":
         return "FAST", "explicit", meta
 
-    # AUTO is always FAST (for now).
+    if any(marker in msg_norm for marker in recap_markers):
+        return "DEEP", "auto_session_recap", meta
+    if est_prompt_tokens > int(WP6_FAST_MAX_INPUT_TOKENS or 0):
+        return "DEEP", "auto_exceeds_fast_tokens", meta
+    if complexity_score >= int(WP6_AUTO_DEEP_COMPLEXITY_THRESHOLD or 35) and has_multi_part:
+        return "DEEP", "auto_complex_query", meta
+
     return "FAST", "auto_fast", meta
 
 
@@ -1624,8 +1708,12 @@ def _wp6_build_or_reuse_context_pack(
         meta["validation_error"] = reason
         return "", meta
 
+    cb_prompt_payload: Dict[str, Any] = {"id": OPENAI_CONTEXT_BUILDER_PROMPT_ID}
+    if OPENAI_CONTEXT_BUILDER_PROMPT_VERSION:
+        cb_prompt_payload["version"] = OPENAI_CONTEXT_BUILDER_PROMPT_VERSION
+
     cb_kwargs: Dict[str, Any] = {
-        "prompt": {"id": OPENAI_CONTEXT_BUILDER_PROMPT_ID},
+        "prompt": cb_prompt_payload,
         # Responses API requires `input` to be a string or array of input items; provide JSON as a string.
         "input": json.dumps(cb_input, ensure_ascii=False),
         "max_output_tokens": min(WP6_DEEP_MAX_PACK_TOKENS, 8192),
@@ -2385,8 +2473,11 @@ def run_responses(
     recent_turns_buffer: list[str] = list(recent_turns or [])
 
     for iteration in range(25):
+        prompt_payload: Dict[str, Any] = {"id": OPENAI_PROMPT_ID}
+        if OPENAI_PROMPT_VERSION:
+            prompt_payload["version"] = OPENAI_PROMPT_VERSION
         create_kwargs: Dict[str, Any] = {
-            "prompt": {"id": OPENAI_PROMPT_ID},
+            "prompt": prompt_payload,
             "instructions": OPENAI_RUNTIME_INSTRUCTIONS,
             "input": current_input,
             "tool_choice": "auto",

@@ -44,17 +44,21 @@ Copy-paste this catalog when provisioning Azure App Service settings or local `.
 | `OPENAI_API_KEY` | `<secret>` | Primary OpenAI or Azure OpenAI key. |
 | `OPENAI_ASSISTANT_ID` | `<secret>` | Set when invoking Responses. |
 | `OPENAI_PROMPT_ID` | `<secret>` | Default response prompt. |
+| `OPENAI_PROMPT_VERSION` | `<optional>` | Optional pinned prompt version for deterministic runtime behavior. |
 | `OPENAI_INDEXER_PROMPT_ID` | `<secret>` | Prompt used for WP7 batch indexing. |
 | `OPENAI_INDEXER_MODEL` | `gpt-5-mini` | Model that produces semantic artifacts. |
 | `OPENAI_CONTEXT_BUILDER_PROMPT_ID` | `pmpt_6952...` | Prompt driving the WP6 context builder. |
+| `OPENAI_CONTEXT_BUILDER_PROMPT_VERSION` | `<optional>` | Optional pinned version for WP6 context builder prompt. |
 | `OPENAI_VECTOR_STORE_ID` | `<optional>` | Required only when using your own vector store. |
 | `OPENAI_API_BASE` | `https://api.openai.com` | Override when hitting Azure OpenAI or proxied endpoints. |
 | `LLM_RUNTIME` | `assistants` | Determines Responses runtime. |
 | `RESPONSES_INCLUDE_TOOLS` | `true` | Allows response loops to call tools. |
 | `WP6_DEFAULT_CONTEXT_MODE` | `AUTO` | Auto / FAST / DEEP. |
+| `WP6_RESPONSES_STATELESS` | `false` | Use stateless Responses flow; recommended `true` after prompt switch validation. |
 | `WP6_FAST_MAX_INPUT_TOKENS` | `2000` | FAST routing token cap. |
 | `WP6_FAST_MAX_SOURCES` | `4` | FAST source limit. |
 | `WP6_FAST_MAX_RAW_BYTES` | `64000` | Raw bytes allowed per FAST pack. |
+| `WP6_AUTO_DEEP_COMPLEXITY_THRESHOLD` | `35` | AUTO mode threshold for routing complex multi-part queries to DEEP. |
 | `WP6_DEEP_MAX_PACK_TOKENS` | `16000` | Max tokens for DEEP pack. |
 | `WP6_DEEP_MAX_CANDIDATE_SOURCES` | `12` | Candidate docs per DEEP run. |
 | `WP6_DEEP_MIN_SEMANTIC_SELECTED` | `3` | Minimum to include semantic doc. |

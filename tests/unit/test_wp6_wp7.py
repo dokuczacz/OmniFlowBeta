@@ -36,6 +36,25 @@ def test_wp6_route_context_mode_variants():
     assert meta["context_mode_requested"] == "AUTO"
 
 
+def test_wp6_route_context_mode_auto_session_recap_is_deep():
+    mode, source, meta = handler._wp6_route_context_mode({}, "Podsumuj co robiliśmy w tej sesji.")
+    assert mode == "DEEP"
+    assert source == "auto_session_recap"
+    assert meta["context_mode_requested"] == "AUTO"
+
+
+def test_wp6_route_context_mode_auto_complex_query_is_deep():
+    msg = (
+        "Can you analyze the relationship between retention patterns and seasonal trends? "
+        "Please provide a comprehensive comparison of quarterly outcomes. "
+        "Explain implications and evaluate strategic options in detail."
+    )
+    mode, source, meta = handler._wp6_route_context_mode({}, msg)
+    assert mode == "DEEP"
+    assert source in ("auto_complex_query", "auto_exceeds_fast_tokens")
+    assert meta["complexity_score"] >= 50 or meta["prompt_tokens_est"] > handler.WP6_FAST_MAX_INPUT_TOKENS
+
+
 def test_wp6_norm_intent_key_stable_hash():
     base = "  Repeat   this   sentence "
     key1 = handler._wp6_norm_intent_key(base)
@@ -149,3 +168,41 @@ def test_wp7_timer_call_indexer_model_uses_schema_and_fallback_output_text():
     assert out and out[0]["interaction_id"] == "INT_X"
     assert seen.get("text", {}).get("format", {}).get("name") == "interaction_items"
     assert seen.get("reasoning", {}).get("effort") == "minimal"
+
+
+def test_run_responses_includes_prompt_version_when_set(monkeypatch):
+    seen = {}
+
+    class FakeResp:
+        id = "resp_test_version"
+        conversation = None
+        output = []
+        output_text = "Reasoning: ok. Summary: ok."
+
+    def fake_openai_call(_fn, **kwargs):
+        seen.update(kwargs)
+        return FakeResp()
+
+    monkeypatch.setattr(handler, "_openai_call", fake_openai_call)
+    monkeypatch.setattr(handler, "_load_handles", lambda _user_id: {})
+    monkeypatch.setattr(handler, "_save_handles", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(handler, "WP6_RESPONSES_STATELESS", True)
+    monkeypatch.setattr(handler, "OPENAI_PROMPT_ID", "pmpt_test")
+    monkeypatch.setattr(handler, "OPENAI_PROMPT_VERSION", "123")
+
+    class FakeResponses:
+        def create(self, **_kwargs):
+            return None
+
+    class FakeOpenAI:
+        responses = FakeResponses()
+
+    final_text, _calls, _meta, _thread = handler.run_responses(
+        openai_client=FakeOpenAI(),
+        user_id="u1",
+        user_message="hello",
+        thread_id="t1",
+    )
+    assert final_text.startswith("Reasoning")
+    assert seen.get("prompt", {}).get("id") == "pmpt_test"
+    assert seen.get("prompt", {}).get("version") == "123"
