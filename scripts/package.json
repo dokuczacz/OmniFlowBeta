@@ -1,0 +1,8 @@
+{
+  "name": "omniflowbeta-scripts",
+  "private": true,
+  "scripts": {
+    "run:local": "python ./run_local.py",
+    "run:local:skip-install": "python ./run_local.py --skip-install"
+  }
+}
