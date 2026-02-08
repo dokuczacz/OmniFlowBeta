@@ -283,6 +283,49 @@ def _catalog_path() -> Path:
     return Path(_repo_root_dir()) / "AGENT_FUNCTIONS_CATALOG.json"
 
 
+def _needs_task_first_mode(user_message: str) -> bool:
+    text = str(user_message or "").strip().lower()
+    if not text:
+        return False
+    triggers = (
+        "co tam mamy",
+        "co nowego",
+        "aktualnos",
+        "aktualiz",
+        "zalegl",
+        "niezrobion",
+        "wracam",
+        "dawno mnie nie bylo",
+        "what's new",
+        "whats new",
+        "updates",
+        "unfinished",
+        "pending tasks",
+    )
+    return any(token in text for token in triggers)
+
+
+def _runtime_instructions_for_turn(user_message: str) -> str:
+    """
+    Build per-turn runtime instructions while staying stateless.
+    """
+    base = str(OPENAI_RUNTIME_INSTRUCTIONS or "").strip()
+    if not _needs_task_first_mode(user_message):
+        return base
+    task_first = (
+        "Task-first policy (personal assistance): "
+        "when the user asks for updates/what is new, check user's own data first via tools "
+        "before asking follow-up questions or giving general news. "
+        "Preferred order: list_blobs(include_meta=true) -> read_blob_file(TM.json if present) "
+        "-> read_blob_file(handles.json) -> read_many_blobs(interactions/index.jsonl or related files). "
+        "If TM.json is missing, explicitly state checked files and continue with closest task-related sources. "
+        "Only provide general world news when user explicitly asks for external news."
+    )
+    if not base:
+        return task_first
+    return f"{base}\n\n{task_first}"
+
+
 def _responses_resolve_tool_source() -> str:
     src = str(OPENAI_RESPONSES_TOOL_SOURCE or "inline").strip().lower()
     if src not in {"inline", "dashboard", "both"}:
@@ -2652,7 +2695,7 @@ def run_responses(
             prompt_payload["version"] = OPENAI_PROMPT_VERSION
         create_kwargs: Dict[str, Any] = {
             "prompt": prompt_payload,
-            "instructions": OPENAI_RUNTIME_INSTRUCTIONS,
+            "instructions": _runtime_instructions_for_turn(str(user_message or "")),
             "input": current_input,
             "tool_choice": "auto",
             "parallel_tool_calls": False,
