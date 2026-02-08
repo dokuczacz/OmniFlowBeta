@@ -32,6 +32,7 @@ from types import SimpleNamespace
 import types as _types
 import threading
 import random
+from pathlib import Path
 
 try:
     from jsonschema import Draft202012Validator
@@ -61,6 +62,11 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 ASSISTANT_ID = os.environ.get("OPENAI_ASSISTANT_ID", "")
 OPENAI_PROMPT_ID = os.environ.get("OPENAI_PROMPT_ID", "")
 OPENAI_PROMPT_VERSION = str(os.environ.get("OPENAI_PROMPT_VERSION", "") or "").strip()
+OPENAI_RESPONSES_TOOL_SOURCE = (
+    str(os.environ.get("OPENAI_RESPONSES_TOOL_SOURCE", "inline") or "inline")
+    .strip()
+    .lower()
+)
 OPENAI_RUNTIME_INSTRUCTIONS = os.environ.get(
     "OPENAI_RUNTIME_INSTRUCTIONS",
     (
@@ -88,7 +94,7 @@ OPENAI_MAX_REQUESTS = int(os.environ.get("OPENAI_MAX_REQUESTS", "0") or 0)
 WP6_DEFAULT_CONTEXT_MODE = (os.environ.get("WP6_DEFAULT_CONTEXT_MODE", "AUTO") or "AUTO").strip().upper()
 WP6_TOPIC_CHANGE_ENABLED = False
 WP6_TOPIC_CHANGE_WINDOW_SECONDS = 0
-WP6_RESPONSES_STATELESS = os.environ.get("WP6_RESPONSES_STATELESS", "").lower() in ("1", "true", "yes")
+WP6_RESPONSES_STATELESS = os.environ.get("WP6_RESPONSES_STATELESS", "true").lower() in ("1", "true", "yes")
 WP6_RECENT_TURNS_MAX = int(os.environ.get("WP6_RECENT_TURNS_MAX", "8") or 8)
 WP6_RECENT_TURNS_MAX_CHARS = int(os.environ.get("WP6_RECENT_TURNS_MAX_CHARS", "320") or 320)
 WP6_FAST_AUDIT_ENABLED = str(os.environ.get("WP6_FAST_AUDIT_ENABLED", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on")
@@ -102,6 +108,7 @@ _openai_lock = threading.Lock()
 _openai_count = 0
 CACHE_LOCK = threading.Lock()
 _handles_cache: Dict[str, Dict[str, Any]] = {}
+_responses_inline_tools_cache: List[Dict[str, Any]] | None = None
 
 # WP6.M1: preferences cache (best-effort; no hard dependency)
 _prefs_cache: Dict[str, Dict[str, Any]] = {}
@@ -270,6 +277,120 @@ _wp6_builder_input_validator = None
 def _repo_root_dir() -> str:
     backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.abspath(os.path.join(backend_dir, ".."))
+
+
+def _catalog_path() -> Path:
+    return Path(_repo_root_dir()) / "AGENT_FUNCTIONS_CATALOG.json"
+
+
+def _responses_resolve_tool_source() -> str:
+    src = str(OPENAI_RESPONSES_TOOL_SOURCE or "inline").strip().lower()
+    if src not in {"inline", "dashboard", "both"}:
+        return "inline"
+    return src
+
+
+def _responses_inline_tools() -> List[Dict[str, Any]]:
+    """
+    Load OpenAI function tools from AGENT_FUNCTIONS_CATALOG.json (cached).
+    """
+    global _responses_inline_tools_cache
+    with CACHE_LOCK:
+        if isinstance(_responses_inline_tools_cache, list):
+            return list(_responses_inline_tools_cache)
+    try:
+        raw = _catalog_path().read_text(encoding="utf-8")
+        payload = json.loads(raw)
+        schemas = payload.get("openai_function_schemas") if isinstance(payload, dict) else None
+        tools: List[Dict[str, Any]] = []
+        if isinstance(schemas, list):
+            for entry in schemas:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name") or "").strip()
+                if not name:
+                    continue
+                strict = bool(entry.get("strict", True))
+                parameters = entry.get("parameters") if isinstance(entry.get("parameters"), dict) else {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": False,
+                }
+                parameters = _normalize_inline_tool_parameters(parameters, strict=strict)
+                tool_obj: Dict[str, Any] = {
+                    "type": "function",
+                    "name": name,
+                    "description": str(entry.get("description") or "").strip(),
+                    "parameters": parameters,
+                    "strict": strict,
+                }
+                tools.append(tool_obj)
+        with CACHE_LOCK:
+            _responses_inline_tools_cache = list(tools)
+        return tools
+    except Exception as exc:
+        _best_effort_debug("responses_inline_tools_load_failed", error=exc)
+        return []
+
+
+def _normalize_inline_tool_parameters(parameters: Dict[str, Any], *, strict: bool) -> Dict[str, Any]:
+    """
+    Normalize function parameters for Responses API strict validation.
+
+    In strict mode, ensure `required` includes all keys from `properties`.
+    """
+    normalized = dict(parameters or {})
+    if str(normalized.get("type") or "").strip().lower() != "object":
+        normalized["type"] = "object"
+    normalized = _normalize_json_schema_tree(normalized, strict=strict)
+    return normalized
+
+
+def _normalize_json_schema_tree(node: Any, *, strict: bool) -> Any:
+    """
+    Recursively normalize JSON Schema nodes for strict tool validation.
+    """
+    if isinstance(node, list):
+        return [_normalize_json_schema_tree(item, strict=strict) for item in node]
+    if not isinstance(node, dict):
+        return node
+
+    out: Dict[str, Any] = dict(node)
+
+    # Recurse known composition/data-carrying keys.
+    for key in ("items", "additionalProperties", "not"):
+        if key in out:
+            out[key] = _normalize_json_schema_tree(out.get(key), strict=strict)
+    for key in ("allOf", "anyOf", "oneOf", "prefixItems"):
+        val = out.get(key)
+        if isinstance(val, list):
+            out[key] = [_normalize_json_schema_tree(item, strict=strict) for item in val]
+    props = out.get("properties")
+    if isinstance(props, dict):
+        out["properties"] = {
+            str(k): _normalize_json_schema_tree(v, strict=strict) for k, v in props.items()
+        }
+    else:
+        props = None
+
+    node_type = str(out.get("type") or "").strip().lower()
+    if node_type == "object" or isinstance(props, dict):
+        if not isinstance(props, dict):
+            props = {}
+            out["properties"] = props
+        required = out.get("required")
+        required_list: List[str] = []
+        if isinstance(required, list):
+            required_list = [str(x) for x in required if isinstance(x, str) and x.strip()]
+        # Responses API function schemas expect an explicit `required` array.
+        # Keep it aligned with declared properties to avoid runtime 400s.
+        required_list = list(dict.fromkeys(list(required_list) + list(props.keys())))
+        out["required"] = required_list
+        # Strict schemas require explicit additionalProperties=false on objects.
+        out["additionalProperties"] = False
+
+    return out
 
 
 def _load_schema_file(relative_path: str) -> Dict[str, Any]:
@@ -2337,6 +2458,19 @@ _INTERNAL_CONTRACT_KEYS = {
     "tests",
 }
 
+_INTERNAL_CONTRACT_MARKERS = {
+    '"name"',
+    '"version"',
+    '"type"',
+    '"runtime"',
+    '"workflow"',
+    '"execution_policy"',
+    '"format_rules"',
+    '"error_handling"',
+    '"output_template"',
+    '"tests"',
+}
+
 
 def _looks_like_internal_contract_payload(text: str) -> bool:
     """Detect accidental prompt/contract dumps returned as user-facing output."""
@@ -2355,12 +2489,46 @@ def _looks_like_internal_contract_payload(text: str) -> bool:
     return overlap >= 2 or (has_manifest_shape and "runtime" in keys)
 
 
+def _looks_like_internal_contract_fragment(text: str) -> bool:
+    """
+    Detect truncated/invalid JSON that still clearly resembles an internal manifest.
+    """
+    raw = str(text or "").strip()
+    if not raw or not raw.startswith("{"):
+        return False
+    lowered = raw.lower()
+    markers = sum(1 for marker in _INTERNAL_CONTRACT_MARKERS if marker in lowered)
+    has_runtime = '"runtime"' in lowered or '"execution_policy"' in lowered
+    has_tests = '"tests"' in lowered
+    return markers >= 4 and (has_runtime or has_tests)
+
+
+def _looks_like_response_object_dump(text: str) -> bool:
+    """
+    Detect full OpenAI Responses object dumps accidentally shown to end users.
+    """
+    raw = str(text or "").strip()
+    if not raw or not raw.startswith("{"):
+        return False
+    lowered = raw.lower()
+    return (
+        '"object"' in lowered
+        and '"response"' in lowered
+        and '"instructions"' in lowered
+        and '"tools"' in lowered
+    )
+
+
 def _sanitize_responses_final_text(text: Any, response: Any = None) -> str:
     """Protect chat UX from leaking internal prompt/manifest payloads."""
     raw = str(text or "").strip()
     if not raw:
         return ""
-    if _looks_like_internal_contract_payload(raw):
+    if (
+        _looks_like_internal_contract_payload(raw)
+        or _looks_like_internal_contract_fragment(raw)
+        or _looks_like_response_object_dump(raw)
+    ):
         response_id = str(getattr(response, "id", "") or "")
         status = str(getattr(response, "status", "") or "")
         reason = ""
@@ -2399,6 +2567,11 @@ def _coerce_conversation_id(value: Any) -> str:
         return str(value)
     except Exception:
         return ""
+
+
+def _is_openai_thread_id(value: Any) -> bool:
+    tid = str(value or "").strip()
+    return bool(tid) and tid.startswith("thread")
 
 
 def _persist_responses_state(user_id: str, thread_id: str, conversation_id: str, response_id: str) -> None:
@@ -2473,6 +2646,7 @@ def run_responses(
     recent_turns_buffer: list[str] = list(recent_turns or [])
 
     for iteration in range(25):
+        tool_source = _responses_resolve_tool_source()
         prompt_payload: Dict[str, Any] = {"id": OPENAI_PROMPT_ID}
         if OPENAI_PROMPT_VERSION:
             prompt_payload["version"] = OPENAI_PROMPT_VERSION
@@ -2489,6 +2663,7 @@ def run_responses(
                 "user_id": str(user_id),
                 "thread_id": str(thread_id),
                 "runtime": "responses",
+                "tool_source": tool_source,
                 **(
                     {"recent_user_turns": _wp6_recent_turns_metadata(recent_turns_buffer)}
                     if recent_turns_buffer
@@ -2496,6 +2671,13 @@ def run_responses(
                 ),
             },
             }
+        if tool_source in {"inline", "both"}:
+            inline_tools = _responses_inline_tools()
+            if inline_tools:
+                create_kwargs["tools"] = inline_tools
+        if tool_source == "inline":
+            # Keep prompt text/instructions, but explicitly decouple tool declarations from dashboard prompt.
+            create_kwargs["parallel_tool_calls"] = False
         registered_call_ids = [call.get("call_id") for call in all_tool_calls if isinstance(call, dict)]
         logging.debug(
             "responses.prepare user_id=%s thread_id=%s iteration=%s tool_calls_registered=%s tool_calls_kw=%s recent_turns=%s input_type=%s",
@@ -2613,7 +2795,12 @@ def run_responses(
             )
             if not final_text:
                 final_text = "No response from assistant."
-            meta = {"responses_conversation_id": conversation_id, "responses_last_response_id": previous_response_id}
+            meta = {
+                "responses_conversation_id": conversation_id,
+                "responses_last_response_id": previous_response_id,
+                "tool_source": tool_source,
+                "inline_tools_count": len(create_kwargs.get("tools") or []),
+            }
             # Persist only after reaching a "final" response to avoid saving a response id with pending tool calls.
             try:
                 if (not WP6_RESPONSES_STATELESS) and persist_handles and isinstance(handles, dict):
@@ -2666,7 +2853,13 @@ def restore_or_create_thread(openai_client: OpenAI, user_id: str, thread_id: str
     """
     # Try restore from blob storage if no thread_id provided
     if thread_id:
-        return thread_id
+        if _is_openai_thread_id(thread_id):
+            return thread_id
+        logging.warning(
+            "Ignoring non-OpenAI thread_id for assistants runtime; expected prefix 'thread', got=%s",
+            str(thread_id),
+        )
+        thread_id = ""
     try:
         if user_id:
             logging.info(f"Attempting to restore thread_id for user {user_id} from blob")
@@ -3293,16 +3486,26 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
             
             # Handle registry dispatch response
             if result.get("status") == "error":
-                # Error from registry dispatch
-                info = {
-                    "tool_name": tool_name,
-                    "arguments": dispatch_args,
-                    "status": "failed",
-                    "duration_ms": duration_ms,
-                    "error": result.get("error", "Unknown error"),
-                    "code": result.get("code", "INTERNAL_ERROR"),
-                }
-                return json.dumps(result), info
+                err_code = str(result.get("code") or "")
+                err_msg = str(result.get("error") or result.get("message") or "")
+                # Phase 2 bridge: if registry dispatch layer cannot delegate yet,
+                # continue to legacy/proxy path instead of failing hard.
+                if err_code == "INTERNAL_ERROR" and "dispatch not available" in err_msg.lower():
+                    logging.info(
+                        "Registry dispatch unavailable for tool=%s, falling back to legacy dispatch path",
+                        tool_name,
+                    )
+                else:
+                    # Error from registry dispatch
+                    info = {
+                        "tool_name": tool_name,
+                        "arguments": dispatch_args,
+                        "status": "failed",
+                        "duration_ms": duration_ms,
+                        "error": result.get("error", "Unknown error"),
+                        "code": result.get("code", "INTERNAL_ERROR"),
+                    }
+                    return json.dumps(result), info
             else:
                 # Success from registry dispatch
                 info = {
@@ -3320,6 +3523,14 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
     
     # Fallback: Try legacy in-process dispatch
     try:
+        # Keep import resolution stable: `tools` should resolve to backend/tools package,
+        # not shadow backend/<tool_name> modules accidentally injected on sys.path.
+        backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        tools_path = os.path.join(backend_root, "tools")
+        while tools_path in sys.path:
+            sys.path.remove(tools_path)
+        if backend_root not in sys.path:
+            sys.path.insert(0, backend_root)
         from tools import dispatch_tool
         inprocess_args = dict(dispatch_args or {})
         inprocess_args.pop("user_id", None)
@@ -3329,7 +3540,7 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
         logging.info(f"Tool {tool_name} OK in-process in {duration_ms:.1f}ms")
         return json.dumps(result), info
     except ImportError as e:
-        logging.warning(f"tools module not available for in-process dispatch: {e}")
+        logging.info(f"tools module not available for in-process dispatch (expected bridge): {e}")
     except Exception as e:
         logging.warning(f"In-process dispatch failed for {tool_name}: {e}. Falling back to proxy_router.")
         # Only include required fields for each function (per DATA_EXTRACTION_FUNCTIONS_REFERENCE.md)
