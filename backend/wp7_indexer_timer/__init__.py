@@ -115,29 +115,45 @@ def _wp7_enabled() -> bool:
     return CONFIG.wp7_enabled
 
 
-def _discover_user_ids_with_queue() -> list[str]:
+def _discover_user_ids_auto() -> tuple[list[str], str]:
     """
-    Discover user IDs that have a WP7 queue blob present.
+    Discover user IDs for timer-triggered WP7 processing.
 
-    This is used for timer-triggered indexing, where we do not have an HTTP header
-    to infer `user_id`. For safety, this only discovers users that already have
-    `users/{user_id}/interactions/indexer_queue.jsonl`.
+    Priority:
+    1) Users with an actual WP7 queue blob.
+    2) If no queues exist, users with session markers created by UI/backend.
+
+    Returns: (user_ids, source) where source in {"queue", "markers", "none", "error"}.
     """
     cc = AzureBlobClient.get_container_client()
-    suffix = f"/{WP7_QUEUE_BLOB_NAME}"
-    users: set[str] = set()
+    queue_suffix = f"/{WP7_QUEUE_BLOB_NAME}"
+    marker_suffixes = (
+        "/handles.json",
+        "/current_thread.json",
+        "/interaction_logs.json",
+    )
+    queue_users: set[str] = set()
+    marker_users: set[str] = set()
     try:
         for blob in cc.list_blobs(name_starts_with="users/"):
             name = str(getattr(blob, "name", "") or "")
-            if not name.endswith(suffix):
-                continue
             parts = name.split("/")
-            if len(parts) >= 2 and parts[0] == "users" and parts[1].strip():
-                users.add(parts[1].strip())
+            if len(parts) < 2 or parts[0] != "users" or not parts[1].strip():
+                continue
+            uid = parts[1].strip()
+            if name.endswith(queue_suffix):
+                queue_users.add(uid)
+                continue
+            if any(name.endswith(suffix) for suffix in marker_suffixes):
+                marker_users.add(uid)
     except Exception as e:
         logging.warning(f"WP7: user discovery failed: {e}")
-        return []
-    return sorted(users)
+        return [], "error"
+    if queue_users:
+        return sorted(queue_users), "queue"
+    if marker_users:
+        return sorted(marker_users), "markers"
+    return [], "none"
 
 
 def _load_batch_state(user_id: str) -> Dict[str, Any]:
@@ -1009,18 +1025,20 @@ def main(timer: func.TimerRequest) -> None:
         logging.info("WP7 indexer timer disabled (WP7_ENABLED=0)")
         return
     user_ids_env = str(CONFIG.wp7_indexer_user_ids or "").strip()
+    discover_source = "config"
     if user_ids_env.lower() in ("auto", "*"):
-        user_ids = _discover_user_ids_with_queue()
+        user_ids, discover_source = _discover_user_ids_auto()
         user_ids = [u for u in user_ids if str(u).strip() and str(u).strip().lower() not in ("none", "null")]
         if not user_ids:
             # No queues present; avoid doing any work.
-            logging.info("WP7: timer_start user_ids=none (auto)")
+            logging.info("WP7: timer_start user_ids=none (auto, source=%s)", discover_source)
             return
     else:
         user_ids = [u.strip() for u in user_ids_env.split(",") if u.strip()]
         user_ids = [u for u in user_ids if u.strip().lower() not in ("none", "null")]
         if not user_ids:
-            user_ids = ["default"]
+            logging.info("WP7: timer_start user_ids=none (configured_empty)")
+            return
 
     prompt_id = CONFIG.openai_indexer_prompt_id
     openai_key = os.environ.get("OPENAI_API_KEY", "")
@@ -1034,7 +1052,7 @@ def main(timer: func.TimerRequest) -> None:
     base_target = CONFIG.wp7_target_batch_tokens
     base_hard_min = CONFIG.wp7_hard_min_batch_tokens
     logging.info(
-        "WP7: timer_start user_ids=%s mode=%s multiplier=%s target_tokens_eff=%s hard_min_eff=%s (base_target=%s base_hard_min=%s) max_wait_s=%s max_items=%s",
+        "WP7: timer_start user_ids=%s mode=%s multiplier=%s target_tokens_eff=%s hard_min_eff=%s (base_target=%s base_hard_min=%s) max_wait_s=%s max_items=%s source=%s",
         ",".join(user_ids),
         _wp7_mode(),
         batch_mult,
@@ -1044,6 +1062,7 @@ def main(timer: func.TimerRequest) -> None:
         base_hard_min,
         thresholds.max_wait_seconds,
         thresholds.max_items_per_run,
+        discover_source,
     )
 
     for user_id in user_ids:

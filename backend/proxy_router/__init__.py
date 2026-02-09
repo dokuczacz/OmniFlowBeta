@@ -20,6 +20,31 @@ ACTION_MAP = {
         "url": os.getenv("FUNCTION_URL_BASE", "https://agentbackendservice.azurewebsites.net") + "/api/get_current_time",
         "code": _get_code("FUNCTION_CODE_GET_TIME")
     },
+    "oauth_status": {
+        "method": "POST",
+        "url": os.getenv("FUNCTION_URL_BASE", "https://agentbackendservice.azurewebsites.net") + "/api/custom_bridge",
+        "code": _get_code("FUNCTION_CODE_CUSTOM_BRIDGE", "FUNCTION_CODE_OAUTH_EMAIL", "FUNCTION_CODE_GMAIL")
+    },
+    "gmail_list": {
+        "method": "POST",
+        "url": os.getenv("FUNCTION_URL_BASE", "https://agentbackendservice.azurewebsites.net") + "/api/custom_bridge",
+        "code": _get_code("FUNCTION_CODE_CUSTOM_BRIDGE", "FUNCTION_CODE_OAUTH_EMAIL", "FUNCTION_CODE_GMAIL")
+    },
+    "gmail_get": {
+        "method": "POST",
+        "url": os.getenv("FUNCTION_URL_BASE", "https://agentbackendservice.azurewebsites.net") + "/api/custom_bridge",
+        "code": _get_code("FUNCTION_CODE_CUSTOM_BRIDGE", "FUNCTION_CODE_OAUTH_EMAIL", "FUNCTION_CODE_GMAIL")
+    },
+    "gmail_send": {
+        "method": "POST",
+        "url": os.getenv("FUNCTION_URL_BASE", "https://agentbackendservice.azurewebsites.net") + "/api/custom_bridge",
+        "code": _get_code("FUNCTION_CODE_CUSTOM_BRIDGE", "FUNCTION_CODE_OAUTH_EMAIL", "FUNCTION_CODE_GMAIL")
+    },
+    "gmail_attachment": {
+        "method": "POST",
+        "url": os.getenv("FUNCTION_URL_BASE", "https://agentbackendservice.azurewebsites.net") + "/api/custom_bridge",
+        "code": _get_code("FUNCTION_CODE_CUSTOM_BRIDGE", "FUNCTION_CODE_OAUTH_EMAIL", "FUNCTION_CODE_GMAIL")
+    },
     "add_new_data": {
         "method": "POST",
         "url": os.getenv("FUNCTION_URL_BASE", "https://agentbackendservice.azurewebsites.net") + "/api/add_new_data",
@@ -88,7 +113,18 @@ ACTION_SCHEMA = {
     "add_new_data": ["target_blob_name", "new_entry"],
     "manage_files": ["operation"],
     "save_interaction": ["user_message", "assistant_response"],
+    "gmail_get": ["message_id"],
+    "gmail_send": ["to"],
+    "gmail_attachment": ["message_id", "attachment_id"],
     # Other actions don't require parameters
+}
+
+BRIDGE_ACTIONS = {
+    "oauth_status",
+    "gmail_list",
+    "gmail_get",
+    "gmail_send",
+    "gmail_attachment",
 }
 
 
@@ -141,9 +177,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 code="proxy_router_get",
             )
         elif method == "POST":
+            payload = {"action": action, "payload": params} if action in BRIDGE_ACTIONS else params
             res = requests_post(
                 f"{url}?code={code}",
-                json=params,
+                json=payload,
                 headers={"x-user-id": user_id, "Content-Type": "application/json"},
                 timeout=10,
                 user_id=str(user_id),

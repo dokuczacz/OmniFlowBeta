@@ -29,6 +29,9 @@ To integrate OmniFlow with your Custom GPT or LLM system, ensure the following e
 - `AZURE_PROXY_URL` - Proxy router endpoint (if you route tool calls through the proxy)
 - `FUNCTION_URL_BASE` - Base URL used by proxy_router to construct endpoint URLs
 - `FUNCTION_CODE_*` - Azure function keys for each endpoint (used by Custom GPT Actions)
+- `WP6_RESPONSES_STATELESS` - `true|false` (Responses runtime only). When `false`, the backend uses
+  `conversation` + `previous_response_id` to keep a server-side context on OpenAI. Recommended for
+  “cached prefix” behavior and lower prompt repetition.
 - WP7 (Indexer): `OPENAI_INDEXER_PROMPT_ID`, `OPENAI_INDEXER_MODEL`, `WP7_INDEXER_MODE`, `WP7_INDEXER_USER_IDS`, `WP7_*` thresholds
 
 See `.env.example` for a complete list of configuration options.
@@ -57,6 +60,21 @@ __ROUTE_DEEP__
 ```
 
 The backend will perform **at most one** DEEP escalation per user message. If DEEP is blocked (e.g., cooldown, insufficient inputs), the backend returns the FAST answer plus a short note.
+
+---
+
+## Responses Stateful vs Stateless
+
+By default, `LLM_RUNTIME=responses` can run in stateless mode (no server-side conversation).
+
+To enable **stateful** behavior (cached prefix on OpenAI side):
+
+```
+WP6_RESPONSES_STATELESS=false
+```
+
+When enabled, the backend passes `conversation` + `previous_response_id` to OpenAI so repeating
+prefix context is retained server-side. This reduces repeated prompt payload and improves continuity.
 
 ### WP6 tuning env vars (local + Azure app settings)
 

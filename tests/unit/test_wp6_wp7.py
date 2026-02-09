@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import sys
+from types import SimpleNamespace
 
 ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "backend")
@@ -168,6 +169,52 @@ def test_wp7_timer_call_indexer_model_uses_schema_and_fallback_output_text():
     assert out and out[0]["interaction_id"] == "INT_X"
     assert seen.get("text", {}).get("format", {}).get("name") == "interaction_items"
     assert seen.get("reasoning", {}).get("effort") == "minimal"
+
+
+def test_wp7_discover_user_ids_auto_prefers_queue(monkeypatch):
+    blobs = [
+        SimpleNamespace(name="users/MarioBros/handles.json"),
+        SimpleNamespace(name=f"users/QueueUser/{wp7_timer.WP7_QUEUE_BLOB_NAME}"),
+        SimpleNamespace(name="users/AnotherUser/current_thread.json"),
+    ]
+
+    class FakeContainer:
+        def list_blobs(self, name_starts_with="users/"):
+            assert name_starts_with == "users/"
+            return blobs
+
+    monkeypatch.setattr(
+        wp7_timer.AzureBlobClient,
+        "get_container_client",
+        lambda: FakeContainer(),
+    )
+
+    user_ids, source = wp7_timer._discover_user_ids_auto()
+    assert user_ids == ["QueueUser"]
+    assert source == "queue"
+
+
+def test_wp7_discover_user_ids_auto_falls_back_to_markers(monkeypatch):
+    blobs = [
+        SimpleNamespace(name="users/MarioBros/handles.json"),
+        SimpleNamespace(name="users/AnotherUser/current_thread.json"),
+        SimpleNamespace(name="users/MarioBros/interaction_logs.json"),
+    ]
+
+    class FakeContainer:
+        def list_blobs(self, name_starts_with="users/"):
+            assert name_starts_with == "users/"
+            return blobs
+
+    monkeypatch.setattr(
+        wp7_timer.AzureBlobClient,
+        "get_container_client",
+        lambda: FakeContainer(),
+    )
+
+    user_ids, source = wp7_timer._discover_user_ids_auto()
+    assert user_ids == ["AnotherUser", "MarioBros"]
+    assert source == "markers"
 
 
 def test_run_responses_includes_prompt_version_when_set(monkeypatch):

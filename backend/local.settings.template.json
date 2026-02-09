@@ -11,9 +11,16 @@
     "OPENAI_INDEXER_PROMPT_ID": "",
     "OPENAI_INDEXER_MODEL": "gpt-5-mini",
     "RESPONSES_MAX_OUTPUT_TOKENS": "4096",
+    "OPENAI_RESPONSES_STORE": "true",
+    "INTENT_CLASSIFIER_STORE": "true",
     "OPENAI_CONTEXT_BUILDER_PROMPT_ID": "pmpt_6952ad14ef908197b2549560c7956f9d0d171ad15b4f737a",
     "LLM_RUNTIME": "assistants",
+    "WP6_RESPONSES_STATELESS": "false",
     "AZURE_PROXY_URL": "http://localhost:7071/api/proxy_router",
-    "FUNCTION_URL_BASE": "http://localhost:7071"
+    "FUNCTION_URL_BASE": "http://localhost:7071",
+    "INTENT_CLASSIFIER_ENABLED": "true",
+    "INTENT_CLASSIFIER_MODEL": "gpt-5.0-nano",
+    "INTENT_CLASSIFIER_LOG_PATH": "backend/intent_classifications.jsonl",
+    "INTENT_CLASSIFIER_LOG_FULL_TEXT": "true"
   }
 }

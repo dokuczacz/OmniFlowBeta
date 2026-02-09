@@ -88,10 +88,22 @@ def dispatch_tool_call(
         
     except ToolError as e:
         # Structured error from validation
-        logger.warning(
-            f"Tool error in {tool_name}: {e.code} - {e.message}",
-            extra={"tool": tool_name, "user_id": user_id, "trace_id": trace_id}
-        )
+        if e.code == "INTERNAL_ERROR" and "dispatch not available" in str(e.message).lower():
+            # Bridge state: registry dispatch falls back to legacy/proxy path.
+            logger.info(
+                "Registry bridge unavailable for tool=%s; using legacy/proxy fallback (%s)",
+                tool_name,
+                str(e.message),
+                extra={"tool": tool_name, "user_id": user_id, "trace_id": trace_id},
+            )
+        else:
+            logger.warning(
+                "Tool error in %s: %s - %s",
+                tool_name,
+                e.code,
+                e.message,
+                extra={"tool": tool_name, "user_id": user_id, "trace_id": trace_id},
+            )
         return build_error_payload(e.code, e.message, e.details, trace_id)
         
     except Exception as e:
@@ -135,11 +147,21 @@ def _delegate_to_implementation(
         # Lazy import to avoid pulling in heavy dependencies during module load
         import sys
         import os
-        
-        # Try to import tools dispatch
-        tools_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'tools')
-        if tools_path not in sys.path:
-            sys.path.insert(0, tools_path)
+
+        # Ensure backend root is on sys.path so `import tools` resolves as
+        # backend/tools package, without shadowing backend/<tool_name> packages.
+        backend_root = os.path.dirname(os.path.dirname(__file__))
+        tools_path = os.path.join(backend_root, "tools")
+
+        # Remove legacy path injection that caused module shadowing:
+        # with tools_path first in sys.path, imports like `add_new_data.service`
+        # resolved to backend/tools/add_new_data.py (module) instead of
+        # backend/add_new_data (package).
+        while tools_path in sys.path:
+            sys.path.remove(tools_path)
+
+        if backend_root not in sys.path:
+            sys.path.insert(0, backend_root)
         
         try:
             from tools import dispatch_tool

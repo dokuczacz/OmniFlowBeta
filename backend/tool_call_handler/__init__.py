@@ -42,11 +42,10 @@ except Exception:  # pragma: no cover
 # Allow importing shared helpers when running as a Functions app or locally
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
-    from shared.file_logger import attach_file_handler, detach_file_handler
+    from shared.local_logger import log_response_id
 except Exception:
-    # Best-effort import; if it fails, we will continue without file logging
-    attach_file_handler = None
-    detach_file_handler = None
+    # Best-effort import; if it fails, we will continue without response_id logging
+    log_response_id = None
 from shared.http_client import requests_get, requests_post
 from shared.mock_agent import build_mock_agent_response, mock_marker, mock_user_id
 
@@ -89,6 +88,8 @@ OMNIFLOW_DEBUG = os.environ.get("OMNIFLOW_DEBUG", "").lower() in ("1", "true", "
 DEBUG_TOOL_CALL_HANDLER = bool(DEBUG_TOOL_CALL_HANDLER or OMNIFLOW_DEBUG)
 OMNIFLOW_MOCK_AGENT = os.environ.get("OMNIFLOW_MOCK_AGENT", "").lower() in ("1", "true", "yes")
 OPENAI_MAX_REQUESTS = int(os.environ.get("OPENAI_MAX_REQUESTS", "0") or 0)
+OPENAI_RESPONSES_STORE = os.environ.get("OPENAI_RESPONSES_STORE", "true").lower() in ("1", "true", "yes")
+INTENT_CLASSIFIER_STORE = os.environ.get("INTENT_CLASSIFIER_STORE", "true").lower() in ("1", "true", "yes")
 # WP6 routing: when UI does not send `context_mode`, fall back to this default.
 # Values: AUTO | FAST | DEEP
 WP6_DEFAULT_CONTEXT_MODE = (os.environ.get("WP6_DEFAULT_CONTEXT_MODE", "AUTO") or "AUTO").strip().upper()
@@ -98,6 +99,12 @@ WP6_RESPONSES_STATELESS = os.environ.get("WP6_RESPONSES_STATELESS", "true").lowe
 WP6_RECENT_TURNS_MAX = int(os.environ.get("WP6_RECENT_TURNS_MAX", "8") or 8)
 WP6_RECENT_TURNS_MAX_CHARS = int(os.environ.get("WP6_RECENT_TURNS_MAX_CHARS", "320") or 320)
 WP6_FAST_AUDIT_ENABLED = str(os.environ.get("WP6_FAST_AUDIT_ENABLED", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+# Intent classification (LLM-based, will switch to ML model later)
+INTENT_CLASSIFIER_MODEL = os.environ.get("INTENT_CLASSIFIER_MODEL", "gpt-5.0-nano")
+INTENT_CLASSIFIER_ENABLED = os.environ.get("INTENT_CLASSIFIER_ENABLED", "true").lower() in ("1", "true", "yes")
+INTENT_CLASSIFIER_LOG_PATH = os.environ.get("INTENT_CLASSIFIER_LOG_PATH", "backend/intent_classifications.jsonl")
+# For ML training: log full text (default true for lab/dev)
+INTENT_CLASSIFIER_LOG_FULL_TEXT = os.environ.get("INTENT_CLASSIFIER_LOG_FULL_TEXT", "true").lower() in ("1", "true", "yes")
 WP6_FAST_AUDIT_MAX_CHARS = int(os.environ.get("WP6_FAST_AUDIT_MAX_CHARS", "16000") or 16000)
 WP6_AUDIT_DEFAULT_MODEL = str(os.environ.get("WP6_AUDIT_DEFAULT_MODEL") or os.environ.get("OPENAI_WP6_AUDIT_MODEL") or "gpt-5-mini").strip()
 WP6_AUDIT_DEFAULT_REASONING_EFFORT = str(os.environ.get("WP6_AUDIT_DEFAULT_REASONING_EFFORT") or os.environ.get("OPENAI_WP6_AUDIT_REASONING_EFFORT") or "medium").strip().lower()
@@ -154,96 +161,178 @@ PA_INTENT_STAGES = (
 )
 PA_WRITE_STAGES = {"CALENDAR_WRITE", "EMAIL_WRITE", "TASKS_MANAGE"}
 
+PA_READ_TOOLS = {
+    "get_current_time",
+    "list_blobs",
+    "read_blob_file",
+    "read_many_blobs",
+    "get_filtered_data",
+    "get_interaction_history",
+}
+
+PA_WRITE_TOOLS = {
+    "add_new_data",
+    "update_data_entry",
+    "remove_data_entry",
+    "upload_data_or_file",
+    "manage_files",
+    "save_interaction",
+    "gmail_send",
+}
+
+PA_STAGE_TOOL_ALLOWLIST: Dict[str, set[str]] = {
+    "EMAIL_QUERY": {"gmail_list", "gmail_get", "oauth_status"},
+    "EMAIL_WRITE": {"gmail_list", "gmail_get", "gmail_send", "oauth_status"},
+    "CALENDAR_QUERY": {"list_blobs", "read_blob_file", "read_many_blobs"},
+    "CALENDAR_WRITE": {"list_blobs", "read_blob_file", "read_many_blobs"},
+    "TASKS_MANAGE": {
+        "list_blobs",
+        "read_blob_file",
+        "read_many_blobs",
+        "get_filtered_data",
+        "add_new_data",
+        "update_data_entry",
+        "remove_data_entry",
+        "upload_data_or_file",
+    },
+    "DAILY_PLAN": {"list_blobs", "read_blob_file", "read_many_blobs", "get_filtered_data"},
+    "NOTES_KB": {"list_blobs", "read_blob_file", "read_many_blobs", "add_new_data", "update_data_entry", "upload_data_or_file"},
+    "DECISION_SUPPORT": {"read_blob_file", "read_many_blobs", "get_filtered_data"},
+    "DOC_ANALYSIS": {"read_blob_file", "read_many_blobs"},
+    "REPORTING": {"read_blob_file", "read_many_blobs", "get_filtered_data"},
+    "TRAVEL_PLANNING": {"read_blob_file", "read_many_blobs"},
+}
+
+
+def _pa_allowed_tools_for_stage_phase(stage: str, phase: str) -> set[str]:
+    stage_key = str(stage or "").strip().upper()
+    phase_key = str(phase or "").strip().upper()
+
+    if stage_key not in PA_INTENT_STAGES:
+        return set()
+
+    allowed = set(PA_READ_TOOLS)
+    allowed.update(PA_STAGE_TOOL_ALLOWLIST.get(stage_key, set()))
+
+    # Only allow write tools during EXECUTE phase
+    if phase_key != "EXECUTE":
+        allowed.difference_update(PA_WRITE_TOOLS)
+
+    return allowed
+
 
 def _pa_intent_router(user_text: str) -> Dict[str, Any]:
-    text = str(user_text or "").lower()
-    stage_scores = {stage: 0.0 for stage in PA_INTENT_STAGES}
-    evidence: list[str] = []
+    """
+    Route user intent to PA stage using LLM-based classification (gpt-5.0-nano).
+    
+    Returns:
+    - top_intents: list of {stage, p} sorted by probability
+    - recommended_stage: highest-probability PA_INTENT_STAGE
+    - recommended_phase: "DISCOVERY" (safe default for Iter1)
+    - need_clarification: bool
+    - clarify_questions: list[str]
+    - evidence: classification details for audit trail
+    """
+    text = str(user_text or "").strip()
+    if not text or len(text) < 3:
+        return {
+            "top_intents": [{"stage": "DECISION_SUPPORT", "p": 1.0}],
+            "recommended_stage": "DECISION_SUPPORT",
+            "recommended_phase": "DISCOVERY",
+            "need_clarification": True,
+            "clarify_questions": ["Tekst zbyt krótki. Opisz proszę dokładniej, czego potrzebujesz."],
+            "evidence": ["empty_input"],
+        }
+    
+    if not INTENT_CLASSIFIER_ENABLED:
+        # Fallback to safe stage
+        return {
+            "top_intents": [{"stage": "DECISION_SUPPORT", "p": 1.0}],
+            "recommended_stage": "DECISION_SUPPORT",
+            "recommended_phase": "DISCOVERY",
+            "need_clarification": False,
+            "clarify_questions": [],
+            "evidence": ["classifier_disabled"],
+        }
+    
+    # LLM-based classification prompt (optimized for PA stages)
+    pa_stages_str = ", ".join(PA_INTENT_STAGES)
+    prompt = f"""Classify user intent to ONE Personal Assistant stage.
 
-    def _add(stage: str, keyword: str, weight: float = 1.0):
-        if keyword and keyword in text:
-            stage_scores[stage] += weight
-            evidence.append(f"{stage}:{keyword}")
+User message: {text}
 
-    email_terms = ["email", "mail", "inbox", "gmail", "outlook"]
-    email_write_terms = ["send", "draft", "write", "reply", "respond", "compose", "forward"]
-    email_query_terms = ["check", "read", "show", "find", "search", "unread", "latest", "last"]
-    calendar_terms = ["calendar", "meeting", "event", "appointment", "schedule"]
-    calendar_write_terms = ["schedule", "book", "reschedule", "move", "cancel", "create", "add", "invite"]
-    calendar_query_terms = ["when", "next", "upcoming", "availability", "free", "busy"]
-    tasks_terms = ["task", "todo", "to-do", "remind", "reminder", "follow up", "follow-up"]
-    plan_terms = ["plan my day", "daily plan", "agenda", "day plan", "schedule my day"]
-    notes_terms = ["note", "remember", "save", "store", "knowledge base", "kb", "notes"]
-    decision_terms = ["decide", "choose", "recommend", "compare", "pros and cons", "tradeoff", "advice"]
-    doc_terms = ["document", "pdf", "summarize", "analyze", "extract", "review", "report"]
-    reporting_terms = ["report", "metrics", "status update", "weekly summary", "kpi"]
-    travel_terms = ["travel", "trip", "flight", "hotel", "itinerary", "booking"]
+Valid stages: {pa_stages_str}
 
-    for term in email_terms:
-        _add("EMAIL_QUERY", term, 0.5)
-        _add("EMAIL_WRITE", term, 0.5)
-    for term in email_write_terms:
-        _add("EMAIL_WRITE", term, 2.0)
-    for term in email_query_terms:
-        _add("EMAIL_QUERY", term, 1.5)
+Return ONLY the stage name (one word, uppercase).
 
-    for term in calendar_terms:
-        _add("CALENDAR_QUERY", term, 0.5)
-        _add("CALENDAR_WRITE", term, 0.5)
-    for term in calendar_write_terms:
-        _add("CALENDAR_WRITE", term, 2.0)
-    for term in calendar_query_terms:
-        _add("CALENDAR_QUERY", term, 1.5)
-
-    for term in tasks_terms:
-        _add("TASKS_MANAGE", term, 1.5)
-    for term in plan_terms:
-        _add("DAILY_PLAN", term, 2.0)
-    for term in notes_terms:
-        _add("NOTES_KB", term, 1.5)
-    for term in decision_terms:
-        _add("DECISION_SUPPORT", term, 1.5)
-    for term in doc_terms:
-        _add("DOC_ANALYSIS", term, 1.5)
-    for term in reporting_terms:
-        _add("REPORTING", term, 1.5)
-    for term in travel_terms:
-        _add("TRAVEL_PLANNING", term, 1.5)
-
-    sorted_intents = sorted(stage_scores.items(), key=lambda item: item[1], reverse=True)
-    top_stage, top_score = sorted_intents[0]
-    second_score = sorted_intents[1][1] if len(sorted_intents) > 1 else 0.0
-    total_score = sum(stage_scores.values())
-
-    if total_score <= 0:
-        top_stage = "DECISION_SUPPORT"
-        top_score = 1.0
-        total_score = 1.0
-
-    top_intents = [
-        {"stage": stage, "p": round(score / total_score, 3)}
-        for stage, score in sorted_intents
-        if score > 0
-    ][:5]
-    if not top_intents:
-        top_intents = [{"stage": top_stage, "p": 1.0}]
-
-    need_clarification = top_score < 2.0 or (top_score - second_score) <= 1.0
-    clarify_questions = []
-    if need_clarification:
-        clarify_questions = [
-            "Czy chodzi o odczyt (QUERY), czy wykonanie akcji (WRITE)?",
-            "Podaj proszę dokładny zakres i oczekiwany rezultat.",
+Stage:"""
+    
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        try:
+            response = client.chat.completions.create(
+                model=INTENT_CLASSIFIER_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=15,
+                temperature=0,
+                store=bool(INTENT_CLASSIFIER_STORE),
+            )
+        except TypeError:
+            response = client.chat.completions.create(
+                model=INTENT_CLASSIFIER_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=15,
+                temperature=0,
+            )
+        
+        stage_response = str(response.choices[0].message.content or "").strip().upper()
+        
+        # Validate response
+        valid_stage = None
+        for pa_stage in PA_INTENT_STAGES:
+            if pa_stage in stage_response:
+                valid_stage = pa_stage
+                break
+        
+        if not valid_stage:
+            valid_stage = "DECISION_SUPPORT"
+            confidence = 0.3
+        else:
+            confidence = 0.85  # Default LLM confidence
+        
+        top_intents = [
+            {"stage": valid_stage, "p": round(confidence, 3)},
+            {"stage": "DECISION_SUPPORT", "p": round(1.0 - confidence, 3)} if valid_stage != "DECISION_SUPPORT" else None
         ]
-
-    return {
-        "top_intents": top_intents,
-        "recommended_stage": top_stage,
-        "recommended_phase": "DISCOVERY",
-        "need_clarification": need_clarification,
-        "clarify_questions": clarify_questions,
-        "evidence": evidence[:5],
-    }
+        top_intents = [x for x in top_intents if x]
+        
+        need_clarification = confidence < 0.7
+        clarify_questions = []
+        if need_clarification:
+            clarify_questions = [
+                f"Zaproponowałem stage '{valid_stage}'. Czy to poprawne?",
+                "Jeśli nie, opisz dokładniej, co chcesz zrobić.",
+            ]
+        
+        return {
+            "top_intents": top_intents,
+            "recommended_stage": valid_stage,
+            "recommended_phase": "DISCOVERY",
+            "need_clarification": need_clarification,
+            "clarify_questions": clarify_questions,
+            "evidence": [f"llm_classifier:{INTENT_CLASSIFIER_MODEL}", f"response:{stage_response}"],
+        }
+        
+    except Exception as e:
+        logging.warning(f"PA intent router LLM call failed: {e}")
+        return {
+            "top_intents": [{"stage": "DECISION_SUPPORT", "p": 1.0}],
+            "recommended_stage": "DECISION_SUPPORT",
+            "recommended_phase": "DISCOVERY",
+            "need_clarification": True,
+            "clarify_questions": ["Klasyfikacja nieudana. Spróbuj inny opis."],
+            "evidence": [f"error:{type(e).__name__}"],
+        }
 
 def _best_effort_debug(code: str, *, user_id: str = "", thread_id: str = "", error: Exception | None = None, **ctx: Any) -> None:
     logger = logging.getLogger()
@@ -389,61 +478,245 @@ def _catalog_path() -> Path:
     return Path(_repo_root_dir()) / "AGENT_FUNCTIONS_CATALOG.json"
 
 
-def _needs_task_first_mode(user_message: str) -> bool:
-    text = str(user_message or "").strip().lower()
-    if not text:
-        return False
-    triggers = (
-        "co tam mamy",
-        "co nowego",
-        "aktualnos",
-        "aktualiz",
-        "zalegl",
-        "niezrobion",
-        "wracam",
-        "dawno mnie nie bylo",
-        "what's new",
-        "whats new",
-        "updates",
-        "unfinished",
-        "pending tasks",
-    )
-    return any(token in text for token in triggers)
+def _classify_intent_llm(user_message: str) -> Tuple[str, float]:
+    """
+    Classify user intent using LLM (gpt-5.0-nano by default).
+    Returns: (intent, confidence)
+    
+    Intents:
+    - task_update: asking about tasks, pending work, "what's new" in user's projects
+    - email_check: asking about emails, messages, inbox
+    - general_question: asking about facts, external info, how-to
+    - chat: casual conversation, greetings, small talk
+    - other: unclear or mixed intent
+    
+    Will be replaced by ML model once training data is collected.
+    """
+    if not INTENT_CLASSIFIER_ENABLED:
+        return "other", 0.0
+    
+    text = str(user_message or "").strip()
+    if not text or len(text) < 3:
+        return "other", 0.0
+    
+    # Classification prompt (optimized for nano model)
+    prompt = f"""Classify intent (one word):
+
+User: {text}
+
+Categories:
+task_update - tasks/work/projects updates
+email_check - emails/messages/inbox
+general_question - facts/how-to/external info
+chat - conversation/greetings
+other - unclear
+
+Intent:"""
+    
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        try:
+            response = client.chat.completions.create(
+                model=INTENT_CLASSIFIER_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=10,
+                temperature=0,
+                store=bool(INTENT_CLASSIFIER_STORE),
+            )
+        except TypeError:
+            response = client.chat.completions.create(
+                model=INTENT_CLASSIFIER_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=10,
+                temperature=0,
+            )
+        intent = str(response.choices[0].message.content or "").strip().lower()
+        
+        # Normalize to valid intents
+        valid_intents = {"task_update", "email_check", "general_question", "chat", "other"}
+        if intent not in valid_intents:
+            # Try to extract from response
+            for valid in valid_intents:
+                if valid in intent:
+                    intent = valid
+                    break
+            else:
+                intent = "other"
+        
+        # Get confidence from logprobs if available (placeholder for now)
+        confidence = 0.85  # Default confidence until we have logprobs
+        
+        return intent, confidence
+        
+    except Exception as e:
+        logging.warning(f"Intent classification failed: {e}")
+        return "other", 0.0
+
+
+def _log_intent_classification(
+    user_message: str,
+    intent: str,
+    confidence: float,
+    user_id: str = "",
+    thread_id: str = ""
+) -> None:
+    """
+    Log intent classification for ML training dataset.
+    Saves to JSONL file that will be used to train local classifier.
+    """
+    if not INTENT_CLASSIFIER_ENABLED:
+        return
+    
+    try:
+        entry = {
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "intent": intent,
+            "confidence": round(confidence, 3),
+            "user_id_prefix": user_id[:4] if user_id else "",
+            "thread_id": thread_id,
+            "classifier": INTENT_CLASSIFIER_MODEL,
+        }
+        
+        if INTENT_CLASSIFIER_LOG_FULL_TEXT:
+            entry["message"] = user_message
+            entry["message_len"] = len(user_message)
+        else:
+            import hashlib
+            msg_hash = hashlib.sha256(user_message.encode()).hexdigest()[:16]
+            entry["message_hash"] = msg_hash
+            entry["message_len"] = len(user_message)
+        
+        # Append to log file (create if doesn't exist)
+        log_path = Path(_repo_root_dir()) / INTENT_CLASSIFIER_LOG_PATH
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+            
+    except Exception as e:
+        logging.debug(f"Failed to log intent classification: {e}")
+
+
+def _log_pa_intent_classification(
+    user_message: str,
+    pa_intent_result: Dict[str, Any],
+    user_id: str = "",
+    thread_id: str = ""
+) -> None:
+    """
+    Log PA intent classification (stage routing) for ML training dataset.
+    Records both input (user_message) and output (recommended_stage, confidence).
+    """
+    if not INTENT_CLASSIFIER_ENABLED:
+        return
+    
+    try:
+        recommended_stage = pa_intent_result.get("recommended_stage", "UNKNOWN")
+        recommended_phase = pa_intent_result.get("recommended_phase", "DISCOVERY")
+        top_intents = pa_intent_result.get("top_intents", [])
+        
+        # Extract confidence from top intent
+        confidence = top_intents[0].get("p", 0.0) if top_intents else 0.0
+        
+        entry = {
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "input_type": "pa_intent_router",
+            "stage": recommended_stage,
+            "phase": recommended_phase,
+            "confidence": round(confidence, 3),
+            "need_clarification": pa_intent_result.get("need_clarification", False),
+            "top_intents_count": len(top_intents),
+            "user_id_prefix": user_id[:4] if user_id else "",
+            "thread_id": thread_id,
+            "classifier": INTENT_CLASSIFIER_MODEL,
+        }
+        
+        if INTENT_CLASSIFIER_LOG_FULL_TEXT:
+            entry["message"] = user_message
+            entry["message_len"] = len(user_message)
+            entry["top_intents"] = top_intents[:3]  # Log top 3
+        else:
+            import hashlib
+            msg_hash = hashlib.sha256(user_message.encode()).hexdigest()[:16]
+            entry["message_hash"] = msg_hash
+            entry["message_len"] = len(user_message)
+        
+        # Append to same log file (create if doesn't exist)
+        log_path = Path(_repo_root_dir()) / INTENT_CLASSIFIER_LOG_PATH
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+            
+    except Exception as e:
+        logging.debug(f"Failed to log PA intent classification: {e}")
 
 
 def _runtime_instructions_for_turn(
     user_message: str,
     *,
+    user_id: str = "",
+    thread_id: str = "",
     gmail_status: Dict[str, Any] | None = None,
 ) -> str:
     """
-    Build per-turn runtime instructions while staying stateless.
+    Build per-turn runtime instructions using LLM-based intent classification.
+    Replaces hardcoded pattern matching with intelligent routing.
     """
     base = str(OPENAI_RUNTIME_INSTRUCTIONS or "").strip()
-    if not _needs_task_first_mode(user_message):
-        parts = [base] if base else []
-    else:
-        task_first = (
-            "Task-first policy (personal assistance): "
-            "when the user asks for updates/what is new, check user's own data first via tools "
-            "before asking follow-up questions or giving general news. "
-            "Preferred order: list_blobs(include_meta=true) -> read_blob_file(TM.json if present) "
-            "-> read_blob_file(handles.json) -> read_many_blobs(interactions/index.jsonl or related files). "
-            "If TM.json is missing, explicitly state checked files and continue with closest task-related sources. "
-            "Only provide general world news when user explicitly asks for external news."
+    parts = [base] if base else []
+    
+    # Classify user intent
+    intent, confidence = _classify_intent_llm(user_message)
+    
+    # Log for ML training dataset
+    _log_intent_classification(
+        user_message=user_message,
+        intent=intent,
+        confidence=confidence,
+        user_id=user_id,
+        thread_id=thread_id
+    )
+    
+    # Intent-specific instructions
+    if intent == "task_update" and confidence > 0.5:
+        parts.append(
+            "User is asking about their tasks/updates. Consider checking:\n"
+            "• list_blobs(include_meta=true) to see user's files\n"
+            "• read_blob_file('TM.json') for task management data\n"
+            "• read_blob_file('handles.json') for conversation state\n"
+            "• Gmail tools if relevant and connected\n"
+            "Use judgment - not all update queries need all checks."
         )
-        parts = [base, task_first] if base else [task_first]
-
+    elif intent == "email_check" and confidence > 0.5:
+        parts.append(
+            "User is asking about emails. Prioritize Gmail tools if connected. "
+            "Check list_emails, get_email, or send_email as needed."
+        )
+    elif intent == "chat":
+        parts.append(
+            "User is having casual conversation. Focus on natural dialogue; "
+            "avoid unnecessary tool calls unless explicitly requested."
+        )
+    else:
+        # general_question or other
+        parts.append(
+            "Available user data sources (use when relevant):\n"
+            "• list_blobs / read_blob_file - user's stored files\n"
+            "• Gmail tools - if connected\n"
+            "Apply your reasoning to decide if tool use is needed."
+        )
+    
     # Gmail integration awareness
     if isinstance(gmail_status, dict) and gmail_status.get("authorized"):
         email = str(gmail_status.get("email") or "").strip()
         if email:
-            parts.append(f"Gmail integration: connected to {email}. You can use Gmail tools (send, list, get) on behalf of the user.")
+            parts.append(f"Gmail: connected as {email}. Tools available: send_email, list_emails, get_email.")
         else:
-            parts.append("Gmail integration: connected (email unknown). You can use Gmail tools (send, list, get) on behalf of the user.")
+            parts.append("Gmail: connected. Tools available: send_email, list_emails, get_email.")
     else:
-        parts.append("Gmail integration: not connected. If the user asks about email, let them know they need to connect Gmail first via the sidebar button.")
-
+        parts.append("Gmail: not connected. If user asks about email, suggest connecting via sidebar.")
+    
     return "\n\n".join(p for p in parts if p)
 
 
@@ -496,6 +769,16 @@ def _responses_inline_tools() -> List[Dict[str, Any]]:
     except Exception as exc:
         _best_effort_debug("responses_inline_tools_load_failed", error=exc)
         return []
+
+
+def _filter_inline_tools_by_allowlist(
+    tools: List[Dict[str, Any]],
+    allowlist: set[str]
+) -> List[Dict[str, Any]]:
+    if not allowlist:
+        return tools
+    filtered = [tool for tool in tools if str(tool.get("name") or "").strip() in allowlist]
+    return filtered
 
 
 def _normalize_inline_tool_parameters(parameters: Dict[str, Any], *, strict: bool) -> Dict[str, Any]:
@@ -2822,13 +3105,19 @@ def run_responses(
             prompt_payload["variables"] = {"stage": stage, "phase": phase}
         create_kwargs: Dict[str, Any] = {
             "prompt": prompt_payload,
-            "instructions": _runtime_instructions_for_turn(str(user_message or ""), gmail_status=gmail_status),
+            "instructions": _runtime_instructions_for_turn(
+                str(user_message or ""),
+                user_id=user_id,
+                thread_id=thread_id,
+                gmail_status=gmail_status
+            ),
             "input": current_input,
             "tool_choice": "auto",
             "parallel_tool_calls": False,
             # Important: without an explicit cap, the Prompt/model defaults may request very large output budgets,
             # which can blow TPM limits even for tiny user prompts (because conversation history is server-side).
             "max_output_tokens": responses_max_output_tokens,
+            "store": bool(OPENAI_RESPONSES_STORE),
             "metadata": {
                 "user_id": str(user_id),
                 "thread_id": str(thread_id),
@@ -2845,6 +3134,15 @@ def run_responses(
         if tool_source in {"inline", "both"}:
             inline_tools = _responses_inline_tools()
             if inline_tools:
+                allowlist = _pa_allowed_tools_for_stage_phase(stage, phase)
+                if allowlist:
+                    inline_tools = _filter_inline_tools_by_allowlist(inline_tools, allowlist)
+                    logging.info(
+                        "PA tools allowlist stage=%s phase=%s tools=%s",
+                        str(stage),
+                        str(phase),
+                        sorted(list(allowlist))[:50],
+                    )
                 create_kwargs["tools"] = inline_tools
         if tool_source == "inline":
             # Keep prompt text/instructions, but explicitly decouple tool declarations from dashboard prompt.
@@ -2950,6 +3248,20 @@ def run_responses(
             raise
         previous_response_id = str(getattr(response, "id", "") or previous_response_id)
         conversation_id = _coerce_conversation_id(getattr(response, "conversation", None) or conversation_id)
+        
+        # Log response_id for later retrieval
+        if log_response_id and previous_response_id:
+            try:
+                log_response_id(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    response_id=previous_response_id,
+                    conversation_id=conversation_id,
+                    runtime="responses",
+                    metadata={"iteration": iteration, "tool_source": tool_source}
+                )
+            except Exception:
+                pass
 
         function_calls = _extract_response_function_calls(response)
         logging.debug(
@@ -3377,6 +3689,19 @@ def create_run_and_poll(openai_client: OpenAI, thread_id: str, user_id: str):
         prev_status = rs
         if run.status == "completed":
             run_summary["timestamps"]["completed"] = time.time()
+            # Log run_id for later retrieval (run_id serves as response_id for assistants runtime)
+            if log_response_id:
+                try:
+                    log_response_id(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        response_id=str(run.id),
+                        conversation_id=None,
+                        runtime="assistants",
+                        metadata={"status": "completed"}
+                    )
+                except Exception:
+                    pass
             break
         if run.status == "failed":
             if DEBUG_TOOL_CALL_HANDLER:
@@ -3454,6 +3779,19 @@ def create_run_and_poll(openai_client: OpenAI, thread_id: str, user_id: str):
             run = _openai_call(openai_client.beta.threads.runs.retrieve, thread_id=thread_id, run_id=run.id)
             if run.status == "completed":
                 run_summary["timestamps"]["completed_after_tools"] = time.time()
+                # Log run_id for later retrieval
+                if log_response_id:
+                    try:
+                        log_response_id(
+                            user_id=user_id,
+                            thread_id=thread_id,
+                            response_id=str(run.id),
+                            conversation_id=None,
+                            runtime="assistants",
+                            metadata={"status": "completed_after_tools", "tool_count": len(outputs)}
+                        )
+                    except Exception:
+                        pass
                 break
             if run.status == "failed":
                 if DEBUG_TOOL_CALL_HANDLER:
@@ -4278,6 +4616,13 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 wp6_meta["pa_phase"] = requested_phase
                 if intent_router:
                     wp6_meta["pa_intent_router"] = intent_router
+                    # Log PA intent classification for ML dataset
+                    _log_pa_intent_classification(
+                        user_message=user_message,
+                        pa_intent_result=intent_router,
+                        user_id=user_id,
+                        thread_id=thread_id
+                    )
                 logging.info(
                     "PA routing stage=%s phase=%s need_clarification=%s",
                     requested_stage,

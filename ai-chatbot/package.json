@@ -111,6 +111,7 @@
     "@types/react": "^18",
     "@types/react-dom": "^18",
     "@types/react-syntax-highlighter": "^15.5.13",
+    "baseline-browser-mapping": "^2.9.19",
     "drizzle-kit": "^0.25.0",
     "postcss": "^8",
     "tailwindcss": "^4.1.13",

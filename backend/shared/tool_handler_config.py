@@ -133,7 +133,7 @@ def build_tool_handler_config() -> ToolHandlerConfig:
         openai_indexer_prompt_id=_env_str("OPENAI_INDEXER_PROMPT_ID", ""),
         openai_indexer_model=_env_str("OPENAI_INDEXER_MODEL", "gpt-5-mini"),
         wp6_default_context_mode=_env_str("WP6_DEFAULT_CONTEXT_MODE", "AUTO").upper(),
-        wp6_responses_stateless=_env_bool("WP6_RESPONSES_STATELESS", False),
+        wp6_responses_stateless=_env_bool("WP6_RESPONSES_STATELESS", True),
         wp6_recent_turns_max=_env_int("WP6_RECENT_TURNS_MAX", 8),
         wp6_recent_turns_max_chars=_env_int("WP6_RECENT_TURNS_MAX_CHARS", 320),
         wp6_fast_audit_enabled=_env_bool("WP6_FAST_AUDIT_ENABLED", False),

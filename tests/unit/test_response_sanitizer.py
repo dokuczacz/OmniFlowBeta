@@ -37,3 +37,24 @@ def test_sanitize_responses_final_text_blocks_internal_payload():
 def test_sanitize_responses_final_text_keeps_user_text():
     text = "Reasoning: checked tasks. Summary: you have 3 tasks today."
     assert handler._sanitize_responses_final_text(text) == text
+
+
+def test_sanitize_responses_final_text_blocks_truncated_manifest_fragment():
+    text = (
+        '{ "name":"OmniFlow_PA", "version":"1.0", "type":"runtime+tests", '
+        '"runtime":{"execution_policy":{"tools":["list_blobs"]}}, '
+        '"workflow":{"step_1_decision":{}}, "tests":{"framework":"harness"}'
+    )
+    out = handler._sanitize_responses_final_text(text)
+    assert "blocked" in out.lower()
+    assert "internal configuration content" in out
+
+
+def test_sanitize_responses_final_text_blocks_response_object_dump():
+    text = (
+        '{ "id":"resp_123", "object":"response", "instructions":[{"type":"message"}], '
+        '"tools":[{"type":"function"}], "output":[{"type":"message"}] }'
+    )
+    out = handler._sanitize_responses_final_text(text)
+    assert "blocked" in out.lower()
+    assert "internal configuration content" in out

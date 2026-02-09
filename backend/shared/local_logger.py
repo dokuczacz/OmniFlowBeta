@@ -200,10 +200,78 @@ def log_tool_call(
     )
 
 
+def log_response_id(
+    user_id: str,
+    thread_id: str,
+    response_id: str,
+    conversation_id: Optional[str] = None,
+    runtime: str = "responses",
+    metadata: Optional[Dict[str, Any]] = None
+) -> None:
+    """
+    Log OpenAI response_id for later retrieval.
+    
+    This creates both:
+    1. A structured log entry in backend_debug.log
+    2. A dedicated response_ids.jsonl file for easy querying
+    
+    Args:
+        user_id: User ID making the request
+        thread_id: Thread ID
+        response_id: OpenAI response ID (e.g., resp_...)
+        conversation_id: Optional conversation ID for stateful responses
+        runtime: Runtime mode (assistants, responses)
+        metadata: Additional context
+    """
+    try:
+        # Log to main debug log
+        log_metadata = {
+            "thread_id": thread_id,
+            "response_id": response_id,
+            "runtime": runtime,
+        }
+        if conversation_id:
+            log_metadata["conversation_id"] = conversation_id
+        if metadata:
+            log_metadata.update(metadata)
+        
+        LocalLogger.log_to_file(
+            function_name="tool_call_handler",
+            action="response_id_captured",
+            status="info",
+            user_id=user_id,
+            metadata=log_metadata
+        )
+        
+        # Also write to dedicated response_ids.jsonl for easy retrieval
+        log_path = LocalLogger._get_log_path()
+        response_ids_path = log_path.replace("backend_debug.log", "response_ids.jsonl")
+        
+        entry = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "user_id": user_id[:4] + "***" if len(user_id) > 4 else "***",
+            "thread_id": thread_id,
+            "response_id": response_id,
+            "conversation_id": conversation_id,
+            "runtime": runtime,
+        }
+        if metadata:
+            entry["metadata"] = metadata
+        
+        with open(response_ids_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        
+        logging.info(f"Logged response_id: {response_id} for thread: {thread_id}")
+        
+    except Exception as e:
+        logging.warning(f"Failed to log response_id: {e}")
+
+
 # Export main functions
 __all__ = [
     "LocalLogger",
     "log_request_start",
     "log_request_end",
-    "log_tool_call"
+    "log_tool_call",
+    "log_response_id"
 ]
