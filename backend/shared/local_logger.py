@@ -205,7 +205,7 @@ def attach_file_handler(function_name: str) -> Optional[logging.Handler]:
     Attach a file handler to the root logger for per-invocation logging.
     
     Args:
-        function_name: Name of the Azure Function
+        function_name: Name of the Azure Function (used for log identification)
     
     Returns:
         FileHandler instance or None if attachment fails
@@ -215,9 +215,9 @@ def attach_file_handler(function_name: str) -> Optional[logging.Handler]:
         file_handler = logging.FileHandler(log_path, encoding='utf-8')
         file_handler.setLevel(logging.DEBUG)
         
-        # Use a simple format for file logging
+        # Use a simple format for file logging, including function name
         formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            f'%(asctime)s - {function_name} - %(name)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         file_handler.setFormatter(formatter)
@@ -227,16 +227,16 @@ def attach_file_handler(function_name: str) -> Optional[logging.Handler]:
         
         return file_handler
     except Exception as e:
-        logging.warning(f"Failed to attach file handler: {e}")
+        logging.warning(f"Failed to attach file handler for {function_name}: {e}")
         return None
 
 
-def detach_file_handler(file_handler: logging.Handler) -> None:
+def detach_file_handler(file_handler: Optional[logging.Handler]) -> None:
     """
     Detach and close a file handler from the root logger.
     
     Args:
-        file_handler: The handler to detach
+        file_handler: The handler to detach, or None (which will be ignored)
     """
     try:
         if file_handler:
