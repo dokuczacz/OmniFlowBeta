@@ -18,6 +18,7 @@ tool_registry = {
     "get_filtered_data": get_filtered_data,
     "list_blobs": list_blobs,
     "read_blob_file": read_blob_file,
+    "read_blob": read_blob_file,  # Canonical alias
     "read_many_blobs": read_many_blobs,
     "remove_data_entry": remove_data_entry,
     "update_data_entry": update_data_entry,
