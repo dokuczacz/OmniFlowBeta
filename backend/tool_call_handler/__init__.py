@@ -41,7 +41,7 @@ except Exception:  # pragma: no cover
 # Allow importing shared helpers when running as a Functions app or locally
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
-    from shared.file_logger import attach_file_handler, detach_file_handler
+    from shared.local_logger import attach_file_handler, detach_file_handler
 except Exception:
     # Best-effort import; if it fails, we will continue without file logging
     attach_file_handler = None

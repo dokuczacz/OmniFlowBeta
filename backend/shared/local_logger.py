@@ -200,10 +200,80 @@ def log_tool_call(
     )
 
 
+def _sanitize_function_name(function_name: str) -> str:
+    """
+    Sanitize function name to prevent format string and log injection issues.
+    
+    Args:
+        function_name: The function name to sanitize
+    
+    Returns:
+        Sanitized function name with only safe characters
+    """
+    # Allow only alphanumeric, underscores, hyphens, and dots
+    return ''.join(
+        c if c.isalnum() or c in ('_', '-', '.') else '_'
+        for c in str(function_name)
+    )
+
+
+def attach_file_handler(function_name: str) -> Optional[logging.Handler]:
+    """
+    Attach a file handler to the root logger for per-invocation logging.
+    
+    Args:
+        function_name: Name of the Azure Function (used for log identification)
+    
+    Returns:
+        FileHandler instance or None if attachment fails
+    """
+    try:
+        log_path = LocalLogger._get_log_path()
+        file_handler = logging.FileHandler(log_path, encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        
+        # Sanitize function_name to prevent format string and log injection issues
+        safe_function_name = _sanitize_function_name(function_name)
+        
+        # Use a simple format for file logging, including function name
+        formatter = logging.Formatter(
+            f'%(asctime)s - {safe_function_name} - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(formatter)
+        
+        # Attach to root logger
+        logging.getLogger().addHandler(file_handler)
+        
+        return file_handler
+    except Exception as e:
+        # Use safe version in error message to prevent log injection
+        safe_name = _sanitize_function_name(function_name)
+        logging.warning(f"Failed to attach file handler for {safe_name}: {e}")
+        return None
+
+
+def detach_file_handler(file_handler: Optional[logging.Handler]) -> None:
+    """
+    Detach and close a file handler from the root logger.
+    
+    Args:
+        file_handler: The handler to detach, or None (which will be ignored)
+    """
+    try:
+        if file_handler:
+            logging.getLogger().removeHandler(file_handler)
+            file_handler.close()
+    except Exception as e:
+        logging.warning(f"Failed to detach file handler: {e}")
+
+
 # Export main functions
 __all__ = [
     "LocalLogger",
     "log_request_start",
     "log_request_end",
-    "log_tool_call"
+    "log_tool_call",
+    "attach_file_handler",
+    "detach_file_handler"
 ]

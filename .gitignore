@@ -91,7 +91,6 @@ backend/scripts/
 backend/tooling/
 backend/batch_tool_executor/
 backend/health_check/
-backend/shared/file_logger.py
 backend/TESTER_INSTRUCTIONS.md
 
 # Local tests (keep local by default)
