@@ -215,9 +215,13 @@ def attach_file_handler(function_name: str) -> Optional[logging.Handler]:
         file_handler = logging.FileHandler(log_path, encoding='utf-8')
         file_handler.setLevel(logging.DEBUG)
         
+        # Sanitize function_name to prevent format string issues
+        # Replace % characters that could interfere with logging format
+        safe_function_name = str(function_name).replace('%', '%%')
+        
         # Use a simple format for file logging, including function name
         formatter = logging.Formatter(
-            f'%(asctime)s - {function_name} - %(name)s - %(levelname)s - %(message)s',
+            f'%(asctime)s - {safe_function_name} - %(name)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         file_handler.setFormatter(formatter)
