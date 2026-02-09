@@ -139,6 +139,112 @@ OPENAI_CONTEXT_BUILDER_PROMPT_VERSION = str(
     os.environ.get("OPENAI_CONTEXT_BUILDER_PROMPT_VERSION", "") or ""
 ).strip()
 
+PA_INTENT_STAGES = (
+    "CALENDAR_QUERY",
+    "CALENDAR_WRITE",
+    "EMAIL_QUERY",
+    "EMAIL_WRITE",
+    "TASKS_MANAGE",
+    "DAILY_PLAN",
+    "NOTES_KB",
+    "DECISION_SUPPORT",
+    "DOC_ANALYSIS",
+    "REPORTING",
+    "TRAVEL_PLANNING",
+)
+PA_WRITE_STAGES = {"CALENDAR_WRITE", "EMAIL_WRITE", "TASKS_MANAGE"}
+
+
+def _pa_intent_router(user_text: str) -> Dict[str, Any]:
+    text = str(user_text or "").lower()
+    stage_scores = {stage: 0.0 for stage in PA_INTENT_STAGES}
+    evidence: list[str] = []
+
+    def _add(stage: str, keyword: str, weight: float = 1.0):
+        if keyword and keyword in text:
+            stage_scores[stage] += weight
+            evidence.append(f"{stage}:{keyword}")
+
+    email_terms = ["email", "mail", "inbox", "gmail", "outlook"]
+    email_write_terms = ["send", "draft", "write", "reply", "respond", "compose", "forward"]
+    email_query_terms = ["check", "read", "show", "find", "search", "unread", "latest", "last"]
+    calendar_terms = ["calendar", "meeting", "event", "appointment", "schedule"]
+    calendar_write_terms = ["schedule", "book", "reschedule", "move", "cancel", "create", "add", "invite"]
+    calendar_query_terms = ["when", "next", "upcoming", "availability", "free", "busy"]
+    tasks_terms = ["task", "todo", "to-do", "remind", "reminder", "follow up", "follow-up"]
+    plan_terms = ["plan my day", "daily plan", "agenda", "day plan", "schedule my day"]
+    notes_terms = ["note", "remember", "save", "store", "knowledge base", "kb", "notes"]
+    decision_terms = ["decide", "choose", "recommend", "compare", "pros and cons", "tradeoff", "advice"]
+    doc_terms = ["document", "pdf", "summarize", "analyze", "extract", "review", "report"]
+    reporting_terms = ["report", "metrics", "status update", "weekly summary", "kpi"]
+    travel_terms = ["travel", "trip", "flight", "hotel", "itinerary", "booking"]
+
+    for term in email_terms:
+        _add("EMAIL_QUERY", term, 0.5)
+        _add("EMAIL_WRITE", term, 0.5)
+    for term in email_write_terms:
+        _add("EMAIL_WRITE", term, 2.0)
+    for term in email_query_terms:
+        _add("EMAIL_QUERY", term, 1.5)
+
+    for term in calendar_terms:
+        _add("CALENDAR_QUERY", term, 0.5)
+        _add("CALENDAR_WRITE", term, 0.5)
+    for term in calendar_write_terms:
+        _add("CALENDAR_WRITE", term, 2.0)
+    for term in calendar_query_terms:
+        _add("CALENDAR_QUERY", term, 1.5)
+
+    for term in tasks_terms:
+        _add("TASKS_MANAGE", term, 1.5)
+    for term in plan_terms:
+        _add("DAILY_PLAN", term, 2.0)
+    for term in notes_terms:
+        _add("NOTES_KB", term, 1.5)
+    for term in decision_terms:
+        _add("DECISION_SUPPORT", term, 1.5)
+    for term in doc_terms:
+        _add("DOC_ANALYSIS", term, 1.5)
+    for term in reporting_terms:
+        _add("REPORTING", term, 1.5)
+    for term in travel_terms:
+        _add("TRAVEL_PLANNING", term, 1.5)
+
+    sorted_intents = sorted(stage_scores.items(), key=lambda item: item[1], reverse=True)
+    top_stage, top_score = sorted_intents[0]
+    second_score = sorted_intents[1][1] if len(sorted_intents) > 1 else 0.0
+    total_score = sum(stage_scores.values())
+
+    if total_score <= 0:
+        top_stage = "DECISION_SUPPORT"
+        top_score = 1.0
+        total_score = 1.0
+
+    top_intents = [
+        {"stage": stage, "p": round(score / total_score, 3)}
+        for stage, score in sorted_intents
+        if score > 0
+    ][:5]
+    if not top_intents:
+        top_intents = [{"stage": top_stage, "p": 1.0}]
+
+    need_clarification = top_score < 2.0 or (top_score - second_score) <= 1.0
+    clarify_questions = []
+    if need_clarification:
+        clarify_questions = [
+            "Czy chodzi o odczyt (QUERY), czy wykonanie akcji (WRITE)?",
+            "Podaj proszę dokładny zakres i oczekiwany rezultat.",
+        ]
+
+    return {
+        "top_intents": top_intents,
+        "recommended_stage": top_stage,
+        "recommended_phase": "DISCOVERY",
+        "need_clarification": need_clarification,
+        "clarify_questions": clarify_questions,
+        "evidence": evidence[:5],
+    }
+
 def _best_effort_debug(code: str, *, user_id: str = "", thread_id: str = "", error: Exception | None = None, **ctx: Any) -> None:
     logger = logging.getLogger()
     if not (DEBUG_TOOL_CALL_HANDLER or logger.isEnabledFor(logging.DEBUG)):
@@ -2666,6 +2772,9 @@ def run_responses(
     recent_turns: list[str] | None = None,
     run_id: str = "",
     trace_id: str = "",
+    stage: str = "",
+    phase: str = "",
+    intent_router: Dict[str, Any] | None = None,
 ) -> Tuple[str, list, Dict[str, Any], str]:
     """Responses API deterministic tool loop using a Prompt ID (dual-runtime mode)."""
     if not thread_id:
@@ -2693,6 +2802,8 @@ def run_responses(
         prompt_payload: Dict[str, Any] = {"id": OPENAI_PROMPT_ID}
         if OPENAI_PROMPT_VERSION:
             prompt_payload["version"] = OPENAI_PROMPT_VERSION
+        if stage or phase:
+            prompt_payload["variables"] = {"stage": stage, "phase": phase}
         create_kwargs: Dict[str, Any] = {
             "prompt": prompt_payload,
             "instructions": _runtime_instructions_for_turn(str(user_message or "")),
@@ -2707,6 +2818,7 @@ def run_responses(
                 "thread_id": str(thread_id),
                 "runtime": "responses",
                 "tool_source": tool_source,
+                **({"stage": stage, "phase": phase} if (stage or phase) else {}),
                 **(
                     {"recent_user_turns": _wp6_recent_turns_metadata(recent_turns_buffer)}
                     if recent_turns_buffer
@@ -2843,7 +2955,11 @@ def run_responses(
                 "responses_last_response_id": previous_response_id,
                 "tool_source": tool_source,
                 "inline_tools_count": len(create_kwargs.get("tools") or []),
+                "stage": stage,
+                "phase": phase,
             }
+            if intent_router:
+                meta["intent_router"] = intent_router
             # Persist only after reaching a "final" response to avoid saving a response id with pending tool calls.
             try:
                 if (not WP6_RESPONSES_STATELESS) and persist_handles and isinstance(handles, dict):
@@ -4127,6 +4243,30 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 wp6_meta["recent_user_turns_count"] = int(len(recent_turns or []))
                 wp6_meta["recent_user_turns_chars"] = int(sum(len(str(t or "")) for t in (recent_turns or [])))
 
+                requested_stage = str(body.get("stage") or "").strip().upper()
+                requested_phase = str(body.get("phase") or "").strip().upper()
+                intent_router = None
+                if not requested_stage or not requested_phase:
+                    intent_router = _pa_intent_router(user_message)
+                    if not requested_stage:
+                        requested_stage = str(intent_router.get("recommended_stage") or "").strip().upper()
+                    if not requested_phase:
+                        requested_phase = str(intent_router.get("recommended_phase") or "").strip().upper()
+                if not requested_stage:
+                    requested_stage = "DECISION_SUPPORT"
+                if not requested_phase:
+                    requested_phase = "DISCOVERY"
+                wp6_meta["pa_stage"] = requested_stage
+                wp6_meta["pa_phase"] = requested_phase
+                if intent_router:
+                    wp6_meta["pa_intent_router"] = intent_router
+                logging.info(
+                    "PA routing stage=%s phase=%s need_clarification=%s",
+                    requested_stage,
+                    requested_phase,
+                    bool(intent_router and intent_router.get("need_clarification")),
+                )
+
                 audit_id = uuid.uuid4().hex[:12] if WP6_FAST_AUDIT_ENABLED else ""
                 audit_in_path = ""
                 audit_out_path = ""
@@ -4333,6 +4473,9 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     recent_turns=recent_turns,
                     run_id=run_id,
                     trace_id=trace_id,
+                    stage=requested_stage,
+                    phase=requested_phase,
+                    intent_router=intent_router,
                 )
 
                 # Phase 2 (AUTO only): parse FAST response signal and optionally escalate to DEEP once.
@@ -4374,6 +4517,9 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                                     recent_turns=recent_turns,
                                     run_id=run_id,
                                     trace_id=trace_id,
+                                    stage=requested_stage,
+                                    phase=requested_phase,
+                                    intent_router=intent_router,
                                 )
                                 deep_signal, deep_cleaned = _wp6_parse_need_deep_signal(deep_resp or "")
                                 wp6_meta["need_deep_signal_deep"] = deep_signal
@@ -4628,4 +4774,3 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 detach_file_handler(file_handler)
             except Exception:
                 logging.warning("Failed to detach file log handler")
-
