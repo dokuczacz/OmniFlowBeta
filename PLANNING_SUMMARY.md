@@ -354,3 +354,86 @@ backend/shared/
 **Status**: 🟡 Planning Complete - Ready for Implementation Approval
 
 **Recommendation**: Review IMPLEMENTATION_PLAN_UPDATED.md and approve to begin Phase 1.
+
+---
+
+## 🧭 PA Semantic Prompting v1 (Stage/Phase) — Updated Plan
+
+### Goal
+Introduce semantic control for the Personal Assistant by passing `stage` and `phase` into the OpenAI Responses API (dashboard prompt variables), mirroring the CV-generator pattern.
+
+### Recommended Stages (PA intents)
+**Core**
+- CALENDAR_QUERY
+- CALENDAR_WRITE
+- EMAIL_QUERY
+- EMAIL_WRITE
+- TASKS_MANAGE
+- DAILY_PLAN
+- NOTES_KB
+- DECISION_SUPPORT
+
+**Pro/Work**
+- DOC_ANALYSIS
+- REPORTING
+- TRAVEL_PLANNING
+
+**Optional (future)**
+- CONTACTS_MANAGE
+- FILES_MANAGE
+- MEETING_SUMMARY
+
+### Recommended Phases (action gate)
+- DISCOVERY: clarify intent + missing data
+- PLAN: draft actions, no external mutations
+- CONFIRM: show exact actions, request approval
+- EXECUTE: run tools/mutations/sends
+- REPORT: results + optional trace/save
+
+---
+
+### Iteration 1 — Foundation (no architecture refactor)
+1) **Responses API payload**
+   - Add `prompt.variables = { stage, phase }`.
+2) **Inline Intent Router**
+   - Lightweight classifier returning top-k intents, `recommended_stage`, `recommended_phase`, `need_clarification`, and `clarify_questions`.
+3) **Logging**
+   - Log stage/phase in traces.
+
+**DoD**
+- Request includes variables.
+- Stage/phase visible in logs.
+- Dashboard prompt reacts to stage/phase (manual smoke test).
+
+### Iteration 2 — Gating & Safety
+1) Enforce PLAN → CONFIRM → EXECUTE for `*_WRITE`.
+2) Add “what will happen” summary in CONFIRM.
+3) Deny list of mutating actions in PLAN/CONFIRM.
+
+**DoD**
+- No mutating tools in PLAN/CONFIRM.
+- EMAIL_WRITE / CALENDAR_WRITE never execute without CONFIRM.
+
+### Iteration 3 — Logging for ML (WP6)
+1) Log: user_text, top_intents + p, final stage/phase, confirmation flag.
+2) Export JSONL dataset to storage.
+
+**DoD**
+- Dataset grows automatically.
+- Ready for future intent model training.
+
+---
+
+### Test Plan
+**Unit**
+- Responses API payload contains `prompt.variables` (stage/phase).
+- Intent Router JSON contract validation.
+- Gating test: `*_WRITE` cannot reach EXECUTE without CONFIRM.
+
+**Integration/E2E**
+1) “Zaplanuj mój dzień” → DAILY_PLAN → PLAN → CONFIRM → EXECUTE.
+2) “Napisz maila do X” → EMAIL_WRITE → PLAN → CONFIRM → EXECUTE.
+
+**UI (pre-req)**
+- RTL tests for PromptInput: render + typing + submit enabled/disabled.
+- RTL tests for ModelSelector (via multimodal input): model change updates state.
