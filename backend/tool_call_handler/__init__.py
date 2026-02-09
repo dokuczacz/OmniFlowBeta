@@ -103,6 +103,10 @@ WP6_FAST_AUDIT_ENABLED = str(os.environ.get("WP6_FAST_AUDIT_ENABLED", "0") or ""
 INTENT_CLASSIFIER_MODEL = os.environ.get("INTENT_CLASSIFIER_MODEL", "gpt-5.0-nano")
 INTENT_CLASSIFIER_ENABLED = os.environ.get("INTENT_CLASSIFIER_ENABLED", "true").lower() in ("1", "true", "yes")
 INTENT_CLASSIFIER_LOG_PATH = os.environ.get("INTENT_CLASSIFIER_LOG_PATH", "backend/intent_classifications.jsonl")
+# ML training dataset: blob storage (Azurite for local, Azure for prod)
+INTENT_CLASSIFIER_LOG_BLOB_ENABLED = os.environ.get("INTENT_CLASSIFIER_LOG_BLOB_ENABLED", "true").lower() in ("1", "true", "yes")
+INTENT_CLASSIFIER_LOG_BLOB_CONTAINER = os.environ.get("INTENT_CLASSIFIER_LOG_BLOB_CONTAINER", "training-data")
+INTENT_CLASSIFIER_LOG_BLOB_NAME = os.environ.get("INTENT_CLASSIFIER_LOG_BLOB_NAME", "analytics/intent_classifications.jsonl")
 # For ML training: log full text (default true for lab/dev)
 INTENT_CLASSIFIER_LOG_FULL_TEXT = os.environ.get("INTENT_CLASSIFIER_LOG_FULL_TEXT", "true").lower() in ("1", "true", "yes")
 WP6_FAST_AUDIT_MAX_CHARS = int(os.environ.get("WP6_FAST_AUDIT_MAX_CHARS", "16000") or 16000)
@@ -606,6 +610,10 @@ def _log_pa_intent_classification(
     """
     Log PA intent classification (stage routing) for ML training dataset.
     Records both input (user_message) and output (recommended_stage, confidence).
+    
+    Logs to:
+    - Azure Blob Storage (production: Azure Storage, local: Azurite)
+    - Path: {INTENT_CLASSIFIER_LOG_BLOB_CONTAINER}/{INTENT_CLASSIFIER_LOG_BLOB_NAME}
     """
     if not INTENT_CLASSIFIER_ENABLED:
         return
@@ -641,15 +649,77 @@ def _log_pa_intent_classification(
             entry["message_hash"] = msg_hash
             entry["message_len"] = len(user_message)
         
-        # Append to same log file (create if doesn't exist)
-        log_path = Path(_repo_root_dir()) / INTENT_CLASSIFIER_LOG_PATH
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+        # Log to blob storage (Azurite for local, Azure Blob for prod)
+        if INTENT_CLASSIFIER_LOG_BLOB_ENABLED:
+            _append_to_blob_jsonl(
+                json_entry=entry,
+                container_name=INTENT_CLASSIFIER_LOG_BLOB_CONTAINER,
+                blob_name=INTENT_CLASSIFIER_LOG_BLOB_NAME
+            )
+        else:
+            # Fallback to local filesystem if blob storage disabled
+            log_path = Path(_repo_root_dir()) / INTENT_CLASSIFIER_LOG_PATH
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
             
     except Exception as e:
         logging.debug(f"Failed to log PA intent classification: {e}")
+
+
+def _append_to_blob_jsonl(
+    json_entry: Dict[str, Any],
+    container_name: str,
+    blob_name: str
+) -> None:
+    """
+    Append a JSON entry to a blob stored as JSONL.
+    Works with both Azurite (local) and Azure Blob Storage (prod).
+    
+    Args:
+        json_entry: Dictionary to append as a JSON line
+        container_name: Blob storage container name
+        blob_name: Blob name (path) within container
+    """
+    try:
+        from azure.storage.blob import BlobServiceClient
+        from azure.core.exceptions import ResourceNotFoundError
+        
+        connection_string = os.environ.get("AzureWebJobsStorage") or os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+        if not connection_string:
+            logging.warning("Blob storage not configured (no AzureWebJobsStorage or AZURE_STORAGE_CONNECTION_STRING)")
+            return
+        
+        service_client = BlobServiceClient.from_connection_string(connection_string)
+        
+        # Ensure container exists
+        try:
+            service_client.get_container_client(container_name).get_container_properties()
+        except ResourceNotFoundError:
+            logging.info(f"Creating blob container: {container_name}")
+            try:
+                service_client.create_container(container_name)
+            except Exception:
+                pass  # May already exist (race condition)
+        
+        # Get blob client
+        blob_client = service_client.get_blob_client(container=container_name, blob=blob_name)
+        
+        # Read existing content (if any)
+        try:
+            existing = blob_client.download_blob().readall().decode("utf-8")
+        except ResourceNotFoundError:
+            existing = ""
+        
+        # Append new line
+        new_line = json.dumps(json_entry) + "\n"
+        updated_content = existing + new_line if existing else new_line
+        
+        # Write back (overwrite)
+        blob_client.upload_blob(updated_content.encode("utf-8"), overwrite=True)
+        
+    except Exception as e:
+        logging.debug(f"Failed to append to blob JSONL: {e}")
 
 
 def _runtime_instructions_for_turn(

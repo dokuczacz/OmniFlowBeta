@@ -21,6 +21,9 @@
     "INTENT_CLASSIFIER_ENABLED": "true",
     "INTENT_CLASSIFIER_MODEL": "gpt-5.0-nano",
     "INTENT_CLASSIFIER_LOG_PATH": "backend/intent_classifications.jsonl",
-    "INTENT_CLASSIFIER_LOG_FULL_TEXT": "true"
+    "INTENT_CLASSIFIER_LOG_FULL_TEXT": "true",
+    "INTENT_CLASSIFIER_LOG_BLOB_ENABLED": "true",
+    "INTENT_CLASSIFIER_LOG_BLOB_CONTAINER": "training-data",
+    "INTENT_CLASSIFIER_LOG_BLOB_NAME": "analytics/intent_classifications.jsonl"
   }
 }
