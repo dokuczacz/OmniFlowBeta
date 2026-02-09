@@ -8,7 +8,34 @@ type OmniRequest = {
   user_id?: string | null;
   stream?: boolean | null;
   stream_mode?: string | null;
+  gmail_status?: { authorized: boolean; email?: string | null } | null;
 };
+
+function parseBackendPayload(rawText: string): Record<string, unknown> | null {
+  const text = rawText.trim();
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    if (parsed && typeof parsed === "object") return parsed;
+  } catch {}
+  return null;
+}
+
+function extractBackendErrorMessage(
+  status: number,
+  rawText: string,
+  parsed: Record<string, unknown> | null
+): string {
+  if (parsed) {
+    const direct = parsed.error;
+    if (typeof direct === "string" && direct.trim()) return direct.trim();
+    const message = parsed.message;
+    if (typeof message === "string" && message.trim()) return message.trim();
+  }
+  const txt = rawText.trim();
+  if (txt) return txt;
+  return `Backend returned HTTP ${status}`;
+}
 
 export async function POST(request: Request) {
   const backendUrl = process.env.OMNIFLOW_BACKEND_URL || "";
@@ -42,6 +69,9 @@ export async function POST(request: Request) {
   if (typeof body.stream_mode === "string" && body.stream_mode.trim()) {
     payload.stream_mode = body.stream_mode.trim();
   }
+  if (body.gmail_status && typeof body.gmail_status === "object") {
+    payload.gmail_status = body.gmail_status;
+  }
 
   const targetUrl =
     typeof body.backend_url === "string" && body.backend_url.trim()
@@ -59,8 +89,18 @@ export async function POST(request: Request) {
     });
     if (body.stream) {
       if (!resp.body) {
-        const data = await resp.json().catch(() => ({}));
-        return NextResponse.json(data, { status: resp.status });
+        const rawText = await resp.text().catch(() => "");
+        const data = parseBackendPayload(rawText);
+        if (!resp.ok) {
+          return NextResponse.json(
+            {
+              error: extractBackendErrorMessage(resp.status, rawText, data),
+              raw: data ?? rawText,
+            },
+            { status: resp.status }
+          );
+        }
+        return NextResponse.json(data ?? {}, { status: resp.status });
       }
       return new Response(resp.body, {
         status: resp.status,
@@ -70,14 +110,18 @@ export async function POST(request: Request) {
         },
       });
     }
-    const data = await resp.json().catch(() => ({}));
+    const rawText = await resp.text().catch(() => "");
+    const data = parseBackendPayload(rawText);
     if (!resp.ok) {
       return NextResponse.json(
-        { error: data?.error || "Backend error", raw: data },
+        {
+          error: extractBackendErrorMessage(resp.status, rawText, data),
+          raw: data ?? rawText,
+        },
         { status: resp.status }
       );
     }
-    return NextResponse.json(data);
+    return NextResponse.json(data ?? {});
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : "Request failed" },

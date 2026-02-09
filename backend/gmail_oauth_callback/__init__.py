@@ -22,13 +22,28 @@ def _response(payload: Dict[str, Any], status_code: int = 200) -> func.HttpRespo
     )
 
 
-def _html(message: str, status_code: int = 200) -> func.HttpResponse:
-    body = f"""<!doctype html>
+def _html(message: str, status_code: int = 200, *, success: bool = False) -> func.HttpResponse:
+    # On success, notify the opener window and auto-close the popup.
+    if success:
+        body = """<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Gmail OAuth</title></head>
+<body>
+<h2>OAuth completed successfully</h2>
+<p>This window will close automatically.</p>
+<script>
+try { window.opener && window.opener.postMessage({type:"gmail_oauth_complete"}, "*"); } catch(e) {}
+setTimeout(function(){ window.close(); }, 600);
+</script>
+</body>
+</html>"""
+    else:
+        body = f"""<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Gmail OAuth</title></head>
 <body>
 <h2>{message}</h2>
-<p>You may now return to ChatGPT and proceed.</p>
+<p>You may close this window and try again.</p>
 </body>
 </html>"""
     return func.HttpResponse(body, status_code=status_code, mimetype="text/html")
@@ -81,4 +96,4 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         logging.error("gmail_oauth_callback failed: %s", exc, exc_info=True)
         return _html("Internal error", status_code=500)
 
-    return _html("OAuth completed successfully", status_code=200)
+    return _html("OAuth completed successfully", status_code=200, success=True)

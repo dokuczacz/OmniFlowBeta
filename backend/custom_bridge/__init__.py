@@ -184,7 +184,15 @@ def handle_oauth_status(user_id: str, _: Dict[str, Any], __: str | None = None) 
             "authorized": False,
             "user_id": user_id,
         }
-    return {
+    # Best-effort profile fetch to include the connected email address.
+    email: str | None = None
+    try:
+        gmail = GmailClient(user_id)
+        profile = gmail.request("get", "profile").json()
+        email = profile.get("emailAddress") or None
+    except Exception:
+        pass
+    result: Dict[str, Any] = {
         "action": "oauth_status",
         "authorized": True,
         "user_id": user_id,
@@ -192,6 +200,9 @@ def handle_oauth_status(user_id: str, _: Dict[str, Any], __: str | None = None) 
         "expires_at": stored.get("expires_at"),
         "saved_at": stored.get("saved_at"),
     }
+    if email:
+        result["email"] = email
+    return result
 
 
 def handle_ensure_authorized(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:

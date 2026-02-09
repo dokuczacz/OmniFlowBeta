@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import type { GmailStatus } from "@/components/mvp-shell";
 
 type ChatMessage = {
   id: string;
@@ -64,6 +65,9 @@ function extractStreamText(chunk: StreamChunk): string | null {
       if (parsed && typeof parsed.message === "string") {
         return parsed.message;
       }
+      if (parsed && typeof parsed.response === "string") {
+        return parsed.response;
+      }
     } catch {
       return chunk.response;
     }
@@ -72,16 +76,53 @@ function extractStreamText(chunk: StreamChunk): string | null {
   if (chunk.response && typeof chunk.response === "object") {
     const response = chunk.response as StreamChunk;
     if (typeof response.message === "string") return response.message;
-    return JSON.stringify(response, null, 2);
+    if (typeof response.response === "string") return response.response;
+    if (typeof response.assistant_text === "string") return response.assistant_text;
+    return null;
   }
   if (typeof chunk.content === "string") return chunk.content;
-  if (chunk.response && typeof chunk.response === "object") {
-    return JSON.stringify(chunk.response, null, 2);
-  }
   if (chunk.content && typeof chunk.content === "object") {
-    return JSON.stringify(chunk.content, null, 2);
+    const content = chunk.content as StreamChunk;
+    if (typeof content.message === "string") return content.message;
+    if (typeof content.response === "string") return content.response;
+    if (typeof content.assistant_text === "string") return content.assistant_text;
   }
   return null;
+}
+
+function looksLikeInternalPayload(text: string): boolean {
+  const raw = text.trim().toLowerCase();
+  if (!raw.startsWith("{")) return false;
+  const markers = [
+    '"runtime"',
+    '"workflow"',
+    '"execution_policy"',
+    '"format_rules"',
+    '"error_handling"',
+    '"output_template"',
+    '"tests"',
+  ];
+  const hits = markers.filter((m) => raw.includes(m)).length;
+  return hits >= 3;
+}
+
+function sanitizeAssistantDisplayText(text: string): string {
+  const raw = (text || "").trim();
+  if (!raw) return "";
+  if (looksLikeInternalPayload(raw)) {
+    return "Assistant response was blocked because internal configuration content was generated instead of a user reply.";
+  }
+  return raw;
+}
+
+function extractApiErrorMessage(payload: Record<string, unknown>): string {
+  const direct = payload.error;
+  if (typeof direct === "string" && direct.trim()) return direct.trim();
+  const message = payload.message;
+  if (typeof message === "string" && message.trim()) return message.trim();
+  const response = payload.response;
+  if (typeof response === "string" && response.trim()) return response.trim();
+  return "Backend returned an error.";
 }
 
 function parseStreamBuffer(
@@ -150,12 +191,14 @@ export function MVPChat({
   activeUser,
   chatEnabled,
   streamMode,
+  gmailStatus,
   onStatusUpdate = () => {},
 }: {
   backendUrl: string;
   activeUser: string;
   chatEnabled: boolean;
   streamMode: string;
+  gmailStatus?: GmailStatus;
   onStatusUpdate?: (status: string, threadId: string | null) => void;
 }) {
   const [input, setInput] = useState("");
@@ -379,6 +422,9 @@ export function MVPChat({
           user_id: activeUser || null,
           stream: requestStream,
           stream_mode: streamMode,
+          gmail_status: gmailStatus
+            ? { authorized: gmailStatus.authorized, email: gmailStatus.email ?? null }
+            : undefined,
         }),
       });
       setContentType(resp.headers.get("content-type"));
@@ -387,7 +433,7 @@ export function MVPChat({
         const elapsed = Math.round(performance.now() - started);
         setLatencyMs(elapsed);
         const errorText = await resp.text();
-        let errorMessage = "Backend error";
+        let errorMessage = `Backend HTTP ${resp.status}`;
         try {
           const parsed = JSON.parse(errorText) as Record<string, unknown>;
           if (typeof parsed.error === "string") {
@@ -399,6 +445,13 @@ export function MVPChat({
           if (errorText.trim()) {
             errorMessage = errorText;
           }
+        }
+        const normalizedError = errorMessage.trim().toLowerCase();
+        if (
+          normalizedError === "internal server error" ||
+          normalizedError === "backend error"
+        ) {
+          errorMessage = `Backend HTTP ${resp.status}: internal server error (check backend logs).`;
         }
         setStatus("error");
         setError(errorMessage);
@@ -421,7 +474,23 @@ export function MVPChat({
           string,
           unknown
         >;
-        const assistantText = extractStreamText(data) ?? "";
+        const statusValue =
+          typeof data.status === "string" ? data.status.toLowerCase() : "";
+        if (statusValue === "error") {
+          const elapsed = Math.round(performance.now() - started);
+          setLatencyMs(elapsed);
+          const errorMessage = extractApiErrorMessage(data);
+          setStatus("error");
+          setError(errorMessage);
+          setAssistantContent(assistantId, `(Error) ${errorMessage}`);
+          appendRun("error", elapsed, nextThreadId, trimmed);
+          onStatusUpdate?.("Assistant finished (error).", nextThreadId);
+          onStatusUpdate?.("Waiting for input...", nextThreadId);
+          return;
+        }
+        const assistantText = sanitizeAssistantDisplayText(
+          extractStreamText(data) ?? ""
+        );
         if (typeof data.thread_id === "string" && data.thread_id) {
           nextThreadId = data.thread_id;
           setThreadId(data.thread_id);
@@ -433,7 +502,7 @@ export function MVPChat({
           onStatusUpdate?.("Agent is collecting data from tools...", nextThreadId);
         }
 
-        const finalText = assistantText || JSON.stringify(data, null, 2);
+        const finalText = assistantText || "No response from assistant.";
         if (streamMode === "simulate") {
           onStatusUpdate?.("Rendering response...", nextThreadId);
           await simulateStreaming(assistantId, finalText);
@@ -525,11 +594,13 @@ export function MVPChat({
         try {
           const parsed = JSON.parse(rawText) as StreamChunk;
           toolsCount = toolCallsCount(parsed);
-          const extracted = extractStreamText(parsed);
+          const extracted = sanitizeAssistantDisplayText(
+            extractStreamText(parsed) ?? ""
+          );
           if (extracted) {
             fallbackText = extracted;
           } else {
-            fallbackText = JSON.stringify(parsed, null, 2);
+            fallbackText = "No response from assistant.";
           }
         } catch {
           // keep raw text

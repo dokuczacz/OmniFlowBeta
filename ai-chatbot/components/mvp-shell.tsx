@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -9,6 +9,12 @@ import { MVPChat } from "@/components/mvp-chat";
 type UserEntry = {
   id: string;
   label: string;
+};
+
+export type GmailStatus = {
+  authorized: boolean;
+  email?: string;
+  checkedAt?: string;
 };
 
 export function MVPShell({ initialBackendUrl }: { initialBackendUrl: string }) {
@@ -23,6 +29,102 @@ export function MVPShell({ initialBackendUrl }: { initialBackendUrl: string }) {
   const [statusHistory, setStatusHistory] = useState<
     { id: string; label: string }[]
   >([]);
+
+  // --- Gmail OAuth state ---
+  const [gmailStatus, setGmailStatus] = useState<GmailStatus>({ authorized: false });
+  const [gmailLoading, setGmailLoading] = useState(false);
+  const gmailPopupRef = useRef<Window | null>(null);
+
+  const checkGmailStatus = useCallback(async (userId: string) => {
+    if (!userId) return;
+    setGmailLoading(true);
+    try {
+      const resp = await fetch("/api/gmail", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "oauth_status", user_id: userId }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      const result = data?.result ?? data;
+      const next: GmailStatus = {
+        authorized: !!result?.authorized,
+        email: result?.email ?? undefined,
+        checkedAt: new Date().toISOString(),
+      };
+      setGmailStatus(next);
+      if (typeof window !== "undefined") {
+        localStorage.setItem(`mvp_gmail_status_${userId}`, JSON.stringify(next));
+      }
+    } catch {
+      // keep previous status on transient failures
+    } finally {
+      setGmailLoading(false);
+    }
+  }, []);
+
+  const handleConnectGmail = useCallback(async () => {
+    if (!activeUser) return;
+    setGmailLoading(true);
+    try {
+      const resp = await fetch("/api/gmail", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "oauth_authorize", user_id: activeUser }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      const authorizeUrl = data?.result?.authorize_url;
+      if (!authorizeUrl) {
+        setGmailLoading(false);
+        return;
+      }
+      const popup = window.open(authorizeUrl, "gmail_oauth", "width=600,height=700");
+      gmailPopupRef.current = popup;
+
+      // Fallback: poll popup.closed every 1s
+      const pollTimer = window.setInterval(() => {
+        if (popup && popup.closed) {
+          window.clearInterval(pollTimer);
+          gmailPopupRef.current = null;
+          void checkGmailStatus(activeUser);
+        }
+      }, 1000);
+    } catch {
+      setGmailLoading(false);
+    }
+  }, [activeUser, checkGmailStatus]);
+
+  // Listen for postMessage from popup
+  useEffect(() => {
+    const handler = (event: MessageEvent) => {
+      if (event.data?.type === "gmail_oauth_complete") {
+        gmailPopupRef.current = null;
+        if (activeUser) {
+          void checkGmailStatus(activeUser);
+        }
+      }
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, [activeUser, checkGmailStatus]);
+
+  // Restore persisted gmail status on user change
+  useEffect(() => {
+    if (!activeUser) {
+      setGmailStatus({ authorized: false });
+      return;
+    }
+    const stored = localStorage.getItem(`mvp_gmail_status_${activeUser}`);
+    if (stored) {
+      try {
+        setGmailStatus(JSON.parse(stored) as GmailStatus);
+      } catch {
+        setGmailStatus({ authorized: false });
+      }
+    } else {
+      setGmailStatus({ authorized: false });
+    }
+  }, [activeUser]);
+
   const logFrontEnd = useCallback(
     (status: string, threadId: string | null) => {
       const payload = {
@@ -144,6 +246,7 @@ export function MVPShell({ initialBackendUrl }: { initialBackendUrl: string }) {
   const handleConfirmUser = () => {
     if (!activeUser) return;
     setConfirmedUser(activeUser);
+    void checkGmailStatus(activeUser);
   };
 
   const handleChangeUser = () => {
@@ -187,6 +290,28 @@ export function MVPShell({ initialBackendUrl }: { initialBackendUrl: string }) {
               Add
             </Button>
           </div>
+        </div>
+
+        <div className="space-y-3 rounded-xl border border-border/40 bg-muted/20 p-3">
+          <div className="text-xs uppercase tracking-[0.2em] text-muted-foreground">
+            Gmail
+          </div>
+          {gmailStatus.authorized ? (
+            <div className="flex items-center gap-2 text-sm">
+              <span className="h-2 w-2 rounded-full bg-green-500" />
+              <span className="truncate">{gmailStatus.email || "Connected"}</span>
+            </div>
+          ) : (
+            <Button
+              type="button"
+              variant="secondary"
+              className="w-full"
+              disabled={gmailLoading || !activeUser}
+              onClick={handleConnectGmail}
+            >
+              {gmailLoading ? "Connecting..." : "Connect Gmail"}
+            </Button>
+          )}
         </div>
 
         <div className="space-y-3 rounded-xl border border-dashed border-border/50 bg-background/60 p-3">
@@ -250,6 +375,7 @@ export function MVPShell({ initialBackendUrl }: { initialBackendUrl: string }) {
               activeUser={activeUser}
               chatEnabled={isUserConfirmed}
               streamMode={streamMode}
+              gmailStatus={gmailStatus}
               onStatusUpdate={(status, threadId) =>
                 handleStatusUpdate(status, threadId)
               }

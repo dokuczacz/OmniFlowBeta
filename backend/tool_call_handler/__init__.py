@@ -411,25 +411,40 @@ def _needs_task_first_mode(user_message: str) -> bool:
     return any(token in text for token in triggers)
 
 
-def _runtime_instructions_for_turn(user_message: str) -> str:
+def _runtime_instructions_for_turn(
+    user_message: str,
+    *,
+    gmail_status: Dict[str, Any] | None = None,
+) -> str:
     """
     Build per-turn runtime instructions while staying stateless.
     """
     base = str(OPENAI_RUNTIME_INSTRUCTIONS or "").strip()
     if not _needs_task_first_mode(user_message):
-        return base
-    task_first = (
-        "Task-first policy (personal assistance): "
-        "when the user asks for updates/what is new, check user's own data first via tools "
-        "before asking follow-up questions or giving general news. "
-        "Preferred order: list_blobs(include_meta=true) -> read_blob_file(TM.json if present) "
-        "-> read_blob_file(handles.json) -> read_many_blobs(interactions/index.jsonl or related files). "
-        "If TM.json is missing, explicitly state checked files and continue with closest task-related sources. "
-        "Only provide general world news when user explicitly asks for external news."
-    )
-    if not base:
-        return task_first
-    return f"{base}\n\n{task_first}"
+        parts = [base] if base else []
+    else:
+        task_first = (
+            "Task-first policy (personal assistance): "
+            "when the user asks for updates/what is new, check user's own data first via tools "
+            "before asking follow-up questions or giving general news. "
+            "Preferred order: list_blobs(include_meta=true) -> read_blob_file(TM.json if present) "
+            "-> read_blob_file(handles.json) -> read_many_blobs(interactions/index.jsonl or related files). "
+            "If TM.json is missing, explicitly state checked files and continue with closest task-related sources. "
+            "Only provide general world news when user explicitly asks for external news."
+        )
+        parts = [base, task_first] if base else [task_first]
+
+    # Gmail integration awareness
+    if isinstance(gmail_status, dict) and gmail_status.get("authorized"):
+        email = str(gmail_status.get("email") or "").strip()
+        if email:
+            parts.append(f"Gmail integration: connected to {email}. You can use Gmail tools (send, list, get) on behalf of the user.")
+        else:
+            parts.append("Gmail integration: connected (email unknown). You can use Gmail tools (send, list, get) on behalf of the user.")
+    else:
+        parts.append("Gmail integration: not connected. If the user asks about email, let them know they need to connect Gmail first via the sidebar button.")
+
+    return "\n\n".join(p for p in parts if p)
 
 
 def _responses_resolve_tool_source() -> str:
@@ -2775,6 +2790,7 @@ def run_responses(
     stage: str = "",
     phase: str = "",
     intent_router: Dict[str, Any] | None = None,
+    gmail_status: Dict[str, Any] | None = None,
 ) -> Tuple[str, list, Dict[str, Any], str]:
     """Responses API deterministic tool loop using a Prompt ID (dual-runtime mode)."""
     if not thread_id:
@@ -2806,7 +2822,7 @@ def run_responses(
             prompt_payload["variables"] = {"stage": stage, "phase": phase}
         create_kwargs: Dict[str, Any] = {
             "prompt": prompt_payload,
-            "instructions": _runtime_instructions_for_turn(str(user_message or "")),
+            "instructions": _runtime_instructions_for_turn(str(user_message or ""), gmail_status=gmail_status),
             "input": current_input,
             "tool_choice": "auto",
             "parallel_tool_calls": False,
@@ -4012,6 +4028,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         params = body.get("params", {})
         log_interaction = bool(body.get("log_interaction", True))
         trace_id = str(body.get("trace_id") or "").strip()
+        gmail_status_raw = body.get("gmail_status")
+        gmail_status = gmail_status_raw if isinstance(gmail_status_raw, dict) else None
 
         # Direct actions bypass agent/tool loop
         if action in ["save_interaction", "get_interaction_history"]:
@@ -4476,6 +4494,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     stage=requested_stage,
                     phase=requested_phase,
                     intent_router=intent_router,
+                    gmail_status=gmail_status,
                 )
 
                 # Phase 2 (AUTO only): parse FAST response signal and optionally escalate to DEEP once.
@@ -4520,6 +4539,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                                     stage=requested_stage,
                                     phase=requested_phase,
                                     intent_router=intent_router,
+                                    gmail_status=gmail_status,
                                 )
                                 deep_signal, deep_cleaned = _wp6_parse_need_deep_signal(deep_resp or "")
                                 wp6_meta["need_deep_signal_deep"] = deep_signal
