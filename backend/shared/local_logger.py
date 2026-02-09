@@ -215,9 +215,12 @@ def attach_file_handler(function_name: str) -> Optional[logging.Handler]:
         file_handler = logging.FileHandler(log_path, encoding='utf-8')
         file_handler.setLevel(logging.DEBUG)
         
-        # Sanitize function_name to prevent format string issues
-        # Replace % characters that could interfere with logging format
-        safe_function_name = str(function_name).replace('%', '%%')
+        # Sanitize function_name to prevent format string and log injection issues
+        # Allow only alphanumeric, underscores, hyphens, and dots
+        safe_function_name = ''.join(
+            c if c.isalnum() or c in ('_', '-', '.') else '_'
+            for c in str(function_name)
+        )
         
         # Use a simple format for file logging, including function name
         formatter = logging.Formatter(
@@ -231,7 +234,9 @@ def attach_file_handler(function_name: str) -> Optional[logging.Handler]:
         
         return file_handler
     except Exception as e:
-        logging.warning(f"Failed to attach file handler for {function_name}: {e}")
+        # Use safe version in error message to prevent log injection
+        safe_name = ''.join(c if c.isalnum() or c in ('_', '-', '.') else '_' for c in str(function_name))
+        logging.warning(f"Failed to attach file handler for {safe_name}: {e}")
         return None
 
 
