@@ -200,10 +200,58 @@ def log_tool_call(
     )
 
 
+def attach_file_handler(function_name: str) -> Optional[logging.Handler]:
+    """
+    Attach a file handler to the root logger for per-invocation logging.
+    
+    Args:
+        function_name: Name of the Azure Function
+    
+    Returns:
+        FileHandler instance or None if attachment fails
+    """
+    try:
+        log_path = LocalLogger._get_log_path()
+        file_handler = logging.FileHandler(log_path, encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        
+        # Use a simple format for file logging
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(formatter)
+        
+        # Attach to root logger
+        logging.getLogger().addHandler(file_handler)
+        
+        return file_handler
+    except Exception as e:
+        logging.warning(f"Failed to attach file handler: {e}")
+        return None
+
+
+def detach_file_handler(file_handler: logging.Handler) -> None:
+    """
+    Detach and close a file handler from the root logger.
+    
+    Args:
+        file_handler: The handler to detach
+    """
+    try:
+        if file_handler:
+            logging.getLogger().removeHandler(file_handler)
+            file_handler.close()
+    except Exception as e:
+        logging.warning(f"Failed to detach file handler: {e}")
+
+
 # Export main functions
 __all__ = [
     "LocalLogger",
     "log_request_start",
     "log_request_end",
-    "log_tool_call"
+    "log_tool_call",
+    "attach_file_handler",
+    "detach_file_handler"
 ]
