@@ -200,6 +200,23 @@ def log_tool_call(
     )
 
 
+def _sanitize_function_name(function_name: str) -> str:
+    """
+    Sanitize function name to prevent format string and log injection issues.
+    
+    Args:
+        function_name: The function name to sanitize
+    
+    Returns:
+        Sanitized function name with only safe characters
+    """
+    # Allow only alphanumeric, underscores, hyphens, and dots
+    return ''.join(
+        c if c.isalnum() or c in ('_', '-', '.') else '_'
+        for c in str(function_name)
+    )
+
+
 def attach_file_handler(function_name: str) -> Optional[logging.Handler]:
     """
     Attach a file handler to the root logger for per-invocation logging.
@@ -216,11 +233,7 @@ def attach_file_handler(function_name: str) -> Optional[logging.Handler]:
         file_handler.setLevel(logging.DEBUG)
         
         # Sanitize function_name to prevent format string and log injection issues
-        # Allow only alphanumeric, underscores, hyphens, and dots
-        safe_function_name = ''.join(
-            c if c.isalnum() or c in ('_', '-', '.') else '_'
-            for c in str(function_name)
-        )
+        safe_function_name = _sanitize_function_name(function_name)
         
         # Use a simple format for file logging, including function name
         formatter = logging.Formatter(
@@ -235,7 +248,7 @@ def attach_file_handler(function_name: str) -> Optional[logging.Handler]:
         return file_handler
     except Exception as e:
         # Use safe version in error message to prevent log injection
-        safe_name = ''.join(c if c.isalnum() or c in ('_', '-', '.') else '_' for c in str(function_name))
+        safe_name = _sanitize_function_name(function_name)
         logging.warning(f"Failed to attach file handler for {safe_name}: {e}")
         return None
 
