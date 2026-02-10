@@ -10,6 +10,40 @@ type OmniRequest = {
   stream_mode?: string | null;
 };
 
+function normalizeToolCallHandlerUrl(input: string): string {
+  const raw = (input || "").trim();
+  if (!raw) return "";
+
+  // Preserve `?code=...` and other query params (Azure Functions auth).
+  try {
+    const url = new URL(raw);
+    const path = url.pathname.replace(/\/+$/, "");
+    if (path.endsWith("/api/tool_call_handler")) return url.toString();
+    if (path.endsWith("/api/custom_bridge")) {
+      url.pathname = path.replace(/\/api\/custom_bridge$/, "/api/tool_call_handler");
+      return url.toString();
+    }
+    if (path.endsWith("/api")) {
+      url.pathname = `${path}/tool_call_handler`;
+      return url.toString();
+    }
+    if (path.includes("/api/")) return url.toString();
+    url.pathname = `${path}/api/tool_call_handler`;
+    return url.toString();
+  } catch {
+    const trimmed = raw.replace(/\/+$/, "");
+    if (!trimmed) return "";
+    if (trimmed.includes("/api/tool_call_handler")) return trimmed;
+    if (trimmed.includes("/api/custom_bridge")) {
+      const base = trimmed.split("/api/")[0]?.replace(/\/+$/, "") ?? "";
+      return base ? `${base}/api/tool_call_handler` : trimmed;
+    }
+    if (trimmed.endsWith("/api")) return `${trimmed}/tool_call_handler`;
+    if (trimmed.includes("/api/")) return trimmed;
+    return `${trimmed}/api/tool_call_handler`;
+  }
+}
+
 export async function POST(request: Request) {
   const backendUrl = process.env.OMNIFLOW_BACKEND_URL || "";
   if (!backendUrl) {
@@ -43,17 +77,25 @@ export async function POST(request: Request) {
     payload.stream_mode = body.stream_mode.trim();
   }
 
-  const targetUrl =
+  const targetUrl = normalizeToolCallHandlerUrl(
     typeof body.backend_url === "string" && body.backend_url.trim()
       ? body.backend_url.trim()
-      : backendUrl;
+      : backendUrl
+  );
 
   try {
+    const functionKey =
+      process.env.OMNIFLOW_AZFUNC_FUNCTION_KEY ||
+      process.env.OMNIFLOW_CUSTOM_BRIDGE_FUNCTION_KEY ||
+      process.env.OMNIFLOW_AZFUNC_CUSTOM_BRIDGE_KEY ||
+      process.env.FUNCTION_CODE_PROXY_ROUTER ||
+      "";
     const resp = await fetch(targetUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         ...(body.user_id ? { "X-User-Id": body.user_id } : {}),
+        ...(functionKey ? { "x-functions-key": functionKey } : {}),
       },
       body: JSON.stringify(payload),
     });

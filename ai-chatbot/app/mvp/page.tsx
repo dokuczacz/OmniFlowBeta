@@ -1,10 +1,4 @@
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { MVPShell } from "@/components/mvp-shell";
 
 export default function MVPPage() {
@@ -22,16 +16,8 @@ export default function MVPPage() {
 
       <MVPShell
         initialBackendUrl={process.env.OMNIFLOW_BACKEND_URL || ""}
+        initialBackendUrlProd={process.env.OMNIFLOW_BACKEND_URL_PROD || ""}
       />
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-lg">Runs / Reports</CardTitle>
-        </CardHeader>
-        <CardContent className="text-sm text-muted-foreground">
-          Runs history placeholder.
-        </CardContent>
-      </Card>
     </main>
   );
 }

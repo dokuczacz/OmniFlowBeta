@@ -184,10 +184,18 @@ def handle_oauth_status(user_id: str, _: Dict[str, Any], __: str | None = None) 
             "authorized": False,
             "user_id": user_id,
         }
+    email_address = None
+    try:
+        gmail = GmailClient(user_id)
+        profile = gmail.request("get", "profile").json()
+        email_address = profile.get("emailAddress")
+    except Exception:
+        email_address = None
     return {
         "action": "oauth_status",
         "authorized": True,
         "user_id": user_id,
+        **({"email_address": email_address} if email_address else {}),
         "scope": stored.get("scope"),
         "expires_at": stored.get("expires_at"),
         "saved_at": stored.get("saved_at"),
@@ -204,10 +212,18 @@ def handle_ensure_authorized(user_id: str, payload: Dict[str, Any], access_token
         }
     stored = GmailTokenStore.load_tokens(user_id)
     if stored:
+        email_address = None
+        try:
+            gmail = GmailClient(user_id)
+            profile = gmail.request("get", "profile").json()
+            email_address = profile.get("emailAddress")
+        except Exception:
+            email_address = None
         return {
             "action": "ensure_authorized",
             "authorized": True,
             "user_id": user_id,
+            **({"email_address": email_address} if email_address else {}),
             "scope": stored.get("scope"),
             "expires_at": stored.get("expires_at"),
             "saved_at": stored.get("saved_at"),

@@ -3,8 +3,6 @@
 
 import os
 
-from shared.starter_pack import ensure_starter_pack
-
 from .add_new_data import add_new_data
 from .get_current_time import get_current_time
 from .get_filtered_data import get_filtered_data
@@ -15,6 +13,7 @@ from .remove_data_entry import remove_data_entry
 from .update_data_entry import update_data_entry
 from .upload_data_or_file import upload_data_or_file
 from .manage_files import manage_files
+from .gmail_action import gmail_action
 
 tool_registry = {
     "add_new_data": add_new_data,
@@ -27,12 +26,16 @@ tool_registry = {
     "update_data_entry": update_data_entry,
     "upload_data_or_file": upload_data_or_file,
     "manage_files": manage_files,
+    "gmail_action": gmail_action,
 }
 
 def dispatch_tool(tool_name, args, user_id):
     if tool_name not in tool_registry:
         raise ValueError(f"Unknown tool: {tool_name}")
-    # Avoid touching real storage during unit tests unless explicitly forced.
-    if not os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("OMNIFLOW_STARTER_PACK_FORCE") in ("1", "true", "yes"):
+    # Starter pack must be explicit (`action=pa_init`) in tool_call_handler.
+    # For tool-level tests we can force initialization via OMNIFLOW_STARTER_PACK_FORCE=1.
+    if os.environ.get("OMNIFLOW_STARTER_PACK_FORCE") in ("1", "true", "yes"):
+        from shared.starter_pack import ensure_starter_pack
+
         ensure_starter_pack(user_id)
     return tool_registry[tool_name](args, user_id)

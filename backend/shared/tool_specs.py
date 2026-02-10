@@ -518,6 +518,36 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                 "output": {"status": "success"}
             }
         ]
+    },
+
+    "gmail_action": {
+        "description": "Gmail operations via stored OAuth tokens (send/list/get/trash/delete/status).",
+        "method": "POST",
+        "params": {
+            "action": {
+                "type": "str",
+                "required": True,
+                "description": "One of: oauth_status | gmail_send | gmail_list | gmail_get | gmail_trash | gmail_delete"
+            },
+            "payload": {
+                "type": "dict",
+                "required": False,
+                "description": "Action payload. For gmail_send: {to, subject, body}. For list: {q,label,max_results,page_token}. For get/trash/delete: {message_id}."
+            }
+        },
+        "aliases": {
+            "params": "payload"
+        },
+        "examples": [
+            {
+                "input": {"action": "oauth_status"},
+                "output": {"status": "success", "result": {"authorized": False}}
+            },
+            {
+                "input": {"action": "gmail_send", "payload": {"to": "me@example.com", "subject": "Test", "body": "Hello"}},
+                "output": {"status": "success", "result": {"message_id": "..."}},
+            },
+        ],
     }
 }
 
