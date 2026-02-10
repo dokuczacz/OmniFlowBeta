@@ -4143,6 +4143,58 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=200,
             )
 
+        # Deterministic tool execution (read-only allowlist) for E2E verification.
+        # This avoids requiring local Azure connection strings to validate persisted artifacts in prod.
+        if action == "tool_exec":
+            if not user_id:
+                return _make_response({"status": "error", "error": "user_id is required", "action": action}, status_code=400)
+            params = body.get("params", {}) or {}
+            confirm = bool(params.get("confirm", False))
+            if not confirm:
+                return _make_response(
+                    {
+                        "status": "error",
+                        "action": action,
+                        "error": "Confirmation required. Set params.confirm=true to execute a tool.",
+                        "required_confirmation": True,
+                    },
+                    status_code=409,
+                )
+            tool_name = str(params.get("tool_name") or "").strip()
+            tool_arguments = params.get("tool_arguments") or {}
+            if not isinstance(tool_arguments, dict):
+                return _make_response(
+                    {"status": "error", "action": action, "error": "params.tool_arguments must be an object"},
+                    status_code=400,
+                )
+            # Read-only allowlist.
+            allowed = {"read_blob_file", "list_blobs"}
+            if tool_name not in allowed:
+                return _make_response(
+                    {"status": "error", "action": action, "error": f"tool not allowed: {tool_name}", "allowed_tools": sorted(allowed)},
+                    status_code=403,
+                )
+            try:
+                result_str, info = execute_tool_call(tool_name, tool_arguments, str(user_id))
+                # Best-effort parse; keep response compact.
+                parsed = None
+                try:
+                    parsed = json.loads(result_str) if isinstance(result_str, str) else None
+                except Exception:
+                    parsed = None
+                resp = {
+                    "status": "success",
+                    "action": action,
+                    "tool_name": tool_name,
+                    "tool_arguments": tool_arguments,
+                    "result": parsed if parsed is not None else None,
+                    "result_excerpt": (result_str[:4000] if isinstance(result_str, str) else str(result_str)[:4000]),
+                    "tool_call": info or {},
+                }
+                return _make_response(resp, status_code=200)
+            except Exception as exc:
+                return _make_response({"status": "error", "action": action, "error": str(exc)}, status_code=500)
+
         if action in ["wp7_prepare_audit", "wp7_run_audit"]:
             if not user_id:
                 return _make_response({"error": "user_id is required"}, status_code=400)
