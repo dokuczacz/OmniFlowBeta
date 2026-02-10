@@ -72,8 +72,20 @@ DEBUG_TOOL_CALL_HANDLER = os.environ.get("DEBUG_TOOL_CALL_HANDLER", "").lower() 
 OMNIFLOW_DEBUG = os.environ.get("OMNIFLOW_DEBUG", "").lower() in ("1", "true", "yes")
 DEBUG_TOOL_CALL_HANDLER = bool(DEBUG_TOOL_CALL_HANDLER or OMNIFLOW_DEBUG)
 OMNIFLOW_MOCK_AGENT = os.environ.get("OMNIFLOW_MOCK_AGENT", "").lower() in ("1", "true", "yes")
-RESPONSES_INCLUDE_TOOLS = os.environ.get("RESPONSES_INCLUDE_TOOLS", "").lower() in ("1", "true", "yes")
+# Backend-owned tools: default ON so the system never depends on dashboard-configured tools.
+# Set RESPONSES_INCLUDE_TOOLS=0 to disable (debug only).
+RESPONSES_INCLUDE_TOOLS = os.environ.get("RESPONSES_INCLUDE_TOOLS", "1").lower() in ("1", "true", "yes")
 RESPONSES_INSTRUCTIONS = str(os.environ.get("RESPONSES_INSTRUCTIONS", "") or "").strip()
+if not RESPONSES_INSTRUCTIONS:
+    # Default "tool discipline" so the agent cannot silently hallucinate state changes.
+    # Keep this short; the backend owns tool allowlists/validation anyway.
+    RESPONSES_INSTRUCTIONS = (
+        "You are OmniFlow PA. Use tools for any claim about user data.\n"
+        "- If asked about tasks, read/update TM.json via tools. Do not claim writes without a write tool call.\n"
+        "- If asked about Gmail, first call gmail_action oauth_status. If unauthorized, instruct user to Connect.\n"
+        "- If asked to summarize blob contents, call list_blobs (and read_blob_file only if needed).\n"
+        "If tools are unavailable or a tool errors, say so and stop."
+    )
 OPENAI_MAX_REQUESTS = int(os.environ.get("OPENAI_MAX_REQUESTS", "0") or 0)
 # PA init gate: do not auto-create starter pack on request; require explicit confirmation via action.
 PA_REQUIRE_INIT = str(os.environ.get("PA_REQUIRE_INIT", "1") or "").strip().lower() in ("1", "true", "yes", "y", "on")
@@ -166,7 +178,7 @@ def _pa_write_intention_artifact(
         safe_rid = str(run_id or "").strip() or uuid.uuid4().hex[:12]
         path = f"semantics/intents/INTENT_{ts}_{safe_tid}_{safe_rid}.json"
         payload = {
-            "schema_version": "omniflow.pa.intention.v1",
+            "schema_version": "omniflow.pa.intention.v2",
             "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
             "user_id": str(user_id),
             "thread_id": str(thread_id),
@@ -224,10 +236,14 @@ def _pa_run_intention_step(
             "Return STRICT JSON only (no markdown, no prose).\n"
             "Schema:\n"
             "{"
-            "\"schema_version\":\"omniflow.pa.intention.v1\","
+            "\"schema_version\":\"omniflow.pa.intention.v2\","
+            "\"pa_function_id\":\"PA-01|PA-02|...|PA-15\","
+            "\"pa_function_name\":\"...\","
             "\"intent\":\"...\","
             "\"language\":\"...\","
             "\"requires_internet\":true|false,"
+            "\"target_artifacts\":[\"TM.json\"],"
+            "\"required_tools\":[\"list_blobs\"],"
             "\"candidate_tools\":[{\"name\":\"...\",\"why\":\"...\",\"args_hint\":{}}],"
             "\"write_intent\": {\"will_write\":true|false,\"target_files\":[\"TM.json\"],\"consent_required\":true|false}"
             "}\n"
@@ -257,9 +273,73 @@ def _pa_run_intention_step(
         try:
             payload = json.loads(out_text) if out_text else {}
         except Exception:
-            payload = {"schema_version": "omniflow.pa.intention.v1", "parse_error": True, "raw": out_text[:4000]}
+            payload = {"schema_version": "omniflow.pa.intention.v2", "parse_error": True, "raw": out_text[:4000]}
         if not isinstance(payload, dict):
-            payload = {"schema_version": "omniflow.pa.intention.v1", "parse_error": True, "raw": out_text[:4000]}
+            payload = {"schema_version": "omniflow.pa.intention.v2", "parse_error": True, "raw": out_text[:4000]}
+
+        # Normalize to v2 contract deterministically (models may omit fields).
+        try:
+            def _guess_pa_function_id(p: Dict[str, Any]) -> str:
+                tools = []
+                for t in (p.get("candidate_tools") or []):
+                    if isinstance(t, dict) and t.get("name"):
+                        tools.append(str(t.get("name") or ""))
+                tools_set = set(tools)
+                if any(x in tools_set for x in ("list_blobs", "read_blob_file", "read_many_blobs")):
+                    return "PA-08"  # Artifact Analysis
+                if "gmail_action" in tools_set:
+                    return "PA-14"  # Mail Analysis & Triage
+                targets = []
+                wi = p.get("write_intent") if isinstance(p.get("write_intent"), dict) else {}
+                for tf in (wi.get("target_files") or []):
+                    if tf:
+                        targets.append(str(tf))
+                if any(t.upper() == "TM.JSON" for t in targets):
+                    return "PA-01"  # Task Management
+                return "PA-12"  # Function Proposal (safe default)
+
+            def _pa_name(pa_id: str) -> str:
+                mapping = {
+                    "PA-01": "Task Management",
+                    "PA-02": "Daily Planning",
+                    "PA-03": "Priority Reasoning",
+                    "PA-04": "Goal Alignment",
+                    "PA-05": "Progress Review",
+                    "PA-06": "Knowledge Recall",
+                    "PA-07": "Note & Idea Handling",
+                    "PA-08": "Artifact Analysis",
+                    "PA-09": "Context Integration",
+                    "PA-10": "Decision Reflection",
+                    "PA-11": "Summary & Reporting",
+                    "PA-12": "Function Proposal",
+                    "PA-13": "Mail Management",
+                    "PA-14": "Mail Analysis & Triage",
+                    "PA-15": "Mail-to-Action Mapping",
+                }
+                return mapping.get(pa_id, "")
+
+            payload["schema_version"] = "omniflow.pa.intention.v2"
+            if "pa_function_id" not in payload or not str(payload.get("pa_function_id") or "").strip():
+                payload["pa_function_id"] = _guess_pa_function_id(payload)
+            if "pa_function_name" not in payload or not str(payload.get("pa_function_name") or "").strip():
+                payload["pa_function_name"] = _pa_name(str(payload.get("pa_function_id") or ""))
+            if "target_artifacts" not in payload or not isinstance(payload.get("target_artifacts"), list):
+                wi = payload.get("write_intent") if isinstance(payload.get("write_intent"), dict) else {}
+                payload["target_artifacts"] = [str(x) for x in (wi.get("target_files") or []) if str(x).strip()]
+            if "required_tools" not in payload or not isinstance(payload.get("required_tools"), list):
+                tools = []
+                for t in (payload.get("candidate_tools") or []):
+                    if isinstance(t, dict) and t.get("name"):
+                        tools.append(str(t.get("name") or ""))
+                payload["required_tools"] = [x for x in tools if x]
+            if "intent" not in payload:
+                payload["intent"] = ""
+            if "requires_internet" not in payload:
+                payload["requires_internet"] = False
+        except Exception:
+            # Best-effort only; never break the run on normalization errors.
+            pass
+
         path = _pa_write_intention_artifact(
             user_id=str(user_id),
             thread_id=str(thread_id),
@@ -2702,6 +2782,7 @@ def run_responses(
     retried_with_smaller_output = False
     retried_after_tpm_reset = False
     recent_turns_buffer: list[str] = list(recent_turns or [])
+    tools_included_names: List[str] = []
 
     for iteration in range(25):
         prompt_vars = {
@@ -2747,11 +2828,25 @@ def run_responses(
             allowed_domains = []
             if PA_WEB_SEARCH_ALLOWED_DOMAINS:
                 allowed_domains = [d.strip() for d in PA_WEB_SEARCH_ALLOWED_DOMAINS.split(",") if d.strip()]
-            create_kwargs["tools"] = build_responses_tools(
+            tools_payload = build_responses_tools(
                 include_web_search=bool(PA_WEB_SEARCH_ENABLED) and bool(include_web_search),
                 web_search_context_size=str(PA_WEB_SEARCH_CONTEXT_SIZE or "low"),
                 web_search_allowed_domains=allowed_domains,
             )
+            create_kwargs["tools"] = tools_payload
+            # Compact provenance: record tool names included in this call.
+            try:
+                tools_included_names = []
+                for t in tools_payload:
+                    if not isinstance(t, dict):
+                        continue
+                    if t.get("type") == "web_search":
+                        tools_included_names.append("web_search")
+                    elif t.get("type") == "function":
+                        tools_included_names.append(str(t.get("name") or ""))
+                tools_included_names = [x for x in tools_included_names if x]
+            except Exception:
+                tools_included_names = []
         registered_call_ids = [call.get("call_id") for call in all_tool_calls if isinstance(call, dict)]
         logging.debug(
             "responses.prepare user_id=%s thread_id=%s iteration=%s tool_calls_registered=%s tool_calls_kw=%s recent_turns=%s input_type=%s",
@@ -2869,9 +2964,24 @@ def run_responses(
             meta = {
                 "responses_conversation_id": conversation_id,
                 "responses_last_response_id": previous_response_id,
-                "stage": stage,
-                "phase": phase,
+                "prompt_id": str(OPENAI_PROMPT_ID or ""),
+                "prompt_vars": {
+                    "phase": str(phase or ""),
+                    "stage": str(stage or ""),
+                    "user_id": str(user_id or ""),
+                    "thread_id": str(thread_id or ""),
+                    "run_id": str(run_id or ""),
+                },
+                "stage": str(stage or ""),
+                "phase": str(phase or ""),
+                "tools_included": tools_included_names,
+                "include_web_search": bool(include_web_search),
+                "web_search_enabled": bool(PA_WEB_SEARCH_ENABLED),
             }
+            try:
+                meta["web_search_allowed_domains"] = allowed_domains if isinstance(allowed_domains, list) else []
+            except Exception:
+                pass
             if intent_router:
                 meta["intent_router"] = intent_router
             # Persist only after reaching a "final" response to avoid saving a response id with pending tool calls.
@@ -3461,12 +3571,37 @@ def finalize_response(
         logging.debug("Failed to emit concise interaction summary")
 
     if log_interaction:
+        # Persist provenance so we can later audit prompt/phase/stage and tool availability.
+        interaction_metadata: Dict[str, Any] = {
+            "runtime_used": str(runtime_used or ""),
+        }
+        if isinstance(responses_meta, dict):
+            # Keep it compact; interaction_logs.json is user data.
+            try:
+                for k in (
+                    "prompt_id",
+                    "prompt_vars",
+                    "phase",
+                    "stage",
+                    "tools_included",
+                    "include_web_search",
+                    "web_search_enabled",
+                    "web_search_allowed_domains",
+                    "intent_artifact_path",
+                    "pa_intention",
+                    "pa_intent_router",
+                ):
+                    if k in responses_meta:
+                        interaction_metadata[k] = responses_meta.get(k)
+            except Exception:
+                pass
         save_interaction_log_inprocess(
             user_id=user_id,
             user_message=user_message,
             assistant_response=assistant_response,
             thread_id=thread_id,
             tool_calls_info=all_tool_calls,
+            interaction_metadata=interaction_metadata,
         )
 
     # `total_ms` can be supplied by caller; default to 0 if not provided.
@@ -3863,6 +3998,7 @@ def save_interaction_log_inprocess(
     assistant_response: str,
     thread_id: str,
     tool_calls_info: list,
+    interaction_metadata: Dict[str, Any] | None = None,
 ):
     if not ENABLE_SAVE_INTERACTION:
         return
@@ -3877,7 +4013,11 @@ def save_interaction_log_inprocess(
                 assistant_response=str(assistant_response or ""),
                 thread_id=str(thread_id or "") if thread_id is not None else None,
                 tool_calls=tool_calls_info or [],
-                metadata={"assistant_id": ASSISTANT_ID, "source": "tool_call_handler"},
+                metadata={
+                    "assistant_id": ASSISTANT_ID,
+                    "source": "tool_call_handler",
+                    **(interaction_metadata or {}),
+                },
             )
             if DEBUG_TOOL_CALL_HANDLER:
                 logging.debug(f"[DEBUG] save_interaction in-process result={_redact_sensitive(result)}")
@@ -3921,6 +4061,31 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             resp_direct = handle_direct_actions(req, body, action, user_id)
             if resp_direct is not None:
                 return resp_direct
+
+        # Deterministic maintenance: rebuild interactions index after merges/imports.
+        if action == "pa_rebuild_interactions_index":
+            if not user_id:
+                return _make_response({"status": "error", "error": "user_id is required", "action": action}, status_code=400)
+            params = body.get("params", {}) or {}
+            confirm = bool(params.get("confirm", False))
+            if not confirm:
+                return _make_response(
+                    {
+                        "status": "error",
+                        "action": action,
+                        "error": "Confirmation required. Set params.confirm=true to rebuild interactions/index.jsonl.",
+                        "required_confirmation": True,
+                    },
+                    status_code=409,
+                )
+            try:
+                from save_interaction.service import rebuild_interactions_index
+
+                max_scan = int(params.get("max_scan", 5000) or 5000)
+                result = rebuild_interactions_index(str(user_id), max_scan=max_scan)
+                return _make_response({"status": "success", "action": action, "result": result}, status_code=200)
+            except Exception as exc:
+                return _make_response({"status": "error", "action": action, "error": str(exc)}, status_code=500)
 
         # Explicit PA initialization (starter pack) requires confirmation.
         if action == "pa_init":

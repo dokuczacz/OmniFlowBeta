@@ -80,12 +80,18 @@ export default function GmailIntegrationPage() {
       >;
       setRaw(JSON.stringify(data, null, 2));
       if (!resp.ok) {
-        const msg =
-          typeof data.message === "string"
-            ? data.message
-            : typeof data.error === "string"
-              ? data.error
-              : JSON.stringify(data);
+        const msg = (() => {
+          if (
+            data &&
+            typeof data === "object" &&
+            ("status" in data || "target_url" in data || "body_excerpt" in data)
+          ) {
+            return JSON.stringify(data, null, 2);
+          }
+          if (typeof data.message === "string") return data.message;
+          if (typeof data.error === "string") return data.error;
+          return JSON.stringify(data);
+        })();
         setError(msg);
         return null;
       }
@@ -135,7 +141,14 @@ export default function GmailIntegrationPage() {
 
     void gmailCall("ensure_authorized").then((next) => {
       const url = String(next?.authorize_url || "").trim();
-      if (!url) return;
+      if (!url) {
+        try {
+          popup?.close();
+        } catch {
+          // ignore
+        }
+        return;
+      }
       if (popup) {
         try {
           popup.location.href = url;

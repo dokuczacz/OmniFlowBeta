@@ -65,6 +65,27 @@ function deriveCustomBridgeUrl(toolCallHandlerUrl: string): string {
   }
 }
 
+function pickFunctionKeyFromEnv(): { key: string; source: string | null } {
+  // Do not expose the key value; we return only which env var was used.
+  const candidates: Array<[string, string | undefined]> = [
+    ["OMNIFLOW_AZFUNC_FUNCTION_KEY", process.env.OMNIFLOW_AZFUNC_FUNCTION_KEY],
+    ["OMNIFLOW_CUSTOM_BRIDGE_FUNCTION_KEY", process.env.OMNIFLOW_CUSTOM_BRIDGE_FUNCTION_KEY],
+    ["OMNIFLOW_AZFUNC_CUSTOM_BRIDGE_KEY", process.env.OMNIFLOW_AZFUNC_CUSTOM_BRIDGE_KEY],
+    ["FUNCTION_CODE_CUSTOM_BRIDGE", process.env.FUNCTION_CODE_CUSTOM_BRIDGE],
+    ["FUNCTION_CODE_PROXY_ROUTER", process.env.FUNCTION_CODE_PROXY_ROUTER],
+    // Common ad-hoc names (fallback).
+    ["AZURE_FUNCTION_KEY", process.env.AZURE_FUNCTION_KEY],
+    ["AZURE_FUNCTIONS_KEY", process.env.AZURE_FUNCTIONS_KEY],
+    ["FUNCTIONS_KEY", process.env.FUNCTIONS_KEY],
+    ["X_FUNCTIONS_KEY", process.env.X_FUNCTIONS_KEY],
+  ];
+  for (const [name, value] of candidates) {
+    const v = (value || "").trim();
+    if (v) return { key: v, source: name };
+  }
+  return { key: "", source: null };
+}
+
 export async function POST(request: Request) {
   let body: GmailBridgeRequest;
   try {
@@ -107,13 +128,7 @@ export async function POST(request: Request) {
   };
 
   try {
-    const functionKey =
-      process.env.OMNIFLOW_AZFUNC_FUNCTION_KEY ||
-      process.env.OMNIFLOW_CUSTOM_BRIDGE_FUNCTION_KEY ||
-      process.env.OMNIFLOW_AZFUNC_CUSTOM_BRIDGE_KEY ||
-      process.env.FUNCTION_CODE_CUSTOM_BRIDGE ||
-      process.env.FUNCTION_CODE_PROXY_ROUTER ||
-      "";
+    const { key: functionKey, source: functionKeySource } = pickFunctionKeyFromEnv();
     const resp = await fetch(targetUrl, {
       method: "POST",
       headers: {
@@ -131,6 +146,8 @@ export async function POST(request: Request) {
           error: "custom_bridge returned non-JSON response",
           status: resp.status,
           target_url: targetUrl,
+          function_key_present: !!functionKey,
+          function_key_source: functionKeySource,
           body_excerpt: text.slice(0, 300),
         },
         { status: 502 }

@@ -29,6 +29,8 @@ def _status(user_id: str) -> Dict[str, Any]:
 
 
 def _send(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not GmailTokenStore.load_tokens(user_id):
+        return {"status": "error", "code": "NOT_AUTHORIZED", "error": "Gmail tokens not found for user", "authorized": False, "user_id": user_id, "action": "gmail_send"}
     to = payload.get("to")
     if not to:
         raise ValueError("payload.to is required")
@@ -48,6 +50,8 @@ def _send(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _list(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not GmailTokenStore.load_tokens(user_id):
+        return {"status": "error", "code": "NOT_AUTHORIZED", "error": "Gmail tokens not found for user", "authorized": False, "user_id": user_id, "action": "gmail_list"}
     params: Dict[str, Any] = {}
     if payload.get("max_results") is not None:
         params["maxResults"] = int(payload.get("max_results"))
@@ -69,6 +73,8 @@ def _list(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _get(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not GmailTokenStore.load_tokens(user_id):
+        return {"status": "error", "code": "NOT_AUTHORIZED", "error": "Gmail tokens not found for user", "authorized": False, "user_id": user_id, "action": "gmail_get"}
     mid = payload.get("message_id")
     if not mid:
         raise ValueError("payload.message_id is required")
@@ -79,6 +85,8 @@ def _get(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _trash(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not GmailTokenStore.load_tokens(user_id):
+        return {"status": "error", "code": "NOT_AUTHORIZED", "error": "Gmail tokens not found for user", "authorized": False, "user_id": user_id, "action": "gmail_trash"}
     mid = payload.get("message_id")
     if not mid:
         raise ValueError("payload.message_id is required")
@@ -88,6 +96,8 @@ def _trash(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _delete(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not GmailTokenStore.load_tokens(user_id):
+        return {"status": "error", "code": "NOT_AUTHORIZED", "error": "Gmail tokens not found for user", "authorized": False, "user_id": user_id, "action": "gmail_delete"}
     mid = payload.get("message_id")
     if not mid:
         raise ValueError("payload.message_id is required")
@@ -118,4 +128,3 @@ def gmail_action(args: Dict[str, Any], user_id: str) -> Dict[str, Any]:
         return _delete(user_id, payload)
 
     raise ValueError(f"Unknown action: {action}")
-
