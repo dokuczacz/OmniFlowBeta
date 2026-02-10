@@ -72,7 +72,22 @@ DEBUG_TOOL_CALL_HANDLER = os.environ.get("DEBUG_TOOL_CALL_HANDLER", "").lower() 
 OMNIFLOW_DEBUG = os.environ.get("OMNIFLOW_DEBUG", "").lower() in ("1", "true", "yes")
 DEBUG_TOOL_CALL_HANDLER = bool(DEBUG_TOOL_CALL_HANDLER or OMNIFLOW_DEBUG)
 OMNIFLOW_MOCK_AGENT = os.environ.get("OMNIFLOW_MOCK_AGENT", "").lower() in ("1", "true", "yes")
+RESPONSES_INCLUDE_TOOLS = os.environ.get("RESPONSES_INCLUDE_TOOLS", "").lower() in ("1", "true", "yes")
+RESPONSES_INSTRUCTIONS = str(os.environ.get("RESPONSES_INSTRUCTIONS", "") or "").strip()
 OPENAI_MAX_REQUESTS = int(os.environ.get("OPENAI_MAX_REQUESTS", "0") or 0)
+# PA init gate: do not auto-create starter pack on request; require explicit confirmation via action.
+PA_REQUIRE_INIT = str(os.environ.get("PA_REQUIRE_INIT", "1") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+# Optional intention step (separate model call) for ML artifacts / traceability.
+PA_INTENTION_ENABLED = str(os.environ.get("PA_INTENTION_ENABLED", "1") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+PA_INTENTION_MODEL = str(os.environ.get("PA_INTENTION_MODEL", "gpt-5-nano") or "gpt-5-nano").strip()
+PA_INTENTION_REASONING_EFFORT = str(os.environ.get("PA_INTENTION_REASONING_EFFORT", "low") or "low").strip().lower()
+PA_INTENTION_MAX_OUTPUT_TOKENS = int(os.environ.get("PA_INTENTION_MAX_OUTPUT_TOKENS", "600") or 600)
+
+# Optional built-in web search tool (OpenAI hosted tool). If enabled, it is added to the Responses tools list.
+PA_WEB_SEARCH_ENABLED = str(os.environ.get("PA_WEB_SEARCH_ENABLED", "1") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+PA_WEB_SEARCH_CONTEXT_SIZE = str(os.environ.get("PA_WEB_SEARCH_CONTEXT_SIZE", "low") or "low").strip().lower()
+PA_WEB_SEARCH_ALLOWED_DOMAINS = str(os.environ.get("PA_WEB_SEARCH_ALLOWED_DOMAINS", "") or "").strip()
 # WP6 routing: when UI does not send `context_mode`, fall back to this default.
 # Values: AUTO | FAST | DEEP
 WP6_DEFAULT_CONTEXT_MODE = (os.environ.get("WP6_DEFAULT_CONTEXT_MODE", "AUTO") or "AUTO").strip().upper()
@@ -92,6 +107,268 @@ _openai_lock = threading.Lock()
 _openai_count = 0
 CACHE_LOCK = threading.Lock()
 _handles_cache: Dict[str, Dict[str, Any]] = {}
+
+# Best-effort manifest updater: tool_call_handler can mutate blobs via tools like
+# `upload_data_or_file`, but those code paths do not automatically update
+# `manifests/{user_id}/manifest.json` (unlike add_new_data/update_data_entry endpoints).
+def _best_effort_update_manifest_after_tool_call(
+    *,
+    user_id: str,
+    tool_name: str,
+    tool_args: Dict[str, Any] | None,
+    result_str: str,
+) -> None:
+    try:
+        from shared.azure_client import AzureBlobClient
+        from shared.manifest_helper import (
+            build_manifest_entry,
+            upsert_manifest_entry,
+            remove_manifest_entry,
+            rename_manifest_entry,
+        )
+    except Exception:
+        return
+
+# PA starter pack: explicit init only (no silent auto-create).
+def _pa_has_starter_pack(user_id: str) -> bool:
+    try:
+        from shared.azure_client import AzureBlobClient
+
+        return bool(AzureBlobClient.blob_exists("SYS.json", user_id=str(user_id)))
+    except Exception:
+        return False
+
+
+def _pa_init_starter_pack(user_id: str) -> Dict[str, Any]:
+    from shared.starter_pack import ensure_starter_pack
+
+    return ensure_starter_pack(str(user_id))
+
+
+def _pa_write_intention_artifact(
+    *,
+    user_id: str,
+    thread_id: str,
+    run_id: str,
+    phase: str,
+    stage: str,
+    model: str,
+    request_message: str,
+    intent_payload: Dict[str, Any],
+) -> str:
+    """
+    Persist intention artifact as JSON for ML.
+    Best-effort: never raises.
+    """
+    try:
+        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        safe_tid = str(thread_id or "").strip() or "no_thread"
+        safe_rid = str(run_id or "").strip() or uuid.uuid4().hex[:12]
+        path = f"semantics/intents/INTENT_{ts}_{safe_tid}_{safe_rid}.json"
+        payload = {
+            "schema_version": "omniflow.pa.intention.v1",
+            "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
+            "user_id": str(user_id),
+            "thread_id": str(thread_id),
+            "run_id": str(run_id),
+            "phase": str(phase or ""),
+            "stage": str(stage or ""),
+            "model": str(model or ""),
+            "request_message": str(request_message or "")[:4000],
+            "intention": intent_payload,
+        }
+        execute_tool_call("upload_data_or_file", {"target_blob_name": path, "file_content": payload}, user_id)
+        _best_effort_update_manifest_after_tool_call(
+            user_id=str(user_id),
+            tool_name="upload_data_or_file",
+            tool_args={"target_blob_name": path, "file_content": {"schema_version": payload.get("schema_version")}},
+            result_str=json.dumps({"status": "success"}),
+        )
+        return path
+    except Exception:
+        return ""
+
+
+def _pa_run_intention_step(
+    *,
+    openai_client: OpenAI,
+    user_id: str,
+    thread_id: str,
+    run_id: str,
+    phase: str,
+    stage: str,
+    user_message: str,
+) -> Tuple[Dict[str, Any], str]:
+    """
+    Separate "intention" call (no tools) to produce an ML-ready artifact.
+    Returns (intent_payload, artifact_path).
+    """
+    if not PA_INTENTION_ENABLED:
+        return {}, ""
+    try:
+        _emit_run_progress(
+            user_id=str(user_id),
+            thread_id=str(thread_id),
+            run_id=str(run_id or ""),
+            trace_id="",
+            status="in_progress",
+            stage="intention",
+            message=f"Intention: calling model {PA_INTENTION_MODEL}",
+            async_save=True,
+        )
+    except Exception:
+        pass
+    try:
+        prompt = (
+            "You are an intention router for OmniFlow Personal Assistance (PA).\n"
+            "Return STRICT JSON only (no markdown, no prose).\n"
+            "Schema:\n"
+            "{"
+            "\"schema_version\":\"omniflow.pa.intention.v1\","
+            "\"intent\":\"...\","
+            "\"language\":\"...\","
+            "\"requires_internet\":true|false,"
+            "\"candidate_tools\":[{\"name\":\"...\",\"why\":\"...\",\"args_hint\":{}}],"
+            "\"write_intent\": {\"will_write\":true|false,\"target_files\":[\"TM.json\"],\"consent_required\":true|false}"
+            "}\n"
+            f"Phase={phase or ''}; Stage={stage or ''}\n"
+            "User message:\n"
+            f"{user_message}"
+        )
+        call_kwargs = {
+            "model": PA_INTENTION_MODEL,
+            "input": prompt,
+            "tool_choice": "none",
+            "parallel_tool_calls": False,
+            "max_output_tokens": int(PA_INTENTION_MAX_OUTPUT_TOKENS),
+            "metadata": {
+                "purpose": "pa_intention",
+                "user_id": str(user_id),
+                "thread_id": str(thread_id),
+                "run_id": str(run_id or ""),
+                "phase": str(phase or ""),
+                "stage": str(stage or ""),
+            },
+        }
+        if PA_INTENTION_REASONING_EFFORT in ("low", "medium", "high"):
+            call_kwargs["reasoning"] = {"effort": PA_INTENTION_REASONING_EFFORT}
+        resp = _openai_call(openai_client.responses.create, **call_kwargs)
+        out_text = str(getattr(resp, "output_text", None) or "").strip()
+        try:
+            payload = json.loads(out_text) if out_text else {}
+        except Exception:
+            payload = {"schema_version": "omniflow.pa.intention.v1", "parse_error": True, "raw": out_text[:4000]}
+        if not isinstance(payload, dict):
+            payload = {"schema_version": "omniflow.pa.intention.v1", "parse_error": True, "raw": out_text[:4000]}
+        path = _pa_write_intention_artifact(
+            user_id=str(user_id),
+            thread_id=str(thread_id),
+            run_id=str(run_id or ""),
+            phase=str(phase or ""),
+            stage=str(stage or ""),
+            model=str(PA_INTENTION_MODEL),
+            request_message=str(user_message or ""),
+            intent_payload=payload,
+        )
+        return payload, path
+    except Exception as exc:
+        _best_effort_debug("pa_intention_failed", user_id=str(user_id), thread_id=str(thread_id), error=exc)
+        return {}, ""
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        return
+
+    name = str(tool_name or "").strip()
+    args = tool_args if isinstance(tool_args, dict) else {}
+
+    if name not in ("upload_data_or_file", "manage_files", "add_new_data", "update_data_entry", "remove_data_entry"):
+        return
+
+    # Don't update manifest on failures.
+    try:
+        parsed = json.loads(result_str) if isinstance(result_str, str) else {}
+    except Exception:
+        parsed = {}
+    if isinstance(parsed, dict):
+        status = str(parsed.get("status") or "").lower()
+        if status and status not in ("success", "ok"):
+            return
+        if parsed.get("error"):
+            return
+
+    try:
+        container = AzureBlobClient.get_container_client()
+    except Exception:
+        return
+
+    if name == "manage_files":
+        op = str(args.get("operation") or "").strip().lower()
+        src = str(args.get("source_name") or "").lstrip("/")
+        tgt = str(args.get("target_name") or "").lstrip("/")
+        if not src:
+            return
+        old_namespaced = f"users/{uid}/{src}"
+        if op == "delete":
+            try:
+                remove_manifest_entry(container, uid, old_namespaced)
+            except Exception:
+                pass
+            return
+        if op == "rename" and tgt:
+            new_namespaced = f"users/{uid}/{tgt}"
+            try:
+                rename_manifest_entry(container, uid, old_namespaced, new_namespaced, display_name=tgt)
+            except Exception:
+                pass
+            return
+        return
+
+    # For blob writes, upsert a lightweight entry.
+    target = str(args.get("target_blob_name") or "").lstrip("/")
+    if not target:
+        return
+
+    namespaced = f"users/{uid}/{target}"
+
+    # Conservative size estimate without embedding contents.
+    payload_bytes = b""
+    content_type = "application/octet-stream"
+    try:
+        if name == "upload_data_or_file":
+            fc = args.get("file_content")
+            if isinstance(fc, (dict, list)):
+                payload_bytes = json.dumps(fc, ensure_ascii=False, indent=2).encode("utf-8")
+                content_type = "application/json"
+            elif isinstance(fc, (bytes, bytearray)):
+                payload_bytes = bytes(fc)
+            else:
+                payload_bytes = str(fc or "").encode("utf-8")
+                if target.lower().endswith(".json"):
+                    content_type = "application/json"
+        else:
+            payload_bytes = (result_str or "").encode("utf-8")
+            if target.lower().endswith(".json"):
+                content_type = "application/json"
+    except Exception:
+        payload_bytes = (result_str or "").encode("utf-8")
+
+    try:
+        entry = build_manifest_entry(
+            namespaced=namespaced,
+            target_blob_name=target,
+            payload={
+                "target_blob_name": target,
+                "category": "artifact",
+                "source": "tool_call_handler",
+                "metadata": {"tool_name": name},
+            },
+            content_type=content_type,
+            size=len(payload_bytes or b""),
+        )
+        upsert_manifest_entry(container, uid, entry)
+    except Exception:
+        return
 
 # WP6.M1: preferences cache (best-effort; no hard dependency)
 _prefs_cache: Dict[str, Dict[str, Any]] = {}
@@ -2400,11 +2677,12 @@ def run_responses(
     recent_turns: list[str] | None = None,
     run_id: str = "",
     trace_id: str = "",
-    stage: str = "",
-    phase: str = "",
     intent_router: Dict[str, Any] | None = None,
+    phase: str = "",
+    stage: str = "",
+    include_web_search: bool = False,
 ) -> Tuple[str, list, Dict[str, Any], str]:
-    """Responses API deterministic tool loop using a Prompt ID (dual-runtime mode)."""
+    """Responses API deterministic tool loop using a Prompt ID."""
     if not thread_id:
         thread_id = f"handle_{uuid.uuid4().hex[:12]}"
 
@@ -2426,11 +2704,15 @@ def run_responses(
     recent_turns_buffer: list[str] = list(recent_turns or [])
 
     for iteration in range(25):
-        prompt_payload: Dict[str, Any] = {"id": OPENAI_PROMPT_ID}
-        if stage or phase:
-            prompt_payload["variables"] = {"stage": stage, "phase": phase}
+        prompt_vars = {
+            "phase": str(phase or ""),
+            "stage": str(stage or ""),
+            "user_id": str(user_id or ""),
+            "thread_id": str(thread_id or ""),
+            "run_id": str(run_id or ""),
+        }
         create_kwargs: Dict[str, Any] = {
-            "prompt": prompt_payload,
+            "prompt": {"id": OPENAI_PROMPT_ID, "variables": prompt_vars},
             "input": current_input,
             "tool_choice": "auto",
             "parallel_tool_calls": False,
@@ -2441,14 +2723,35 @@ def run_responses(
                 "user_id": str(user_id),
                 "thread_id": str(thread_id),
                 "runtime": "responses",
-                **({"stage": stage, "phase": phase} if (stage or phase) else {}),
+                **({"phase": str(phase or "")} if (phase or "") else {}),
+                **({"stage": str(stage or "")} if (stage or "") else {}),
                 **(
                     {"recent_user_turns": _wp6_recent_turns_metadata(recent_turns_buffer)}
                     if recent_turns_buffer
                     else {}
                 ),
             },
-            }
+        }
+        if intent_router:
+            try:
+                # OpenAI metadata values must be scalar-ish; store a short JSON string for traceability.
+                create_kwargs["metadata"]["intent_router"] = json.dumps(intent_router, ensure_ascii=False)[:768]
+            except Exception:
+                pass
+        if RESPONSES_INSTRUCTIONS:
+            create_kwargs["instructions"] = RESPONSES_INSTRUCTIONS
+        if RESPONSES_INCLUDE_TOOLS:
+            # Allow tool calling even if the dashboard Prompt ID is instruction-only.
+            from shared.openai_tools import build_responses_tools
+
+            allowed_domains = []
+            if PA_WEB_SEARCH_ALLOWED_DOMAINS:
+                allowed_domains = [d.strip() for d in PA_WEB_SEARCH_ALLOWED_DOMAINS.split(",") if d.strip()]
+            create_kwargs["tools"] = build_responses_tools(
+                include_web_search=bool(PA_WEB_SEARCH_ENABLED) and bool(include_web_search),
+                web_search_context_size=str(PA_WEB_SEARCH_CONTEXT_SIZE or "low"),
+                web_search_allowed_domains=allowed_domains,
+            )
         registered_call_ids = [call.get("call_id") for call in all_tool_calls if isinstance(call, dict)]
         logging.debug(
             "responses.prepare user_id=%s thread_id=%s iteration=%s tool_calls_registered=%s tool_calls_kw=%s recent_turns=%s input_type=%s",
@@ -2603,6 +2906,12 @@ def run_responses(
                 handles=handles if isinstance(handles, dict) else None,
             )
             result_str, info = execute_tool_call(name, args, user_id)
+            _best_effort_update_manifest_after_tool_call(
+                user_id=str(user_id),
+                tool_name=str(name or ""),
+                tool_args=args if isinstance(args, dict) else {},
+                result_str=str(result_str or ""),
+            )
             info = dict(info or {})
             info["call_id"] = call.get("call_id")
             info["runtime"] = "responses"
@@ -3014,6 +3323,12 @@ def create_run_and_poll(openai_client: OpenAI, thread_id: str, user_id: str):
                         args["thread_id"] = thread_id
 
                     result_str, info = execute_tool_call(name, args, user_id)
+                    _best_effort_update_manifest_after_tool_call(
+                        user_id=str(user_id),
+                        tool_name=str(name or ""),
+                        tool_args=args if isinstance(args, dict) else {},
+                        result_str=str(result_str or ""),
+                    )
                     call_end = time.time()
                     all_tool_calls.append(info)
                     try:
@@ -3596,12 +3911,53 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         params = body.get("params", {})
         log_interaction = bool(body.get("log_interaction", True))
         trace_id = str(body.get("trace_id") or "").strip()
+        # UI may send phase/stage, but backend owns these semantics.
+        # Keep UI values only for debug (do not trust them for orchestration).
+        phase_ui = str(body.get("phase") or "").strip()
+        stage_ui = str(body.get("stage") or "").strip()
 
         # Direct actions bypass agent/tool loop
         if action in ["save_interaction", "get_interaction_history"]:
             resp_direct = handle_direct_actions(req, body, action, user_id)
             if resp_direct is not None:
                 return resp_direct
+
+        # Explicit PA initialization (starter pack) requires confirmation.
+        if action == "pa_init":
+            if not user_id:
+                return _make_response({"status": "error", "error": "user_id is required", "action": action}, status_code=400)
+            params = body.get("params", {}) or {}
+            confirm = bool(params.get("confirm_create", False))
+            if not confirm:
+                return _make_response(
+                    {
+                        "status": "error",
+                        "action": action,
+                        "error": "PA not initialized. Set params.confirm_create=true to create starter files.",
+                        "required_confirmation": True,
+                        "will_create": ["TM.json", "PS.json", "LO.json", "GEN.json", "SYS.json", "semantics/preferences.json"],
+                        "phase_ui": phase_ui,
+                        "stage_ui": stage_ui,
+                    },
+                    status_code=409,
+                )
+            result = _pa_init_starter_pack(str(user_id))
+            return _make_response({"status": "success", "action": action, "result": result}, status_code=200)
+
+        # Gate: do not auto-create PA core files during normal runs.
+        if PA_REQUIRE_INIT and user_id and action not in ("get_run_progress", "wp6_prepare_audit", "wp6_run_audit", "wp7_prepare_audit", "wp7_run_audit"):
+            if not _pa_has_starter_pack(str(user_id)):
+                return _make_response(
+                    {
+                        "status": "error",
+                        "error": "PA starter pack missing. Initialize user first (explicit confirmation required).",
+                        "action_required": "pa_init",
+                        "action_params": {"confirm_create": True},
+                        "phase_ui": phase_ui,
+                        "stage_ui": stage_ui,
+                    },
+                    status_code=409,
+                )
 
         if action == "get_run_progress":
             if not user_id:
@@ -3821,6 +4177,35 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     message="Starting: building context",
                     async_save=True,
                 )
+
+                # Optional separate "intention" model call (for ML artifacts and explicit traceability).
+                # This does NOT execute tools. It produces a JSON artifact under `semantics/intents/`.
+                phase_intent = "P4"
+                stage_intent = "S6"
+                phase_response = "P7"
+                stage_response = "S8"
+                requires_internet = False
+                try:
+                    intent_payload, intent_artifact_path = _pa_run_intention_step(
+                        openai_client=openai_client,
+                        user_id=str(user_id),
+                        thread_id=str(thread_id),
+                        run_id=str(run_id or ""),
+                        phase=phase_intent,
+                        stage=stage_intent,
+                        user_message=str(user_message or ""),
+                    )
+                    if isinstance(intent_payload, dict) and intent_payload:
+                        requires_internet = bool(intent_payload.get("requires_internet"))
+                        wp6_meta["pa_intention"] = {
+                            "model": PA_INTENTION_MODEL,
+                            "reasoning_effort": PA_INTENTION_REASONING_EFFORT,
+                            "artifact_path": str(intent_artifact_path or ""),
+                            "requires_internet": bool(requires_internet),
+                            "intent": str(intent_payload.get("intent") or "") if isinstance(intent_payload, dict) else "",
+                        }
+                except Exception:
+                    pass
 
                 recent_turns = _wp6_update_recent_user_turns(user_id, str(thread_id), user_message)
                 recent_block = _wp6_format_recent_turns(recent_turns)
@@ -4057,9 +4442,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     recent_turns=recent_turns,
                     run_id=run_id,
                     trace_id=trace_id,
-                    stage=requested_stage,
-                    phase=requested_phase,
+                    phase=phase_response,
+                    stage=stage_response,
                     intent_router=intent_router,
+                    include_web_search=bool(requires_internet),
                 )
 
                 # Phase 2 (AUTO only): parse FAST response signal and optionally escalate to DEEP once.
@@ -4101,9 +4487,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                                     recent_turns=recent_turns,
                                     run_id=run_id,
                                     trace_id=trace_id,
-                                    stage=requested_stage,
-                                    phase=requested_phase,
+                                    phase=phase_response,
+                                    stage=stage_response,
                                     intent_router=intent_router,
+                                    include_web_search=bool(requires_internet),
                                 )
                                 deep_signal, deep_cleaned = _wp6_parse_need_deep_signal(deep_resp or "")
                                 wp6_meta["need_deep_signal_deep"] = deep_signal

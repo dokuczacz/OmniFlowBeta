@@ -136,10 +136,11 @@ def _delegate_to_implementation(
         import sys
         import os
         
-        # Try to import tools dispatch
-        tools_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'tools')
-        if tools_path not in sys.path:
-            sys.path.insert(0, tools_path)
+        # Try to import tools dispatch.
+        # Important: sys.path must include the *parent* directory that contains the `tools/` package.
+        backend_root = os.path.dirname(os.path.dirname(__file__))
+        if backend_root not in sys.path:
+            sys.path.insert(0, backend_root)
         
         try:
             from tools import dispatch_tool

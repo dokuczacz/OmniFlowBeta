@@ -7,6 +7,7 @@ from azure.storage.blob import BlobServiceClient
 
 from shared.config import AzureConfig
 from shared.manifest_helper import remove_manifest_entry
+from shared.artifact_envelope import extract_items, merge_items_back
 
 DEFAULT_USER_ID = "default"
 NAMESPACE_PREFIX = "users"
@@ -46,9 +47,8 @@ def _namespaced_path(user_id: str, blob_name: str) -> str:
     return f"{NAMESPACE_PREFIX}/{user_id}/{blob_name}"
 
 
-def _load_entries(blob_client) -> List[Any]:
-    payload = blob_client.download_blob().readall().decode("utf-8")
-    raw_list = json.loads(payload)
+def _load_entries_from_payload(raw_payload: Any) -> tuple[dict | None, List[Any]]:
+    envelope, raw_list = extract_items(raw_payload, items_key="items")
     if isinstance(raw_list, list):
         candidates = raw_list
     else:
@@ -61,7 +61,7 @@ def _load_entries(blob_client) -> List[Any]:
             except Exception:
                 entry = {"_raw": entry}
         normalized.append(entry)
-    return normalized
+    return envelope, normalized
 
 
 def _matches(entry: Any, key: str, value: Any) -> bool:
@@ -92,7 +92,9 @@ def remove_data_entry_core(
         service_client, container_client = _get_clients()
         _ensure_container(service_client, container_client)
         blob_client = container_client.get_blob_client(namespaced)
-        entries = _load_entries(blob_client)
+        raw_text = blob_client.download_blob().readall().decode("utf-8")
+        raw_payload = json.loads(raw_text)
+        envelope, entries = _load_entries_from_payload(raw_payload)
         initial_count = len(entries)
         filtered = [entry for entry in entries if not _matches(entry, key_to_find, value_to_find)]
         deleted_count = initial_count - len(filtered)
@@ -105,7 +107,8 @@ def remove_data_entry_core(
             }
             return payload, 404
 
-        serialized = json.dumps(filtered, indent=2, ensure_ascii=False).encode("utf-8")
+        out_payload = merge_items_back(envelope, filtered, items_key="items")
+        serialized = json.dumps(out_payload, indent=2, ensure_ascii=False).encode("utf-8")
         blob_client.upload_blob(serialized, overwrite=True)
         payload = {
             "status": "success",

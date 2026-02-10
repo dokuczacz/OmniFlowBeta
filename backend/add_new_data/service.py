@@ -7,6 +7,7 @@ from azure.storage.blob import BlobServiceClient, ContentSettings
 
 from shared.config import AzureConfig
 from shared.manifest_helper import build_manifest_entry, upsert_manifest_entry
+from shared.artifact_envelope import extract_items, merge_items_back
 
 
 def _get_client():
@@ -48,15 +49,18 @@ def add_new_data_core(user_id: str, target_blob_name: str, new_entry: Any, raise
         blob_client = container_client.get_blob_client(namespaced)
         try:
             existing = blob_client.download_blob().readall().decode('utf-8')
-            records = json.loads(existing)
+            records_payload = json.loads(existing)
         except ResourceNotFoundError:
-            records = []
+            records_payload = []
         except json.JSONDecodeError:
-            records = []
+            records_payload = []
+
+        envelope, records = extract_items(records_payload, items_key="items")
         if not isinstance(records, list):
             records = [records]
         records.append(payload_entry)
-        payload_bytes, content_type = _serialize_json(records)
+        out_payload = merge_items_back(envelope, records, items_key="items")
+        payload_bytes, content_type = _serialize_json(out_payload)
         blob_client.upload_blob(payload_bytes, overwrite=True, content_settings=ContentSettings(content_type=content_type))
         response = {
             'status': 'success',

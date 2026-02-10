@@ -7,6 +7,7 @@ from azure.core.exceptions import AzureError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient
 
 from shared.config import AzureConfig
+from shared.artifact_envelope import extract_items
 
 
 def _get_container_client():
@@ -19,9 +20,11 @@ def _get_container_client():
 
 
 def _normalize_entries(raw_data: Any) -> List[Any]:
-    if isinstance(raw_data, list):
+    envelope, items = extract_items(raw_data, items_key="items")
+    data = items if isinstance(items, list) else [items]
+    if isinstance(data, list):
         normalized = []
-        for entry in raw_data:
+        for entry in data:
             if isinstance(entry, str):
                 try:
                     normalized.append(json.loads(entry))

@@ -7,6 +7,7 @@ from azure.storage.blob import BlobServiceClient
 
 from shared.config import AzureConfig
 from shared.manifest_helper import build_manifest_entry, upsert_manifest_entry
+from shared.artifact_envelope import extract_items, merge_items_back
 
 DEFAULT_USER_ID = "default"
 NAMESPACE_PREFIX = "users"
@@ -48,7 +49,8 @@ def _namespaced_path(user_id: str, blob_name: str) -> str:
 
 def _load_entries(blob_client) -> List[Any]:
     payload = blob_client.download_blob().readall().decode("utf-8")
-    raw_list = json.loads(payload)
+    raw_payload = json.loads(payload)
+    envelope, raw_list = extract_items(raw_payload, items_key="items")
     candidates = raw_list if isinstance(raw_list, list) else [raw_list]
     normalized: List[Any] = []
     for entry in candidates:
@@ -97,7 +99,12 @@ def update_data_entry_core(
         service_client, container_client = _get_clients()
         _ensure_container(service_client, container_client)
         blob_client = container_client.get_blob_client(namespaced)
-        entries = _load_entries(blob_client)
+        # Load full payload so we can preserve envelope fields if present.
+        raw_text = blob_client.download_blob().readall().decode("utf-8")
+        raw_payload = json.loads(raw_text)
+        envelope, entries = extract_items(raw_payload, items_key="items")
+        # Normalize entries to list[dict|...]
+        entries = entries if isinstance(entries, list) else [entries]
         entry = _find_entry(entries, find_key, find_value)
         if not entry:
             payload = {
@@ -107,7 +114,8 @@ def update_data_entry_core(
             }
             return payload, 404
         entry[update_key] = update_value
-        serialized = json.dumps(entries, indent=2, ensure_ascii=False).encode("utf-8")
+        out_payload = merge_items_back(envelope, entries, items_key="items")
+        serialized = json.dumps(out_payload, indent=2, ensure_ascii=False).encode("utf-8")
         blob_client.upload_blob(serialized, overwrite=True)
         message = (
             f"Successfully updated {find_key}={find_value} in '{target_blob_name}'"

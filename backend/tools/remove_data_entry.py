@@ -11,7 +11,7 @@ def _choose_blob_name(args):
 
 
 def _choose_find_key(args):
-    for key in ("key_to_find", "find_key", "key", "match_key"):
+    for key in ("key_to_find", "remove_key", "find_key", "key", "match_key"):
         candidate = args.get(key)
         if candidate is not None:
             return str(candidate)
@@ -19,7 +19,7 @@ def _choose_find_key(args):
 
 
 def _choose_find_value(args):
-    for key in ("value_to_find", "find_value", "value"):
+    for key in ("value_to_find", "remove_value", "find_value", "value"):
         if key in args:
             return args.get(key)
     return None

@@ -1,6 +1,10 @@
 # tools/__init__.py
 # Tool dispatch registry and loader for in-process tool calls
 
+import os
+
+from shared.starter_pack import ensure_starter_pack
+
 from .add_new_data import add_new_data
 from .get_current_time import get_current_time
 from .get_filtered_data import get_filtered_data
@@ -28,4 +32,7 @@ tool_registry = {
 def dispatch_tool(tool_name, args, user_id):
     if tool_name not in tool_registry:
         raise ValueError(f"Unknown tool: {tool_name}")
+    # Avoid touching real storage during unit tests unless explicitly forced.
+    if not os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("OMNIFLOW_STARTER_PACK_FORCE") in ("1", "true", "yes"):
+        ensure_starter_pack(user_id)
     return tool_registry[tool_name](args, user_id)
