@@ -104,31 +104,41 @@ def tool_exec(cfg: EnvCfg, user_id: str, *, tool_name: str, tool_arguments: Dict
     return body
 
 
-def read_blob_json(cfg: EnvCfg, user_id: str, file_name: str) -> Dict[str, Any]:
+def read_blob_data(cfg: EnvCfg, user_id: str, file_name: str) -> Any:
     body = tool_exec(cfg, user_id, tool_name="read_blob_file", tool_arguments={"file_name": file_name}, timeout_s=180)
     res = body.get("result")
     # read_blob_file returns an envelope: {"status":"success","file_name":...,"data":...,"content_type":"json|text"}
     if isinstance(res, dict) and res.get("status") == "success":
-        data = res.get("data")
-        if isinstance(data, dict):
-            return data
-        if isinstance(data, str):
-            try:
-                j = json.loads(data)
-                return j if isinstance(j, dict) else {"_non_dict": True}
-            except Exception:
-                return {"_non_dict": True, "raw_excerpt": data[:400]}
-        return {"_non_dict": True}
+        return res.get("data")
 
     # Fallback: attempt parse from excerpt (best-effort).
     raw = str(body.get("result_excerpt") or "")
     try:
         j2 = json.loads(raw)
-        if isinstance(j2, dict) and j2.get("status") == "success" and isinstance(j2.get("data"), dict):
-            return j2["data"]
-        return j2 if isinstance(j2, dict) else {"_non_dict": True}
+        if isinstance(j2, dict) and j2.get("status") == "success":
+            return j2.get("data")
+        return j2
     except Exception:
-        return {"_non_dict": True, "raw_excerpt": raw[:400]}
+        return None
+
+
+def tm_count(value: Any) -> int:
+    # TM.json in legacy data can be:
+    # - dict with "items" or "tasks"
+    # - list of entries (optionally with one element that itself contains "tasks")
+    if isinstance(value, dict):
+        if isinstance(value.get("items"), list):
+            return len(value["items"])
+        if isinstance(value.get("tasks"), list):
+            return len(value["tasks"])
+        return 0
+    if isinstance(value, list):
+        extra = 0
+        for el in value:
+            if isinstance(el, dict) and isinstance(el.get("tasks"), list):
+                extra += len(el["tasks"])
+        return len(value) + extra
+    return 0
 
 
 def list_blobs_meta(cfg: EnvCfg, user_id: str, *, prefix: str) -> List[Dict[str, Any]]:
@@ -186,8 +196,10 @@ def find_latest_interaction_entry(cfg: EnvCfg, user_id: str, thread_id: str, *, 
         if not name.endswith(".json"):
             continue
         try:
-            entry = read_blob_json(cfg, user_id, name)
+            entry = read_blob_data(cfg, user_id, name)
         except Exception:
+            continue
+        if not isinstance(entry, dict):
             continue
         if str(entry.get("thread_id") or "") != str(thread_id):
             continue
@@ -228,8 +240,8 @@ def main() -> int:
     ensure_pa_init(cfg, user_id=user_id, thread_id=thread_id)
 
     # --- TM E2E ---
-    tm_before = read_blob_json(cfg, user_id, "TM.json")
-    before_n = len(tm_before.get("items") or [])
+    tm_before = read_blob_data(cfg, user_id, "TM.json")
+    before_n = tm_count(tm_before)
 
     status, body = http_post_json(
         cfg.tool_handler_url,
@@ -250,8 +262,8 @@ def main() -> int:
     assert_has_tool_call(body)
 
     time.sleep(1.0)
-    tm_after = read_blob_json(cfg, user_id, "TM.json")
-    after_n = len(tm_after.get("items") or [])
+    tm_after = read_blob_data(cfg, user_id, "TM.json")
+    after_n = tm_count(tm_after)
     if after_n <= before_n:
         raise AssertionError(f"TM.json not updated: before_items={before_n} after_items={after_n}")
 
@@ -291,7 +303,9 @@ def main() -> int:
     # Validate latest intent contract v2 contains PA architecture fields.
     latest_intent_name = str((intents_after[-1] or {}).get("name") or "").strip()
     if latest_intent_name:
-        intent_art = read_blob_json(cfg, user_id, latest_intent_name)
+        intent_art = read_blob_data(cfg, user_id, latest_intent_name)
+        if not isinstance(intent_art, dict):
+            raise AssertionError("latest intent artifact is not a JSON object")
         if str(intent_art.get("schema_version") or "") != "omniflow.pa.intention.v2":
             raise AssertionError(f"unexpected intent schema_version={intent_art.get('schema_version')}")
         intent_payload = intent_art.get("intention") if isinstance(intent_art.get("intention"), dict) else {}
