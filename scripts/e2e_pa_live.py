@@ -107,15 +107,28 @@ def tool_exec(cfg: EnvCfg, user_id: str, *, tool_name: str, tool_arguments: Dict
 def read_blob_json(cfg: EnvCfg, user_id: str, file_name: str) -> Dict[str, Any]:
     body = tool_exec(cfg, user_id, tool_name="read_blob_file", tool_arguments={"file_name": file_name}, timeout_s=180)
     res = body.get("result")
-    if isinstance(res, dict):
-        return res
-    if isinstance(res, str):
-        j = json.loads(res)
-        return j if isinstance(j, dict) else {"_non_dict": True}
-    # Fallback: attempt parse from excerpt
+    # read_blob_file returns an envelope: {"status":"success","file_name":...,"data":...,"content_type":"json|text"}
+    if isinstance(res, dict) and res.get("status") == "success":
+        data = res.get("data")
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, str):
+            try:
+                j = json.loads(data)
+                return j if isinstance(j, dict) else {"_non_dict": True}
+            except Exception:
+                return {"_non_dict": True, "raw_excerpt": data[:400]}
+        return {"_non_dict": True}
+
+    # Fallback: attempt parse from excerpt (best-effort).
     raw = str(body.get("result_excerpt") or "")
-    j2 = json.loads(raw)
-    return j2 if isinstance(j2, dict) else {"_non_dict": True}
+    try:
+        j2 = json.loads(raw)
+        if isinstance(j2, dict) and j2.get("status") == "success" and isinstance(j2.get("data"), dict):
+            return j2["data"]
+        return j2 if isinstance(j2, dict) else {"_non_dict": True}
+    except Exception:
+        return {"_non_dict": True, "raw_excerpt": raw[:400]}
 
 
 def list_blobs_meta(cfg: EnvCfg, user_id: str, *, prefix: str) -> List[Dict[str, Any]]:
@@ -319,4 +332,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
