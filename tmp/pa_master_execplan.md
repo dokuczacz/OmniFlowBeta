@@ -113,6 +113,23 @@ Roll out Personal Assistance (PA) end-to-end based on baseline scope `PA-01..PA-
 12. WU-12: Decompose `tool_call_handler` after WU-10 is green.
 13. WU-13: Run ML shadow-mode gates and prepare replacement go/no-go for nano.
 
+## WU status (current)
+| WU | Scope | Status | Evidence |
+|---|---|---|---|
+| WU-1 | Master plan SOT sync | DONE | this file updated and used as single plan SOT |
+| WU-2 | Payload matrix sync | DONE | `tmp/pa_openai_payload_matrix.md` aligned to runtime policy |
+| WU-3 | Capsule v2 hardening | DONE | semantic-only capsule + intent-scoped snippets in runtime |
+| WU-4 | TM/Gmail revalidation | DONE | `eval_pa_intention_tm/gmail` pass + live e2e TM/Gmail pass |
+| WU-5 | ML label contract | DONE | run/intent artifacts include ML label fields (`omniflow.pa.ml_dataset_row.v1`) |
+| WU-6 | Prompt DB composer TM/Gmail | DONE | composer metadata present in responses (`composer_*`) |
+| WU-7 | Wave-1 (`PA-13`,`PA-15`,`PA-02`) | IN_PROGRESS | runtime scaffolding present; full live DoD not closed per function |
+| WU-8 | Wave-2 (`PA-03`,`PA-04`,`PA-05`) | IN_PROGRESS | runtime scaffolding present; full live DoD not closed per function |
+| WU-9 | Wave-3 (`PA-06`,`PA-07`,`PA-08`) | IN_PROGRESS | runtime scaffolding present; full live DoD not closed per function |
+| WU-10 | Wave-4 (`PA-09`,`PA-10`,`PA-11`,`PA-12`) | IN_PROGRESS | runtime scaffolding present; full live DoD not closed per function |
+| WU-11 | Remove `fast/deep` runtime control | DONE | routing forced to FAST, `quality_hint` metadata only |
+| WU-12 | `tool_call_handler` decomposition | NOT_STARTED | gated by Wave DoD closure |
+| WU-13 | ML shadow-mode gates | NOT_STARTED | gated by Wave DoD closure |
+
 # Commands
 - Working dir:
   - `Set-Location "C:\AI memory\NewHope\OmniFlowBeta"`
@@ -221,10 +238,24 @@ Roll out Personal Assistance (PA) end-to-end based on baseline scope `PA-01..PA-
 - 2026-02-11: WU-7..WU-10 rollout scaffolding started:
   - prompt/tool/schema dict registries extended for PA-01..PA-15,
   - backend runtime tool include + prefetch defaults added for non-TM/Gmail functions.
+- 2026-02-11: WU-7..WU-10 status clarification:
+  - no promotion to DONE until each PA function in the wave has one auditable live run and explicit DoD evidence,
+  - temporary helper `scripts/e2e_pa_functions_live.py` exists locally but is ignored by `.gitignore` (`scripts/*`), so it is not yet a tracked SOT validation script.
 - 2026-02-11: WU-11 implemented (policy change):
   - `fast/deep` no longer controls routing,
   - runtime path is forced to FAST,
   - original `fast/deep/auto` value is retained only as `quality_hint` in metadata.
+- 2026-02-11: test alignment to current PA contract completed:
+  - `tests/e2e` moved off legacy `_pa_allowed_tools_for_stage_phase` assumptions,
+  - `tests/e2e` current result: `256 passed, 88 skipped, 0 failed`.
+- 2026-02-11: root cause fix for `MAIL.json` not found:
+  - deterministic prefetch is executed also in single-step PA mode,
+  - Gmail prefetch persists `MAIL.json` snapshot from `gmail_recent_metadata`,
+  - verified by `tool_exec/read_blob_file MAIL.json` returning success for `MarioBros`.
+- 2026-02-11: parallel live load smoke executed:
+  - users `E2E_Load_A`, `E2E_Load_B`, `E2E_Load_C` initialized via `pa_init`,
+  - concurrent TM live runs passed (`TM.json` created/updated, interactions persisted),
+  - `MarioBros` Gmail live run passed with intent artifact increment and `MAIL.json` available.
 
 ## Next major refactor (post-rollout)
 - `function-matrix composer (pre-refactor prerequisite)`:
