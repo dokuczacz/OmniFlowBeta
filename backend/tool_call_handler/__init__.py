@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import time
+import re
 import hashlib
 from typing import Dict, Any, Tuple, List
 import uuid
@@ -56,11 +57,16 @@ try:
 except ImportError:
     REGISTRY_DISPATCH_AVAILABLE = False
 
+try:
+    from prompt_registry import compose_prompt_for_pa
+except Exception:
+    compose_prompt_for_pa = None
+
 # Config
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 ASSISTANT_ID = os.environ.get("OPENAI_ASSISTANT_ID", "")
 OPENAI_PROMPT_ID = os.environ.get("OPENAI_PROMPT_ID", "")
-LLM_RUNTIME_DEFAULT = os.environ.get("LLM_RUNTIME", "assistants")
+LLM_RUNTIME_DEFAULT = os.environ.get("LLM_RUNTIME", "responses")
 # Cache `handles.json` in-memory to avoid repeated blob reads.
 # Default TTL is 10 minutes to tolerate long responses/tool loops without frequent cache refresh.
 HANDLES_CACHE_TTL_SECONDS = int(os.environ.get("HANDLES_CACHE_TTL_SECONDS", "600") or 600)
@@ -75,6 +81,8 @@ OMNIFLOW_MOCK_AGENT = os.environ.get("OMNIFLOW_MOCK_AGENT", "").lower() in ("1",
 # Backend-owned tools: default ON so the system never depends on dashboard-configured tools.
 # Set RESPONSES_INCLUDE_TOOLS=0 to disable (debug only).
 RESPONSES_INCLUDE_TOOLS = os.environ.get("RESPONSES_INCLUDE_TOOLS", "1").lower() in ("1", "true", "yes")
+RESPONSES_PARALLEL_TOOL_CALLS = os.environ.get("RESPONSES_PARALLEL_TOOL_CALLS", "1").lower() in ("1", "true", "yes")
+RESPONSES_PROMPT_VARIABLES_ENABLED = os.environ.get("RESPONSES_PROMPT_VARIABLES_ENABLED", "0").lower() in ("1", "true", "yes")
 RESPONSES_INSTRUCTIONS = str(os.environ.get("RESPONSES_INSTRUCTIONS", "") or "").strip()
 if not RESPONSES_INSTRUCTIONS:
     # Default "tool discipline" so the agent cannot silently hallucinate state changes.
@@ -82,7 +90,10 @@ if not RESPONSES_INSTRUCTIONS:
     RESPONSES_INSTRUCTIONS = (
         "You are OmniFlow PA. Use tools for any claim about user data.\n"
         "- If asked about tasks, read/update TM.json via tools. Do not claim writes without a write tool call.\n"
-        "- If asked about Gmail, first call gmail_action oauth_status. If unauthorized, instruct user to Connect.\n"
+        "- If asked about Gmail, prefer gmail_recent_metadata to fetch recent message metadata; do not ask for 50 if user requested 20.\n"
+        "- For gmail_action gmail_send, always provide JSON with payload.to, payload.subject, payload.body.\n"
+        "- For gmail_action gmail_get/gmail_trash/gmail_delete, always provide payload.message_id.\n"
+        "- If a Gmail tool returns NOT_AUTHORIZED, instruct user to Connect.\n"
         "- If asked to summarize blob contents, call list_blobs (and read_blob_file only if needed).\n"
         "If tools are unavailable or a tool errors, say so and stop."
     )
@@ -94,7 +105,652 @@ PA_REQUIRE_INIT = str(os.environ.get("PA_REQUIRE_INIT", "1") or "").strip().lowe
 PA_INTENTION_ENABLED = str(os.environ.get("PA_INTENTION_ENABLED", "1") or "").strip().lower() in ("1", "true", "yes", "y", "on")
 PA_INTENTION_MODEL = str(os.environ.get("PA_INTENTION_MODEL", "gpt-5-nano") or "gpt-5-nano").strip()
 PA_INTENTION_REASONING_EFFORT = str(os.environ.get("PA_INTENTION_REASONING_EFFORT", "low") or "low").strip().lower()
-PA_INTENTION_MAX_OUTPUT_TOKENS = int(os.environ.get("PA_INTENTION_MAX_OUTPUT_TOKENS", "600") or 600)
+PA_INTENTION_MAX_OUTPUT_TOKENS = int(os.environ.get("PA_INTENTION_MAX_OUTPUT_TOKENS", "1200") or 1200)
+# Allow a local-only debug endpoint to call PA intention directly (for batch eval).
+PA_INTENTION_DEBUG_ENDPOINT = str(os.environ.get("PA_INTENTION_DEBUG_ENDPOINT", "") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+)
+# Per-run artifact (debug observability): default ON for dev/local runs, opt-out via env.
+PA_RUN_ARTIFACT_ENABLED = str(os.environ.get("PA_RUN_ARTIFACT_ENABLED", "1") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+)
+PA_RUN_ARTIFACT_DEV_ONLY = str(os.environ.get("PA_RUN_ARTIFACT_DEV_ONLY", "1") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+)
+PA_RUN_ARTIFACT_MAX_USER_MESSAGE_CHARS = int(
+    os.environ.get("PA_RUN_ARTIFACT_MAX_USER_MESSAGE_CHARS", "2000") or 2000
+)
+PA_RUN_ARTIFACT_MAX_ASSISTANT_CHARS = int(
+    os.environ.get("PA_RUN_ARTIFACT_MAX_ASSISTANT_CHARS", "4000") or 4000
+)
+
+PA_INTENTION_SCHEMA_V3: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "primary": {
+            "type": "object",
+            "properties": {
+                "pa_id": {"type": "string", "maxLength": 16},
+                "intent": {"type": "string", "maxLength": 64},
+                "score": {"type": "number", "minimum": 0, "maximum": 1},
+                "is_selected": {"type": "boolean"},
+            },
+            "required": ["pa_id", "intent", "score", "is_selected"],
+            "additionalProperties": False,
+        },
+        "alternatives": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "pa_id": {"type": "string", "maxLength": 16},
+                    "intent": {"type": "string", "maxLength": 64},
+                    "score": {"type": "number", "minimum": 0, "maximum": 1},
+                    "is_selected": {"type": "boolean"},
+                },
+                "required": ["pa_id", "intent", "score", "is_selected"],
+                "additionalProperties": False,
+            },
+        },
+        "slots": {
+            "type": "object",
+            "properties": {
+                "count": {"type": ["integer", "null"], "minimum": 1, "maximum": 50},
+                "task_index": {"type": ["integer", "null"], "minimum": 1},
+                "email_ref": {"type": ["string", "null"], "maxLength": 64},
+                "query": {"type": ["string", "null"], "maxLength": 256},
+            },
+            "required": ["count", "task_index", "email_ref", "query"],
+            "additionalProperties": False,
+        },
+        "signals": {
+            "type": "object",
+            "properties": {
+                "is_gmail": {"type": "boolean"},
+                "is_tm": {"type": "boolean"},
+                "has_write_intent": {"type": "boolean"},
+            },
+            "required": ["is_gmail", "is_tm", "has_write_intent"],
+            "additionalProperties": False,
+        },
+    },
+    "required": ["primary", "alternatives", "slots", "signals"],
+    "additionalProperties": False,
+}
+
+PA_FUNCTION_NAMES: Dict[str, str] = {
+    "PA-01": "Task Management (TM)",
+    "PA-02": "Daily Planning (LO)",
+    "PA-03": "Priority Reasoning",
+    "PA-04": "Goal Alignment (PS)",
+    "PA-05": "Progress Review",
+    "PA-06": "Knowledge Recall",
+    "PA-07": "Note & Idea Handling (GEN)",
+    "PA-08": "Artifact Analysis",
+    "PA-09": "Context Integration",
+    "PA-10": "Decision Reflection",
+    "PA-11": "Summary & Reporting",
+    "PA-12": "Function Proposal",
+    "PA-13": "Mail Management",
+    "PA-14": "Mail Analysis & Triage",
+    "PA-15": "Mail-to-Action Mapping",
+}
+
+PA_FUNCTION_DEFAULT_ARTIFACTS: Dict[str, List[str]] = {
+    "PA-01": ["TM.json"],
+    "PA-02": ["LO.json"],
+    "PA-03": ["TM.json", "PS.json", "LO.json"],
+    "PA-04": ["PS.json", "TM.json"],
+    "PA-05": ["SYS.json", "TM.json", "LO.json"],
+    "PA-06": ["GEN.json", "TM.json", "PS.json"],
+    "PA-07": ["GEN.json"],
+    "PA-08": [],
+    "PA-09": ["TM.json", "PS.json", "LO.json", "GEN.json", "MAIL.json"],
+    "PA-10": ["SYS.json", "TM.json", "MAIL.json"],
+    "PA-11": ["SYS.json", "TM.json", "MAIL.json"],
+    "PA-12": ["TM.json", "PS.json", "LO.json", "GEN.json", "MAIL.json"],
+    "PA-13": ["MAIL.json"],
+    "PA-14": ["MAIL.json"],
+    "PA-15": ["MAIL.json", "TM.json", "PS.json"],
+}
+
+PA_INTENT_FUNCTION_CATALOG: List[Dict[str, Any]] = [
+    {"pa_id": "PA-01", "name": "Task Management", "intents": ["check_tasks", "add_task", "mark_done", "show_delayed", "update_task", "delete_task"]},
+    {"pa_id": "PA-14", "name": "Mail Analysis & Triage", "intents": ["check_gmail", "summarize_inbox", "answer_latest_email", "send_email", "trash_email"]},
+    {"pa_id": "PA-13", "name": "Mail Management", "intents": ["list_mailboxes", "show_labels"]},
+    {"pa_id": "PA-15", "name": "Mail-to-Action Mapping", "intents": ["mail_to_tasks"]},
+    {"pa_id": "PA-02", "name": "Daily Planning", "intents": ["build_day_plan"]},
+    {"pa_id": "PA-03", "name": "Priority Reasoning", "intents": ["rank_priorities"]},
+    {"pa_id": "PA-04", "name": "Goal Alignment", "intents": ["map_tasks_to_goals"]},
+    {"pa_id": "PA-05", "name": "Progress Review", "intents": ["review_progress"]},
+    {"pa_id": "PA-06", "name": "Knowledge Recall", "intents": ["recall_knowledge"]},
+    {"pa_id": "PA-07", "name": "Note & Idea Handling", "intents": ["create_note", "update_note", "search_notes"]},
+    {"pa_id": "PA-08", "name": "Artifact Analysis", "intents": ["analyze_artifact"]},
+    {"pa_id": "PA-09", "name": "Context Integration", "intents": ["merge_context"]},
+    {"pa_id": "PA-10", "name": "Decision Reflection", "intents": ["reflect_decision"]},
+    {"pa_id": "PA-11", "name": "Summary & Reporting", "intents": ["generate_summary"]},
+    {"pa_id": "PA-12", "name": "Function Proposal", "intents": ["propose_next_steps"]},
+]
+
+PA_INTENT_TO_PA_ID: Dict[str, str] = {}
+for _entry in PA_INTENT_FUNCTION_CATALOG:
+    _entry_pa = str(_entry.get("pa_id") or "").strip()
+    for _intent in list(_entry.get("intents") or []):
+        _key = str(_intent or "").strip().lower()
+        if _key and _key not in PA_INTENT_TO_PA_ID:
+            PA_INTENT_TO_PA_ID[_key] = _entry_pa
+
+PA_TM_INTENT_TO_OPERATION: Dict[str, str] = {
+    "check_tasks": "list",
+    "show_delayed": "list",
+    "add_task": "add",
+    "mark_done": "complete",
+    "update_task": "update",
+    "delete_task": "delete",
+}
+
+PA_GMAIL_INTENT_TO_OPERATION: Dict[str, str] = {
+    "check_gmail": "unknown",
+    "summarize_inbox": "summarize",
+    "answer_latest_email": "send",
+    "send_email": "send",
+    "trash_email": "trash",
+}
+
+
+def _pa_extract_first_int_in_range(text: str, low: int = 1, high: int = 50) -> int | None:
+    msg = str(text or "")
+    m = re.search(r"\b(\d{1,3})\b", msg)
+    if not m:
+        return None
+    try:
+        value = int(m.group(1))
+    except Exception:
+        return None
+    if value < int(low) or value > int(high):
+        return None
+    return value
+
+
+def _pa_extract_email_count(text: str, default_value: int = 20) -> int:
+    msg = str(text or "").lower()
+    candidates = [
+        r"(?:dokladnie|exactly)?\s*(\d{1,2})\s*(?:ostatnich|najnowszych)\s*(?:mail|wiadom|email)",
+        r"(?:mail|wiadom|email)\s*(?:.*?)(\d{1,2})\s*(?:ostatnich|najnowszych)",
+        r"\b(\d{1,2})\b",
+    ]
+    for pat in candidates:
+        m = re.search(pat, msg)
+        if not m:
+            continue
+        try:
+            value = int(m.group(1))
+        except Exception:
+            continue
+        if 1 <= value <= 50:
+            return value
+    return int(default_value)
+
+
+def _pa_extract_task_index(text: str) -> int | None:
+    msg = str(text or "").lower()
+    patterns = [
+        r"(?:zadanie|task)\s*(?:nr|numer)?\s*(\d+)",
+        r"\b(?:nr|numer)\s*(\d+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, msg)
+        if not m:
+            continue
+        try:
+            value = int(m.group(1))
+        except Exception:
+            continue
+        if value >= 1:
+            return value
+    return None
+
+
+def _pa_detect_tm_operation(text: str, current: str) -> str:
+    msg = str(text or "").lower()
+    op = str(current or "").strip().lower()
+    if any(k in msg for k in ("usun", "skasuj", "delete", "remove")):
+        return "delete"
+    if any(k in msg for k in ("oznacz", "wykonane", "zrobione", "complete", "done")):
+        return "complete"
+    if any(k in msg for k in ("dodaj", "utworz", "dopisz", "add", "create")):
+        return "add"
+    if any(k in msg for k in ("zaktualizuj", "zmien", "edytuj", "update", "edit")):
+        return "update"
+    if any(k in msg for k in ("jakie", "lista", "poka", "co mam", "tasks", "zadania", "list")):
+        return "list"
+    if op in ("list", "add", "update", "complete", "delete"):
+        return op
+    return "unknown"
+
+
+def _pa_detect_gmail_operation(text: str, current: str) -> str:
+    msg = str(text or "").lower()
+    op = str(current or "").strip().lower()
+    if any(k in msg for k in ("odpisz", "reply", "wyslij", "send")):
+        return "send"
+    if any(k in msg for k in ("usun", "skasuj", "trash", "delete")):
+        return "trash"
+    if any(k in msg for k in ("podsum", "streszcz", "skategoryzuj", "categor", "summar")):
+        return "summarize"
+    if any(k in msg for k in ("wypisz", "lista", "list", "nadawca", "temat")):
+        return "list"
+    if op in ("list", "get", "summarize", "send", "trash"):
+        return op
+    return "summarize"
+
+
+def _pa_backend_normalize_intention_payload(
+    *,
+    intent_payload: Dict[str, Any] | None,
+    user_message: str,
+    single_step_focus: bool,
+) -> Dict[str, Any]:
+    payload = dict(intent_payload or {}) if isinstance(intent_payload, dict) else {}
+    msg = str(user_message or "")
+    msg_l = msg.lower()
+
+    def _opt_str(value: Any, max_len: int) -> str | None:
+        if value is None:
+            return None
+        txt = str(value).strip()
+        if not txt:
+            return None
+        if txt.lower() in ("null", "none", "na", "n/a", "undefined"):
+            return None
+        return txt[: int(max_len)]
+
+    is_mail = any(k in msg_l for k in ("gmail", "mail", "maile", "wiadom", "inbox", "skrzynk", "odpisz", "reply", "wyslij", "send"))
+    is_task = any(
+        k in msg_l
+        for k in ("task", "tasks", "zadanie", "zadania", "todo", "to-do", "do zrobienia", "co mam jeszcze")
+    )
+
+    primary = payload.get("primary") if isinstance(payload.get("primary"), dict) else {}
+    alternatives_raw = payload.get("alternatives") if isinstance(payload.get("alternatives"), list) else []
+    # Backward compatibility for previous nano schema.
+    if not alternatives_raw and isinstance(payload.get("secondary"), list):
+        alternatives_raw = payload.get("secondary")
+    slots_raw = payload.get("slots") if isinstance(payload.get("slots"), dict) else {}
+    signals_raw = payload.get("signals") if isinstance(payload.get("signals"), dict) else {}
+
+    primary_pa_id = str(primary.get("pa_id") or "").strip()
+    primary_intent = str(primary.get("intent") or "").strip().lower()
+    pa_id_from_intent = PA_INTENT_TO_PA_ID.get(primary_intent, "")
+
+    pa_id = str(payload.get("pa_function_id") or "").strip() or primary_pa_id or pa_id_from_intent
+    if single_step_focus:
+        if is_mail and not is_task:
+            pa_id = "PA-14"
+        elif is_task and not is_mail:
+            pa_id = "PA-01"
+    if pa_id not in PA_FUNCTION_NAMES:
+        pa_id = "PA-14" if is_mail else ("PA-01" if is_task else "PA-11")
+
+    raw_candidates = payload.get("candidate_pa_function_ids")
+    candidates: List[str] = []
+    if isinstance(raw_candidates, list):
+        for item in raw_candidates:
+            sid = str(item or "").strip()
+            if sid in PA_FUNCTION_NAMES and sid not in candidates:
+                candidates.append(sid)
+            if len(candidates) >= 5:
+                break
+    if isinstance(alternatives_raw, list):
+        for item in alternatives_raw:
+            if not isinstance(item, dict):
+                continue
+            sid = str(item.get("pa_id") or "").strip()
+            if not sid:
+                sid = PA_INTENT_TO_PA_ID.get(str(item.get("intent") or "").strip().lower(), "")
+            if sid in PA_FUNCTION_NAMES and sid not in candidates:
+                candidates.append(sid)
+            if len(candidates) >= 5:
+                break
+    if pa_id not in candidates:
+        candidates.insert(0, pa_id)
+    candidates = candidates[:5]
+
+    signal_is_gmail = bool(signals_raw.get("is_gmail")) if isinstance(signals_raw, dict) else False
+    signal_is_tm = bool(signals_raw.get("is_tm")) if isinstance(signals_raw, dict) else False
+    if signal_is_gmail and not signal_is_tm and pa_id not in ("PA-13", "PA-14", "PA-15"):
+        pa_id = "PA-14"
+    if signal_is_tm and not signal_is_gmail and pa_id != "PA-01":
+        pa_id = "PA-01"
+
+    requires_internet = bool(payload.get("requires_internet"))
+    # TM/Gmail never require web search by default.
+    if pa_id in ("PA-01", "PA-14"):
+        requires_internet = False
+
+    no_confirm_hint = ("nie pytaj o dodatkowe potwierdzenia" in msg_l) or ("bez potwierdzen" in msg_l)
+
+    tm_raw = payload.get("tm") if isinstance(payload.get("tm"), dict) else {}
+    tm_fields_raw = tm_raw.get("fields") if isinstance(tm_raw.get("fields"), dict) else {}
+    gmail_raw = payload.get("gmail") if isinstance(payload.get("gmail"), dict) else {}
+
+    tm_op_from_intent = PA_TM_INTENT_TO_OPERATION.get(primary_intent, "unknown")
+    tm_op = tm_op_from_intent if tm_op_from_intent != "unknown" else _pa_detect_tm_operation(msg, str(tm_raw.get("operation") or "unknown"))
+    tm_index = tm_raw.get("task_index_1based")
+    if tm_index is None and slots_raw.get("task_index") is not None:
+        tm_index = slots_raw.get("task_index")
+    if tm_index is None:
+        tm_index = _pa_extract_task_index(msg)
+    try:
+        tm_index = int(tm_index) if tm_index is not None else None
+    except Exception:
+        tm_index = None
+    if isinstance(tm_index, int) and tm_index < 1:
+        tm_index = None
+
+    tm_title = tm_raw.get("task_title")
+    if tm_title is not None:
+        tm_title = str(tm_title).strip() or None
+
+    gmail_op_from_intent = PA_GMAIL_INTENT_TO_OPERATION.get(primary_intent, "unknown")
+    gmail_op = gmail_op_from_intent if gmail_op_from_intent != "unknown" else _pa_detect_gmail_operation(msg, str(gmail_raw.get("operation") or "unknown"))
+    gmail_label = str(gmail_raw.get("label") or "INBOX").strip() or "INBOX"
+    gmail_query = str(gmail_raw.get("query") or slots_raw.get("query") or "").strip() or None
+    gmail_max_results: int | None = None
+    if gmail_op in ("list", "summarize"):
+        raw_count = gmail_raw.get("max_results")
+        if raw_count is None:
+            raw_count = slots_raw.get("count")
+        try:
+            gmail_max_results = int(raw_count) if raw_count is not None else _pa_extract_email_count(msg, 20)
+        except Exception:
+            gmail_max_results = _pa_extract_email_count(msg, 20)
+        gmail_max_results = max(1, min(50, int(gmail_max_results)))
+
+    required_tools: List[str] = []
+    prefetch_plan: List[Dict[str, Any]] = []
+    target_artifacts = list(PA_FUNCTION_DEFAULT_ARTIFACTS.get(pa_id, []))
+    write_will = False
+    write_consent = False
+    requires_user_confirmation = False
+    confirmation_question = None
+
+    if pa_id == "PA-01":
+        required_tools = ["read_blob_file"]
+        prefetch_plan = [
+            {
+                "tool_name": "read_blob_file",
+                "args": {
+                    "file_name": "TM.json",
+                    "prefix": None,
+                    "include_meta": False,
+                    "max_results": None,
+                    "label": None,
+                    "query": None,
+                },
+            }
+        ]
+        write_will = tm_op in ("add", "update", "complete", "delete")
+        write_consent = tm_op == "delete"
+        requires_user_confirmation = bool(write_consent and (not no_confirm_hint))
+        if requires_user_confirmation:
+            idx_txt = f" nr {tm_index}" if isinstance(tm_index, int) else ""
+            confirmation_question = f"Czy na pewno usunac zadanie{idx_txt}?"
+    elif pa_id == "PA-14":
+        if gmail_op in ("list", "summarize"):
+            required_tools = ["gmail_recent_metadata"]
+            prefetch_plan = [
+                {
+                    "tool_name": "gmail_recent_metadata",
+                    "args": {
+                        "file_name": None,
+                        "prefix": None,
+                        "include_meta": None,
+                        "max_results": int(gmail_max_results or 20),
+                        "label": gmail_label,
+                        "query": gmail_query,
+                    },
+                }
+            ]
+        else:
+            required_tools = ["gmail_action"]
+            ordinal_ref = re.search(r"\b\d+\)", msg_l) is not None
+            email_ref = str(slots_raw.get("email_ref") or "").strip().lower()
+            if gmail_op == "send" and (ordinal_ref or email_ref in ("latest", "last", "newest", "ostatni", "najnowszy")):
+                prefetch_plan = [
+                    {
+                        "tool_name": "gmail_recent_metadata",
+                        "args": {
+                            "file_name": None,
+                            "prefix": None,
+                            "include_meta": None,
+                            "max_results": _pa_extract_email_count(msg, 20),
+                            "label": gmail_label,
+                            "query": gmail_query,
+                        },
+                    }
+                ]
+        # Send/trash are side effects, require explicit confirm unless user explicitly disabled confirm.
+        requires_user_confirmation = bool(gmail_op in ("send", "trash") and (not no_confirm_hint))
+        if requires_user_confirmation:
+            confirmation_question = "Czy na pewno wykonac operacje Gmail (send/trash)?"
+    elif pa_id == "PA-13":
+        required_tools = ["gmail_recent_metadata"]
+        prefetch_plan = [
+            {
+                "tool_name": "gmail_recent_metadata",
+                "args": {
+                    "file_name": None,
+                    "prefix": None,
+                    "include_meta": None,
+                    "max_results": int(gmail_max_results or 20),
+                    "label": gmail_label,
+                    "query": gmail_query,
+                },
+            }
+        ]
+    elif pa_id == "PA-15":
+        required_tools = ["gmail_recent_metadata", "read_blob_file"]
+        prefetch_plan = [
+            {
+                "tool_name": "gmail_recent_metadata",
+                "args": {
+                    "file_name": None,
+                    "prefix": None,
+                    "include_meta": None,
+                    "max_results": int(gmail_max_results or 20),
+                    "label": gmail_label,
+                    "query": gmail_query,
+                },
+            }
+        ]
+        for file_name in ("TM.json", "PS.json"):
+            prefetch_plan.append(
+                {
+                    "tool_name": "read_blob_file",
+                    "args": {
+                        "file_name": file_name,
+                        "prefix": None,
+                        "include_meta": False,
+                        "max_results": None,
+                        "label": None,
+                        "query": None,
+                    },
+                }
+            )
+    else:
+        if target_artifacts:
+            required_tools = ["read_blob_file"]
+            for file_name in list(target_artifacts)[:3]:
+                prefetch_plan.append(
+                    {
+                        "tool_name": "read_blob_file",
+                        "args": {
+                            "file_name": file_name,
+                            "prefix": None,
+                            "include_meta": False,
+                            "max_results": None,
+                            "label": None,
+                            "query": None,
+                        },
+                    }
+                )
+        else:
+            required_tools = ["list_blobs"]
+            prefetch_plan = [
+                {
+                    "tool_name": "list_blobs",
+                    "args": {
+                        "prefix": "users",
+                        "max_results": 20,
+                    },
+                }
+            ]
+
+    confidence = payload.get("confidence")
+    if confidence is None and isinstance(primary, dict):
+        confidence = primary.get("score")
+    if confidence is None and isinstance(primary, dict):
+        confidence = primary.get("confidence")
+    try:
+        confidence_f = float(confidence)
+    except Exception:
+        confidence_f = 0.6
+    confidence_f = max(0.0, min(1.0, confidence_f))
+
+    normalized: Dict[str, Any] = {
+        "schema_version": "omniflow.pa.intention.v3",
+        "pa_function_id": pa_id,
+        "candidate_pa_function_ids": candidates,
+        "pa_function_name": PA_FUNCTION_NAMES.get(pa_id, "Unknown"),
+        "intent_summary": str(payload.get("intent_summary") or primary_intent or "")[:200],
+        "language": str(payload.get("language") or "pl")[:8] or "pl",
+        "requires_internet": bool(requires_internet),
+        "requires_user_confirmation": bool(requires_user_confirmation),
+        "confirmation_question": confirmation_question,
+        "target_artifacts": target_artifacts,
+        "required_tools": required_tools,
+        "prefetch_plan": prefetch_plan,
+        "write_intent": {
+            "will_write": bool(write_will),
+            "consent_required": bool(write_consent),
+            "target_files": list(target_artifacts if write_will else []),
+        },
+        "tm": {
+            "operation": tm_op if pa_id == "PA-01" else "unknown",
+            "task_index_1based": tm_index if pa_id == "PA-01" else None,
+            "task_title": tm_title if pa_id == "PA-01" else None,
+            "fields": {
+                "status": _opt_str(tm_fields_raw.get("status"), 32),
+                "due_date_iso": _opt_str(tm_fields_raw.get("due_date_iso"), 32),
+                "priority": _opt_str(tm_fields_raw.get("priority"), 32),
+                "notes": _opt_str(tm_fields_raw.get("notes"), 240),
+            },
+        },
+        "gmail": {
+            "operation": gmail_op if pa_id == "PA-14" else "unknown",
+            "max_results": gmail_max_results if pa_id == "PA-14" and gmail_op in ("list", "summarize") else None,
+            "label": gmail_label if pa_id == "PA-14" else None,
+            "query": gmail_query if pa_id == "PA-14" else None,
+        },
+        "confidence": confidence_f,
+    }
+    summary_txt = str(normalized.get("intent_summary") or "").strip()
+    blocked_markers = (
+        "cannot access",
+        "without tool access",
+        "tools are available",
+        "tools unavailable",
+        "cannot do",
+        "not available",
+        "nie moge",
+        "brak dostepu",
+        "brak narzedzi",
+    )
+    if (not summary_txt) or any(m in summary_txt.lower() for m in blocked_markers):
+        if pa_id == "PA-14":
+            op = str(((normalized.get("gmail") or {}).get("operation")) or "unknown")
+            if op in ("list", "summarize"):
+                summary_txt = "Route to PA-14: analyze recent inbox messages."
+            elif op in ("send", "trash"):
+                summary_txt = "Route to PA-14: execute Gmail side-effect flow."
+            else:
+                summary_txt = "Route to PA-14: Gmail intent detected."
+        elif pa_id == "PA-01":
+            op = str(((normalized.get("tm") or {}).get("operation")) or "unknown")
+            summary_txt = f"Route to PA-01: task operation={op}."
+        else:
+            summary_txt = f"Route to {pa_id} based on user request."
+    normalized["intent_summary"] = summary_txt[:200]
+    return normalized
+
+
+def _pa_runtime_tools_include_from_intent(intent_payload: Dict[str, Any] | None) -> List[str] | None:
+    if not isinstance(intent_payload, dict):
+        return None
+    pa_id = str(intent_payload.get("pa_function_id") or "").strip()
+    if pa_id == "PA-13":
+        return ["get_current_time", "gmail_recent_metadata", "gmail_action"]
+    if pa_id == "PA-14":
+        return ["get_current_time", "gmail_recent_metadata", "gmail_action"]
+    if pa_id == "PA-15":
+        return [
+            "get_current_time",
+            "gmail_recent_metadata",
+            "gmail_action",
+            "read_blob_file",
+            "add_new_data",
+            "update_data_entry",
+            "upload_data_or_file",
+        ]
+    if pa_id == "PA-01":
+        return [
+            "get_current_time",
+            "read_blob_file",
+            "get_filtered_data",
+            "add_new_data",
+            "update_data_entry",
+            "remove_data_entry",
+            "upload_data_or_file",
+        ]
+    if pa_id == "PA-07":
+        return [
+            "get_current_time",
+            "read_blob_file",
+            "add_new_data",
+            "update_data_entry",
+            "remove_data_entry",
+            "upload_data_or_file",
+        ]
+    if pa_id == "PA-08":
+        return ["get_current_time", "list_blobs", "read_blob_file"]
+    if pa_id in ("PA-02", "PA-03", "PA-04", "PA-05", "PA-06", "PA-09", "PA-10", "PA-11", "PA-12"):
+        return ["get_current_time", "read_blob_file"]
+    return None
+
+
+def _pa_intention_text_json_schema_format() -> Dict[str, Any]:
+    return {
+        "format": {
+            "type": "json_schema",
+            "name": "pa_intention_min_v2",
+            "strict": True,
+            "schema": PA_INTENTION_SCHEMA_V3,
+        }
+    }
 
 # Optional built-in web search tool (OpenAI hosted tool). If enabled, it is added to the Responses tools list.
 PA_WEB_SEARCH_ENABLED = str(os.environ.get("PA_WEB_SEARCH_ENABLED", "1") or "").strip().lower() in ("1", "true", "yes", "y", "on")
@@ -105,9 +761,12 @@ PA_WEB_SEARCH_ALLOWED_DOMAINS = str(os.environ.get("PA_WEB_SEARCH_ALLOWED_DOMAIN
 WP6_DEFAULT_CONTEXT_MODE = (os.environ.get("WP6_DEFAULT_CONTEXT_MODE", "AUTO") or "AUTO").strip().upper()
 WP6_TOPIC_CHANGE_ENABLED = False
 WP6_TOPIC_CHANGE_WINDOW_SECONDS = 0
-WP6_RESPONSES_STATELESS = os.environ.get("WP6_RESPONSES_STATELESS", "").lower() in ("1", "true", "yes")
+WP6_RESPONSES_STATELESS = os.environ.get("WP6_RESPONSES_STATELESS", "1").lower() in ("1", "true", "yes")
 WP6_RECENT_TURNS_MAX = int(os.environ.get("WP6_RECENT_TURNS_MAX", "8") or 8)
 WP6_RECENT_TURNS_MAX_CHARS = int(os.environ.get("WP6_RECENT_TURNS_MAX_CHARS", "320") or 320)
+WP6_CAPSULE_RECENT_TURNS = int(os.environ.get("WP6_CAPSULE_RECENT_TURNS", "4") or 4)
+WP6_CAPSULE_LAST_QUESTIONS = int(os.environ.get("WP6_CAPSULE_LAST_QUESTIONS", "3") or 3)
+WP6_CAPSULE_MAX_CHARS = int(os.environ.get("WP6_CAPSULE_MAX_CHARS", "9000") or 9000)
 WP6_FAST_AUDIT_ENABLED = str(os.environ.get("WP6_FAST_AUDIT_ENABLED", "0") or "").strip().lower() in ("1", "true", "yes", "y", "on")
 WP6_FAST_AUDIT_MAX_CHARS = int(os.environ.get("WP6_FAST_AUDIT_MAX_CHARS", "16000") or 16000)
 WP6_AUDIT_DEFAULT_MODEL = str(os.environ.get("WP6_AUDIT_DEFAULT_MODEL") or os.environ.get("OPENAI_WP6_AUDIT_MODEL") or "gpt-5-mini").strip()
@@ -140,220 +799,6 @@ def _best_effort_update_manifest_after_tool_call(
         )
     except Exception:
         return
-
-# PA starter pack: explicit init only (no silent auto-create).
-def _pa_has_starter_pack(user_id: str) -> bool:
-    try:
-        from shared.azure_client import AzureBlobClient
-
-        return bool(AzureBlobClient.blob_exists("SYS.json", user_id=str(user_id)))
-    except Exception:
-        return False
-
-
-def _pa_init_starter_pack(user_id: str) -> Dict[str, Any]:
-    from shared.starter_pack import ensure_starter_pack
-
-    return ensure_starter_pack(str(user_id))
-
-
-def _pa_write_intention_artifact(
-    *,
-    user_id: str,
-    thread_id: str,
-    run_id: str,
-    phase: str,
-    stage: str,
-    model: str,
-    request_message: str,
-    intent_payload: Dict[str, Any],
-) -> str:
-    """
-    Persist intention artifact as JSON for ML.
-    Best-effort: never raises.
-    """
-    try:
-        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        safe_tid = str(thread_id or "").strip() or "no_thread"
-        safe_rid = str(run_id or "").strip() or uuid.uuid4().hex[:12]
-        path = f"semantics/intents/INTENT_{ts}_{safe_tid}_{safe_rid}.json"
-        payload = {
-            "schema_version": "omniflow.pa.intention.v2",
-            "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
-            "user_id": str(user_id),
-            "thread_id": str(thread_id),
-            "run_id": str(run_id),
-            "phase": str(phase or ""),
-            "stage": str(stage or ""),
-            "model": str(model or ""),
-            "request_message": str(request_message or "")[:4000],
-            "intention": intent_payload,
-        }
-        execute_tool_call("upload_data_or_file", {"target_blob_name": path, "file_content": payload}, user_id)
-        _best_effort_update_manifest_after_tool_call(
-            user_id=str(user_id),
-            tool_name="upload_data_or_file",
-            tool_args={"target_blob_name": path, "file_content": {"schema_version": payload.get("schema_version")}},
-            result_str=json.dumps({"status": "success"}),
-        )
-        return path
-    except Exception:
-        return ""
-
-
-def _pa_run_intention_step(
-    *,
-    openai_client: OpenAI,
-    user_id: str,
-    thread_id: str,
-    run_id: str,
-    phase: str,
-    stage: str,
-    user_message: str,
-) -> Tuple[Dict[str, Any], str]:
-    """
-    Separate "intention" call (no tools) to produce an ML-ready artifact.
-    Returns (intent_payload, artifact_path).
-    """
-    if not PA_INTENTION_ENABLED:
-        return {}, ""
-    try:
-        _emit_run_progress(
-            user_id=str(user_id),
-            thread_id=str(thread_id),
-            run_id=str(run_id or ""),
-            trace_id="",
-            status="in_progress",
-            stage="intention",
-            message=f"Intention: calling model {PA_INTENTION_MODEL}",
-            async_save=True,
-        )
-    except Exception:
-        pass
-    try:
-        prompt = (
-            "You are an intention router for OmniFlow Personal Assistance (PA).\n"
-            "Return STRICT JSON only (no markdown, no prose).\n"
-            "Schema:\n"
-            "{"
-            "\"schema_version\":\"omniflow.pa.intention.v2\","
-            "\"pa_function_id\":\"PA-01|PA-02|...|PA-15\","
-            "\"pa_function_name\":\"...\","
-            "\"intent\":\"...\","
-            "\"language\":\"...\","
-            "\"requires_internet\":true|false,"
-            "\"target_artifacts\":[\"TM.json\"],"
-            "\"required_tools\":[\"list_blobs\"],"
-            "\"candidate_tools\":[{\"name\":\"...\",\"why\":\"...\",\"args_hint\":{}}],"
-            "\"write_intent\": {\"will_write\":true|false,\"target_files\":[\"TM.json\"],\"consent_required\":true|false}"
-            "}\n"
-            f"Phase={phase or ''}; Stage={stage or ''}\n"
-            "User message:\n"
-            f"{user_message}"
-        )
-        call_kwargs = {
-            "model": PA_INTENTION_MODEL,
-            "input": prompt,
-            "tool_choice": "none",
-            "parallel_tool_calls": False,
-            "max_output_tokens": int(PA_INTENTION_MAX_OUTPUT_TOKENS),
-            "metadata": {
-                "purpose": "pa_intention",
-                "user_id": str(user_id),
-                "thread_id": str(thread_id),
-                "run_id": str(run_id or ""),
-                "phase": str(phase or ""),
-                "stage": str(stage or ""),
-            },
-        }
-        if PA_INTENTION_REASONING_EFFORT in ("low", "medium", "high"):
-            call_kwargs["reasoning"] = {"effort": PA_INTENTION_REASONING_EFFORT}
-        resp = _openai_call(openai_client.responses.create, **call_kwargs)
-        out_text = str(getattr(resp, "output_text", None) or "").strip()
-        try:
-            payload = json.loads(out_text) if out_text else {}
-        except Exception:
-            payload = {"schema_version": "omniflow.pa.intention.v2", "parse_error": True, "raw": out_text[:4000]}
-        if not isinstance(payload, dict):
-            payload = {"schema_version": "omniflow.pa.intention.v2", "parse_error": True, "raw": out_text[:4000]}
-
-        # Normalize to v2 contract deterministically (models may omit fields).
-        try:
-            def _guess_pa_function_id(p: Dict[str, Any]) -> str:
-                tools = []
-                for t in (p.get("candidate_tools") or []):
-                    if isinstance(t, dict) and t.get("name"):
-                        tools.append(str(t.get("name") or ""))
-                tools_set = set(tools)
-                if any(x in tools_set for x in ("list_blobs", "read_blob_file", "read_many_blobs")):
-                    return "PA-08"  # Artifact Analysis
-                if "gmail_action" in tools_set:
-                    return "PA-14"  # Mail Analysis & Triage
-                targets = []
-                wi = p.get("write_intent") if isinstance(p.get("write_intent"), dict) else {}
-                for tf in (wi.get("target_files") or []):
-                    if tf:
-                        targets.append(str(tf))
-                if any(t.upper() == "TM.JSON" for t in targets):
-                    return "PA-01"  # Task Management
-                return "PA-12"  # Function Proposal (safe default)
-
-            def _pa_name(pa_id: str) -> str:
-                mapping = {
-                    "PA-01": "Task Management",
-                    "PA-02": "Daily Planning",
-                    "PA-03": "Priority Reasoning",
-                    "PA-04": "Goal Alignment",
-                    "PA-05": "Progress Review",
-                    "PA-06": "Knowledge Recall",
-                    "PA-07": "Note & Idea Handling",
-                    "PA-08": "Artifact Analysis",
-                    "PA-09": "Context Integration",
-                    "PA-10": "Decision Reflection",
-                    "PA-11": "Summary & Reporting",
-                    "PA-12": "Function Proposal",
-                    "PA-13": "Mail Management",
-                    "PA-14": "Mail Analysis & Triage",
-                    "PA-15": "Mail-to-Action Mapping",
-                }
-                return mapping.get(pa_id, "")
-
-            payload["schema_version"] = "omniflow.pa.intention.v2"
-            if "pa_function_id" not in payload or not str(payload.get("pa_function_id") or "").strip():
-                payload["pa_function_id"] = _guess_pa_function_id(payload)
-            if "pa_function_name" not in payload or not str(payload.get("pa_function_name") or "").strip():
-                payload["pa_function_name"] = _pa_name(str(payload.get("pa_function_id") or ""))
-            if "target_artifacts" not in payload or not isinstance(payload.get("target_artifacts"), list):
-                wi = payload.get("write_intent") if isinstance(payload.get("write_intent"), dict) else {}
-                payload["target_artifacts"] = [str(x) for x in (wi.get("target_files") or []) if str(x).strip()]
-            if "required_tools" not in payload or not isinstance(payload.get("required_tools"), list):
-                tools = []
-                for t in (payload.get("candidate_tools") or []):
-                    if isinstance(t, dict) and t.get("name"):
-                        tools.append(str(t.get("name") or ""))
-                payload["required_tools"] = [x for x in tools if x]
-            if "intent" not in payload:
-                payload["intent"] = ""
-            if "requires_internet" not in payload:
-                payload["requires_internet"] = False
-        except Exception:
-            # Best-effort only; never break the run on normalization errors.
-            pass
-
-        path = _pa_write_intention_artifact(
-            user_id=str(user_id),
-            thread_id=str(thread_id),
-            run_id=str(run_id or ""),
-            phase=str(phase or ""),
-            stage=str(stage or ""),
-            model=str(PA_INTENTION_MODEL),
-            request_message=str(user_message or ""),
-            intent_payload=payload,
-        )
-        return payload, path
-    except Exception as exc:
-        _best_effort_debug("pa_intention_failed", user_id=str(user_id), thread_id=str(thread_id), error=exc)
-        return {}, ""
 
     uid = str(user_id or "").strip()
     if not uid:
@@ -449,6 +894,484 @@ def _pa_run_intention_step(
         upsert_manifest_entry(container, uid, entry)
     except Exception:
         return
+
+# PA starter pack: explicit init only (no silent auto-create).
+def _pa_has_starter_pack(user_id: str) -> bool:
+    try:
+        from shared.azure_client import AzureBlobClient
+
+        return bool(AzureBlobClient.blob_exists("SYS.json", user_id=str(user_id)))
+    except Exception:
+        return False
+
+
+def _pa_init_starter_pack(user_id: str) -> Dict[str, Any]:
+    from shared.starter_pack import ensure_starter_pack
+
+    return ensure_starter_pack(str(user_id))
+
+
+def _pa_detect_correction_signal(user_message: str) -> bool:
+    text = str(user_message or "").strip().lower()
+    if not text:
+        return False
+    markers = (
+        "nie,",
+        "nie ",
+        "zle",
+        "źle",
+        "wrong",
+        "not this",
+        "i meant",
+        "chodzilo o",
+        "chodziło o",
+        "popraw",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _pa_extract_resolved_slots(intent_payload: Dict[str, Any] | None) -> Dict[str, Any]:
+    payload = dict(intent_payload or {}) if isinstance(intent_payload, dict) else {}
+    tm = payload.get("tm") if isinstance(payload.get("tm"), dict) else {}
+    gmail = payload.get("gmail") if isinstance(payload.get("gmail"), dict) else {}
+    return {
+        "count": gmail.get("max_results"),
+        "task_index": tm.get("task_index_1based"),
+        "email_ref": None,
+        "query": gmail.get("query"),
+    }
+
+
+def _pa_build_ml_labels(
+    *,
+    user_message: str,
+    intent_payload: Dict[str, Any] | None,
+    execution_outcome: str,
+    source: str = "real",
+) -> Dict[str, Any]:
+    payload = dict(intent_payload or {}) if isinstance(intent_payload, dict) else {}
+    tm = payload.get("tm") if isinstance(payload.get("tm"), dict) else {}
+    gmail = payload.get("gmail") if isinstance(payload.get("gmail"), dict) else {}
+    final_resolved_intent = {
+        "pa_function_id": str(payload.get("pa_function_id") or ""),
+        "tm_operation": str(tm.get("operation") or "unknown"),
+        "gmail_operation": str(gmail.get("operation") or "unknown"),
+    }
+    correction = _pa_detect_correction_signal(str(user_message or ""))
+    return {
+        "dataset_schema": "omniflow.pa.ml_dataset_row.v1",
+        "input_text": str(user_message or "")[:4000],
+        "nano_output_raw": payload,
+        "final_resolved_intent": final_resolved_intent,
+        "resolved_slots": _pa_extract_resolved_slots(payload),
+        "execution_outcome": str(execution_outcome or "pending"),
+        "source": str(source or "real"),
+        "correction_signal": bool(correction),
+        "corrected_intent": None,
+    }
+
+
+def _pa_compute_execution_outcome(all_tool_calls: list) -> str:
+    calls = list(all_tool_calls or [])
+    if not calls:
+        return "success"
+    for item in calls:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("status") or "").lower() != "error":
+            continue
+        err = str(item.get("error") or "").lower()
+        if "valueerror" in err or "required" in err or "invalid" in err:
+            return "validation_error"
+        return "tool_error"
+    return "success"
+
+
+def _pa_write_intention_artifact(
+    *,
+    user_id: str,
+    thread_id: str,
+    run_id: str,
+    phase: str,
+    stage: str,
+    model: str,
+    intent_response_id: str,
+    request_message: str,
+    intent_payload: Dict[str, Any],
+) -> str:
+    """
+    Persist intention artifact as JSON for ML.
+    Best-effort: never raises.
+    """
+    try:
+        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        safe_tid = str(thread_id or "").strip() or "no_thread"
+        safe_rid = str(run_id or "").strip() or uuid.uuid4().hex[:12]
+        path = f"semantics/intents/INTENT_{ts}_{safe_tid}_{safe_rid}.json"
+        payload = {
+            "schema_version": "omniflow.pa.intention.v3",
+            "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
+            "user_id": str(user_id),
+            "thread_id": str(thread_id),
+            "run_id": str(run_id),
+            "phase": str(phase or ""),
+            "stage": str(stage or ""),
+            "model": str(model or ""),
+            "intent_response_id": str(intent_response_id or ""),
+            "request_message": str(request_message or "")[:4000],
+            "intention": intent_payload,
+            "ml_labels": _pa_build_ml_labels(
+                user_message=str(request_message or ""),
+                intent_payload=intent_payload if isinstance(intent_payload, dict) else {},
+                execution_outcome="pending",
+                source="real",
+            ),
+        }
+        execute_tool_call("upload_data_or_file", {"target_blob_name": path, "file_content": payload}, user_id)
+        _best_effort_update_manifest_after_tool_call(
+            user_id=str(user_id),
+            tool_name="upload_data_or_file",
+            tool_args={"target_blob_name": path, "file_content": {"schema_version": payload.get("schema_version")}},
+            result_str=json.dumps({"status": "success"}),
+        )
+        return path
+    except Exception:
+        return ""
+
+
+def _pa_run_intention_step(
+    *,
+    openai_client: OpenAI,
+    user_id: str,
+    thread_id: str,
+    run_id: str,
+    phase: str,
+    stage: str,
+    user_message: str,
+    single_step_focus: bool = False,
+    raise_on_error: bool = False,
+) -> Tuple[Dict[str, Any], str]:
+    """
+    Separate "intention" call (no tools) to produce an ML-ready artifact.
+    Returns (intent_payload, artifact_path).
+    """
+    if not PA_INTENTION_ENABLED:
+        return {}, ""
+    try:
+        _emit_run_progress(
+            user_id=str(user_id),
+            thread_id=str(thread_id),
+            run_id=str(run_id or ""),
+            trace_id="",
+            status="in_progress",
+            stage="intention",
+            message=f"Intention: calling model {PA_INTENTION_MODEL}",
+            async_save=True,
+        )
+    except Exception:
+        pass
+    try:
+        # Keep a stable prompt prefix to maximize prompt-caching hits.
+        # Do not embed phase/stage/user ids in the prompt text; send those as metadata.
+        single_step_constraints = (
+            "Single-step focus hint:\n"
+            "- Prefer PA-01 (Task Management) or PA-14 (Mail Analysis & Triage) when clear.\n"
+        ) if single_step_focus else ""
+
+        catalog_json = json.dumps(PA_INTENT_FUNCTION_CATALOG, ensure_ascii=False)
+        input_contract = json.dumps(
+            {
+                "user_message": str(user_message or "")[:2000],
+                "candidate_functions": PA_INTENT_FUNCTION_CATALOG,
+            },
+            ensure_ascii=False,
+        )
+        prompt = (
+            "You are a semantic intention classifier for OmniFlow Personal Assistance (PA).\n"
+            "Return STRICT JSON only. No markdown. No prose.\n"
+            "Do not select tools. Do not propose phase/stage. Do not add schema_version.\n"
+            "\n"
+            "Allowed candidate functions and intents:\n"
+            + catalog_json
+            + "\n\n"
+            "Output contract:\n"
+            "{\n"
+            '  "primary": {"pa_id":"PA-xx","intent":"intent_name","score":0.0-1.0,"is_selected":true},\n'
+            '  "alternatives": [{"pa_id":"PA-xx","intent":"intent_name","score":0.0-1.0,"is_selected":false}],\n'
+            '  "slots": {"count":int|null,"task_index":int|null,"email_ref":string|null,"query":string|null},\n'
+            '  "signals": {"is_gmail":bool,"is_tm":bool,"has_write_intent":bool}\n'
+            "}\n"
+            "\n"
+            "Rules:\n"
+            "- Use only intents from candidate_functions.\n"
+            "- Keep count exact when user requests N emails.\n"
+            "- Keep output compact and deterministic.\n"
+            "- primary.is_selected must be true.\n"
+            "- alternatives entries must use is_selected=false.\n"
+            + single_step_constraints
+            + "\n"
+            "Input contract JSON:\n"
+            + input_contract
+        )
+        call_kwargs = {
+            "model": PA_INTENTION_MODEL,
+            "input": prompt,
+            "tool_choice": "none",
+            "parallel_tool_calls": bool(RESPONSES_PARALLEL_TOOL_CALLS),
+            "text": _pa_intention_text_json_schema_format(),
+            "max_output_tokens": int(PA_INTENTION_MAX_OUTPUT_TOKENS),
+            "store": True,
+            "metadata": {
+                "purpose": "pa_intention",
+                "user_id": str(user_id),
+                "thread_id": str(thread_id),
+                "run_id": str(run_id or ""),
+                "phase": str(phase or ""),
+                "stage": str(stage or ""),
+            },
+        }
+        if PA_INTENTION_REASONING_EFFORT in ("low", "medium", "high"):
+            call_kwargs["reasoning"] = {"effort": PA_INTENTION_REASONING_EFFORT}
+        resp = _openai_call(openai_client.responses.create, **call_kwargs)
+        resp_id = str(getattr(resp, "id", None) or "").strip()
+        out_text = str(getattr(resp, "output_text", None) or "").strip()
+        if not out_text:
+            body: Any = None
+            try:
+                body = resp.model_dump()  # type: ignore[attr-defined]
+            except Exception:
+                try:
+                    body = resp.to_dict()  # type: ignore[attr-defined]
+                except Exception:
+                    body = None
+            out_text = _output_text_from_response_body(body)
+        try:
+            payload = json.loads(out_text) if out_text else {}
+        except Exception:
+            # Best-effort recovery: some models may wrap JSON with prose/code fences despite instructions.
+            # Try to extract a JSON object substring before giving up.
+            recovered = None
+            try:
+                txt = str(out_text or "")
+                txt = txt.replace("```json", "```").strip()
+                if "```" in txt:
+                    # take first fenced block content if present
+                    parts = txt.split("```")
+                    if len(parts) >= 3:
+                        txt = parts[1].strip()
+                i1 = txt.find("{")
+                i2 = txt.rfind("}")
+                if i1 != -1 and i2 != -1 and i2 > i1:
+                    recovered = json.loads(txt[i1 : i2 + 1])
+            except Exception:
+                recovered = None
+            if isinstance(recovered, dict):
+                payload = recovered
+            else:
+                payload = {"schema_version": "omniflow.pa.intention.v3", "parse_error": True, "raw": out_text[:4000]}
+        if not isinstance(payload, dict):
+            payload = {"schema_version": "omniflow.pa.intention.v3", "parse_error": True, "raw": out_text[:4000]}
+
+        payload = _pa_backend_normalize_intention_payload(
+            intent_payload=payload,
+            user_message=str(user_message or ""),
+            single_step_focus=bool(single_step_focus),
+        )
+
+        path = _pa_write_intention_artifact(
+            user_id=str(user_id),
+            thread_id=str(thread_id),
+            run_id=str(run_id or ""),
+            phase=str(phase or ""),
+            stage=str(stage or ""),
+            model=str(PA_INTENTION_MODEL),
+            intent_response_id=resp_id,
+            request_message=str(user_message or ""),
+            intent_payload=payload,
+        )
+        return payload, path
+    except Exception as exc:
+        _best_effort_debug("pa_intention_failed", user_id=str(user_id), thread_id=str(thread_id), error=exc)
+        if raise_on_error:
+            raise
+        return {}, ""
+
+
+def _pa_execute_prefetch_plan(
+    *,
+    user_id: str,
+    thread_id: str,
+    run_id: str,
+    intent_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Execute a bounded, backend-validated prefetch plan produced by PA intention.
+    Deterministic orchestration only: allowlist + strict limits + small artifacts.
+    """
+
+    def _tm_count(value: Any) -> int:
+        if isinstance(value, dict):
+            if isinstance(value.get("items"), list):
+                return len(value["items"])
+            if isinstance(value.get("tasks"), list):
+                return len(value["tasks"])
+            return 0
+        if isinstance(value, list):
+            extra = 0
+            for el in value:
+                if isinstance(el, dict) and isinstance(el.get("tasks"), list):
+                    extra += len(el["tasks"])
+            return len(value) + extra
+        return 0
+
+    plan = intent_payload.get("prefetch_plan") if isinstance(intent_payload, dict) else None
+    if not isinstance(plan, list) or not plan:
+        return {"executed": [], "skipped": [], "errors": [], "artifact_path": ""}
+
+    allow = {"read_blob_file", "list_blobs", "gmail_recent_metadata"}
+    executed: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+
+    tm_task_count: int | None = None
+    tm_sha256: str | None = None
+
+    def _write_mail_snapshot_from_recent(result_payload: Dict[str, Any]) -> None:
+        if not isinstance(result_payload, dict):
+            return
+        if str(result_payload.get("status") or "").lower() != "ok":
+            return
+        rows = result_payload.get("messages")
+        if not isinstance(rows, list):
+            return
+        normalized: List[Dict[str, Any]] = []
+        for row in rows[:50]:
+            if not isinstance(row, dict):
+                continue
+            headers = row.get("headers") if isinstance(row.get("headers"), dict) else {}
+            normalized.append(
+                {
+                    "id": str(row.get("id") or "")[:120],
+                    "threadId": str(row.get("threadId") or "")[:120],
+                    "from": str(headers.get("From") or "")[:300],
+                    "to": str(headers.get("To") or "")[:300],
+                    "subject": str(headers.get("Subject") or "")[:500],
+                    "date": str(headers.get("Date") or row.get("internalDate") or "")[:120],
+                    "snippet": str(row.get("snippet") or "")[:2000],
+                    "labels": list(row.get("labelIds") or [])[:20] if isinstance(row.get("labelIds"), list) else [],
+                }
+            )
+        if not normalized:
+            return
+        snapshot_payload = {
+            "schema_version": "omniflow.pa.mail_snapshot.v1",
+            "updated_utc": datetime.datetime.utcnow().isoformat() + "Z",
+            "source": "gmail_recent_metadata",
+            "result_count": int(len(normalized)),
+            "messages": normalized,
+        }
+        execute_tool_call(
+            "upload_data_or_file",
+            {"target_blob_name": "MAIL.json", "file_content": snapshot_payload},
+            user_id,
+        )
+
+    for step in plan[:10]:
+        if not isinstance(step, dict):
+            continue
+        tool_name = str(step.get("tool_name") or "").strip()
+        args = step.get("args") if isinstance(step.get("args"), dict) else {}
+        if tool_name not in allow:
+            skipped.append({"tool_name": tool_name, "reason": "not_allowlisted"})
+            continue
+
+        # Clamp and validate args deterministically.
+        if tool_name == "read_blob_file":
+            file_name = str(args.get("file_name") or "").strip()
+            if not file_name:
+                skipped.append({"tool_name": tool_name, "reason": "missing_file_name"})
+                continue
+            args = {"file_name": file_name}
+        elif tool_name == "list_blobs":
+            prefix = str(args.get("prefix") or "").strip()
+            include_meta = bool(args.get("include_meta") if args.get("include_meta") is not None else True)
+            args = {"prefix": prefix, "include_meta": include_meta}
+        elif tool_name == "gmail_recent_metadata":
+            try:
+                max_results = int(args.get("max_results") or 20)
+            except Exception:
+                max_results = 20
+            if max_results < 1:
+                max_results = 1
+            if max_results > 50:
+                max_results = 50
+            label = str(args.get("label") or "INBOX").strip() or "INBOX"
+            query = str(args.get("query") or "").strip()
+            args = {"max_results": max_results, "label": label, "query": query}
+
+        try:
+            result_str, info = execute_tool_call(tool_name, args, user_id)
+            executed.append(
+                {
+                    "tool_name": tool_name,
+                    "status": str((info or {}).get("status") or "unknown"),
+                    "duration_ms": float((info or {}).get("duration_ms") or 0),
+                }
+            )
+            if tool_name == "gmail_recent_metadata":
+                try:
+                    parsed_recent = json.loads(result_str) if isinstance(result_str, str) else {}
+                except Exception:
+                    parsed_recent = {}
+                try:
+                    _write_mail_snapshot_from_recent(parsed_recent if isinstance(parsed_recent, dict) else {})
+                except Exception:
+                    pass
+            if tool_name == "read_blob_file" and str(args.get("file_name") or "").upper() == "TM.JSON":
+                # Best-effort: compute a stable digest and task count without storing task contents.
+                try:
+                    parsed = json.loads(result_str) if isinstance(result_str, str) else {}
+                except Exception:
+                    parsed = {}
+                if isinstance(parsed, dict) and parsed.get("status") == "success":
+                    data = parsed.get("data")
+                    try:
+                        raw = json.dumps(data, ensure_ascii=False, sort_keys=True).encode("utf-8", "ignore")
+                        import hashlib
+
+                        tm_sha256 = hashlib.sha256(raw).hexdigest()
+                    except Exception:
+                        tm_sha256 = None
+                    try:
+                        tm_task_count = int(_tm_count(data))
+                    except Exception:
+                        tm_task_count = None
+        except Exception as exc:
+            errors.append({"tool_name": tool_name, "error": f"{type(exc).__name__}: {exc}"})
+
+    artifact_path = ""
+    try:
+        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        safe_tid = str(thread_id or "").strip() or "no_thread"
+        safe_rid = str(run_id or "").strip() or uuid.uuid4().hex[:12]
+        artifact_path = f"semantics/prefetch/PREFETCH_{ts}_{safe_tid}_{safe_rid}.json"
+        payload = {
+            "schema_version": "omniflow.pa.prefetch.v1",
+            "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
+            "user_id": str(user_id),
+            "thread_id": str(thread_id),
+            "run_id": str(run_id),
+            "pa_function_id": str(intent_payload.get("pa_function_id") or ""),
+            "executed": executed,
+            "skipped": skipped,
+            "errors": errors,
+            "tm_digest": {"sha256": tm_sha256, "task_count": tm_task_count},
+        }
+        execute_tool_call("upload_data_or_file", {"target_blob_name": artifact_path, "file_content": payload}, user_id)
+    except Exception:
+        artifact_path = ""
+
+    return {"executed": executed, "skipped": skipped, "errors": errors, "artifact_path": artifact_path}
 
 # WP6.M1: preferences cache (best-effort; no hard dependency)
 _prefs_cache: Dict[str, Dict[str, Any]] = {}
@@ -1330,6 +2253,208 @@ def _wp6_format_recent_turns(turns: list[str]) -> str:
     return "[RECENT_USER_TURNS]\n" + "\n".join(lines)
 
 
+def _wp6_load_user_profile_snapshot(user_id: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    try:
+        raw, _ = execute_tool_call(
+            "read_blob_file",
+            {"file_name": "semantics/preferences.json", "parse_json": True, "max_bytes": 10000},
+            user_id,
+        )
+        payload = json.loads(raw) if isinstance(raw, str) else {}
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return {}
+        for key in list(data.keys())[:20]:
+            k = str(key or "").strip()
+            if not k:
+                continue
+            val = data.get(key)
+            if isinstance(val, (str, int, float, bool)) or val is None:
+                out[k] = val
+                continue
+            if isinstance(val, list):
+                slim = []
+                for item in val[:8]:
+                    if isinstance(item, (str, int, float, bool)) or item is None:
+                        slim.append(item)
+                if slim:
+                    out[k] = slim
+                continue
+            if isinstance(val, dict):
+                nested = {}
+                for nk in list(val.keys())[:8]:
+                    nv = val.get(nk)
+                    if isinstance(nv, (str, int, float, bool)) or nv is None:
+                        nested[str(nk)] = nv
+                if nested:
+                    out[k] = nested
+        return out
+    except Exception:
+        return {}
+
+
+def _wp6_load_mail_snapshot_snippet(user_id: str, max_items: int = 8) -> Dict[str, Any]:
+    try:
+        raw, _ = execute_tool_call(
+            "read_blob_file",
+            {"file_name": "MAIL.json", "parse_json": True, "max_bytes": 80000},
+            user_id,
+        )
+        payload = json.loads(raw) if isinstance(raw, str) else {}
+        data = payload.get("data") if isinstance(payload, dict) else None
+        items: List[Dict[str, Any]] = []
+        candidate_lists: List[Any] = []
+        if isinstance(data, list):
+            candidate_lists.append(data)
+        elif isinstance(data, dict):
+            for key in ("messages", "items", "inbox", "emails", "mail"):
+                if isinstance(data.get(key), list):
+                    candidate_lists.append(data.get(key))
+            if not candidate_lists:
+                for value in data.values():
+                    if isinstance(value, list):
+                        candidate_lists.append(value)
+                        break
+        for lst in candidate_lists:
+            for row in list(lst or []):
+                if not isinstance(row, dict):
+                    continue
+                one = {
+                    "id": str(row.get("id") or row.get("message_id") or "")[:120],
+                    "from": str(row.get("from") or row.get("sender") or "")[:200],
+                    "subject": str(row.get("subject") or "")[:220],
+                    "date": str(row.get("date") or row.get("internal_date") or "")[:80],
+                }
+                labels = row.get("labels")
+                if isinstance(labels, list):
+                    one["labels"] = [str(x)[:32] for x in labels[:6]]
+                elif labels is not None:
+                    one["labels"] = [str(labels)[:32]]
+                items.append(one)
+                if len(items) >= max(1, int(max_items)):
+                    break
+            if len(items) >= max(1, int(max_items)):
+                break
+        if not items:
+            return {}
+        return {"source": "MAIL.json", "items": items}
+    except Exception:
+        return {}
+
+
+def _wp6_build_context_capsule(
+    *,
+    user_id: str,
+    user_message: str,
+    recent_turns: list[str],
+    core_sources: list[dict],
+    fast_ctx: str,
+    intent_payload: Dict[str, Any] | None = None,
+) -> Tuple[str, Dict[str, Any]]:
+    meta: Dict[str, Any] = {
+        "capsule_enabled": True,
+        "capsule_chars": 0,
+        "capsule_recent_turns_count": 0,
+        "capsule_last_questions_count": 0,
+        "capsule_semantic_lines_count": 0,
+        "capsule_has_tm_snippet": False,
+        "capsule_has_user_profile": False,
+    }
+    try:
+        payload = dict(intent_payload or {}) if isinstance(intent_payload, dict) else {}
+        pa_function_id = str(payload.get("pa_function_id") or "").strip()
+        tm_meta = payload.get("tm") if isinstance(payload.get("tm"), dict) else {}
+        gmail_meta = payload.get("gmail") if isinstance(payload.get("gmail"), dict) else {}
+        intent_view = {
+            "primary": {
+                "pa_id": pa_function_id,
+                "summary": str(payload.get("intent_summary") or "")[:120],
+                "confidence": payload.get("confidence"),
+            },
+            "tm": {"operation": str(tm_meta.get("operation") or "unknown")},
+            "gmail": {
+                "operation": str(gmail_meta.get("operation") or "unknown"),
+                "max_results": gmail_meta.get("max_results"),
+                "label": gmail_meta.get("label"),
+                "query": gmail_meta.get("query"),
+            },
+        }
+        profile = _wp6_load_user_profile_snapshot(user_id)
+        forbidden_profile_keys = {
+            "user_id",
+            "session_id",
+            "run_id",
+            "ts_utc",
+            "phase",
+            "stage",
+            "response_id",
+            "prompt_id",
+            "requires_confirmation",
+            "write_intent",
+            "tool_budget",
+        }
+        if isinstance(profile, dict):
+            profile = {k: v for k, v in profile.items() if str(k or "") not in forbidden_profile_keys}
+        tm_snippet = {}
+        if pa_function_id == "PA-01":
+            for src in (core_sources or []):
+                if not isinstance(src, dict):
+                    continue
+                if str(src.get("path") or "").strip() != "TM.json":
+                    continue
+                snippet = str(src.get("excerpt_or_snippet") or "").strip()[:2200]
+                if snippet:
+                    tm_snippet = {"source": "TM.json", "snippet": snippet}
+                    break
+
+        mail_snippet = {}
+        if pa_function_id == "PA-14":
+            mail_snippet = _wp6_load_mail_snapshot_snippet(user_id=user_id, max_items=8)
+
+        recent = [str(t or "").strip() for t in (recent_turns or []) if str(t or "").strip()]
+        if int(WP6_CAPSULE_RECENT_TURNS or 0) > 0:
+            recent = recent[-int(WP6_CAPSULE_RECENT_TURNS) :]
+        last_q = recent[-max(1, int(WP6_CAPSULE_LAST_QUESTIONS or 0)) :] if recent else []
+
+        semantic_lines: list[str] = []
+        for line in str(fast_ctx or "").splitlines():
+            s = str(line or "").strip()
+            if not s or not s.startswith("- "):
+                continue
+            semantic_lines.append(s[:260])
+            if len(semantic_lines) >= 4:
+                break
+
+        artifact_snippets: Dict[str, Any] = {}
+        if pa_function_id == "PA-01" and tm_snippet:
+            artifact_snippets["tm"] = tm_snippet
+        if pa_function_id == "PA-14" and mail_snippet:
+            artifact_snippets["mail"] = mail_snippet
+
+        capsule = {
+            "intent": intent_view,
+            "user_profile": profile,
+            "recent_user_turns": recent,
+            "last_user_questions": last_q,
+            "artifact_snippets": artifact_snippets,
+            "semantic_signals": semantic_lines,
+        }
+        packed = json.dumps(capsule, ensure_ascii=False)
+        meta["capsule_chars"] = int(len(packed))
+        meta["capsule_recent_turns_count"] = int(len(recent))
+        meta["capsule_last_questions_count"] = int(len(last_q))
+        meta["capsule_semantic_lines_count"] = int(len(semantic_lines))
+        meta["capsule_has_tm_snippet"] = bool(artifact_snippets.get("tm"))
+        meta["capsule_has_mail_snippet"] = bool(artifact_snippets.get("mail"))
+        meta["capsule_has_user_profile"] = bool(profile)
+        return packed, meta
+    except Exception as exc:
+        meta["capsule_enabled"] = False
+        meta["capsule_error"] = str(type(exc).__name__)
+        return "", meta
+
+
 def _wp6_update_recent_user_turns(user_id: str, thread_id: str, user_message: str) -> list[str]:
     """
     Maintain a bounded ring buffer of recent raw user turns in handles.json.
@@ -1396,6 +2521,106 @@ def _wp6_write_fast_audit(
             thread_id=str(thread_id),
             error=exc,
             kind=kind,
+        )
+        return ""
+
+
+def _pa_compact_tool_calls_for_run_artifact(tool_calls: list, *, max_items: int = 50) -> List[Dict[str, Any]]:
+    compact: List[Dict[str, Any]] = []
+    if not isinstance(tool_calls, list):
+        return compact
+    for item in tool_calls[: max(1, int(max_items or 50))]:
+        if not isinstance(item, dict):
+            continue
+        row: Dict[str, Any] = {
+            "tool_name": str(item.get("tool_name") or ""),
+            "status": str(item.get("status") or ""),
+            "duration_ms": item.get("duration_ms"),
+            "call_id": str(item.get("call_id") or ""),
+            "runtime": str(item.get("runtime") or ""),
+        }
+        err = item.get("error")
+        if err:
+            row["error"] = str(err)[:400]
+        compact.append(row)
+    return compact
+
+
+def _pa_write_run_artifact(
+    *,
+    user_id: str,
+    thread_id: str,
+    run_id: str,
+    trace_id: str,
+    runtime_used: str,
+    phase: str,
+    stage: str,
+    user_message: str,
+    assistant_response: str,
+    all_tool_calls: list,
+    responses_meta: Dict[str, Any] | None,
+    total_ms: float,
+) -> str:
+    try:
+        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        rid = str(run_id or "").strip() or uuid.uuid4().hex[:12]
+        safe_thread = re.sub(r"[^A-Za-z0-9_.-]", "_", str(thread_id or "thread"))
+        suffix = uuid.uuid4().hex[:8]
+        path = f"semantics/runs/{safe_thread}/RUN_{ts}_{rid}_{suffix}.json"
+        payload: Dict[str, Any] = {
+            "schema_version": "omniflow.pa.run.v1",
+            "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
+            "user_id": str(user_id or ""),
+            "thread_id": str(thread_id or ""),
+            "session_id": str(thread_id or ""),
+            "run_id": rid,
+            "trace_id": str(trace_id or ""),
+            "runtime_used": str(runtime_used or ""),
+            "phase": str(phase or ""),
+            "stage": str(stage or ""),
+            "timings": {"total_ms": float(total_ms or 0)},
+            "user_message": str(user_message or "")[: max(1, int(PA_RUN_ARTIFACT_MAX_USER_MESSAGE_CHARS or 2000))],
+            "assistant_response": str(assistant_response or "")[
+                : max(1, int(PA_RUN_ARTIFACT_MAX_ASSISTANT_CHARS or 4000))
+            ],
+            "tool_calls_count": int(len(all_tool_calls or [])),
+            "tool_calls": _pa_compact_tool_calls_for_run_artifact(all_tool_calls, max_items=50),
+        }
+        intent_payload_for_ml: Dict[str, Any] = {}
+        if isinstance(responses_meta, dict):
+            payload["responses"] = {
+                "responses_conversation_id": str(responses_meta.get("responses_conversation_id") or ""),
+                "responses_last_response_id": str(responses_meta.get("responses_last_response_id") or ""),
+                "prompt_id": str(responses_meta.get("prompt_id") or ""),
+                "prompt_vars_enabled": bool(responses_meta.get("prompt_vars_enabled")),
+                "tools_included": list(responses_meta.get("tools_included") or []),
+                "include_web_search": bool(responses_meta.get("include_web_search")),
+                "web_search_enabled": bool(responses_meta.get("web_search_enabled")),
+                "composer_matrix_id": str(responses_meta.get("composer_matrix_id") or ""),
+                "composer_block_ids": list(responses_meta.get("composer_block_ids") or []),
+                "composer_schema_id": str(responses_meta.get("composer_schema_id") or ""),
+                "composer_tools_id": str(responses_meta.get("composer_tools_id") or ""),
+            }
+            intent_payload_for_ml = (
+                responses_meta.get("pa_intention_payload")
+                if isinstance(responses_meta.get("pa_intention_payload"), dict)
+                else {}
+            )
+        payload["ml_labels"] = _pa_build_ml_labels(
+            user_message=str(user_message or ""),
+            intent_payload=intent_payload_for_ml,
+            execution_outcome=_pa_compute_execution_outcome(list(all_tool_calls or [])),
+            source="real",
+        )
+        execute_tool_call("upload_data_or_file", {"target_blob_name": path, "file_content": payload}, str(user_id or ""))
+        return path
+    except Exception as exc:
+        _best_effort_debug(
+            "pa_run_artifact_write_failed",
+            user_id=str(user_id or ""),
+            thread_id=str(thread_id or ""),
+            error=exc,
+            run_id=str(run_id or ""),
         )
         return ""
 
@@ -2431,10 +3656,13 @@ def resolve_user_id(req, body: Dict[str, Any]) -> Tuple[Any, str]:
 
 def resolve_runtime(body: Dict[str, Any]) -> str:
     """Resolve requested runtime from request body or env default."""
-    runtime = (body or {}).get("runtime") or LLM_RUNTIME_DEFAULT or "assistants"
+    runtime = (body or {}).get("runtime") or LLM_RUNTIME_DEFAULT or "responses"
     runtime = str(runtime).strip().lower()
-    if runtime not in ("assistants", "responses", "auto"):
-        raise ValueError("Invalid runtime. Allowed: assistants|responses|auto")
+    if runtime in ("assistants", "assistant"):
+        # Backward-compatible env/request handling after assistants runtime removal.
+        runtime = "responses"
+    if runtime not in ("responses", "auto"):
+        raise ValueError("Invalid runtime. Allowed: responses|auto (assistants runtime removed)")
     return runtime
 
 
@@ -2445,10 +3673,7 @@ def _missing_env_vars_for_runtime(runtime: str) -> list:
         missing.append("OPENAI_API_KEY")
     if not PROXY_URL:
         missing.append("AZURE_PROXY_URL")
-    if runtime == "assistants":
-        if not ASSISTANT_ID:
-            missing.append("OPENAI_ASSISTANT_ID")
-    elif runtime == "responses":
+    if runtime == "responses":
         if not OPENAI_PROMPT_ID:
             missing.append("OPENAI_PROMPT_ID")
     return missing
@@ -2761,6 +3986,8 @@ def run_responses(
     phase: str = "",
     stage: str = "",
     include_web_search: bool = False,
+    tool_include_names: List[str] | None = None,
+    composer_meta: Dict[str, Any] | None = None,
 ) -> Tuple[str, list, Dict[str, Any], str]:
     """Responses API deterministic tool loop using a Prompt ID."""
     if not thread_id:
@@ -2783,20 +4010,14 @@ def run_responses(
     retried_after_tpm_reset = False
     recent_turns_buffer: list[str] = list(recent_turns or [])
     tools_included_names: List[str] = []
+    prompt_vars_forced = False
 
     for iteration in range(25):
-        prompt_vars = {
-            "phase": str(phase or ""),
-            "stage": str(stage or ""),
-            "user_id": str(user_id or ""),
-            "thread_id": str(thread_id or ""),
-            "run_id": str(run_id or ""),
-        }
         create_kwargs: Dict[str, Any] = {
-            "prompt": {"id": OPENAI_PROMPT_ID, "variables": prompt_vars},
+            "prompt": {"id": OPENAI_PROMPT_ID},
             "input": current_input,
             "tool_choice": "auto",
-            "parallel_tool_calls": False,
+            "parallel_tool_calls": bool(RESPONSES_PARALLEL_TOOL_CALLS),
             # Important: without an explicit cap, the Prompt/model defaults may request very large output budgets,
             # which can blow TPM limits even for tiny user prompts (because conversation history is server-side).
             "max_output_tokens": responses_max_output_tokens,
@@ -2813,12 +4034,28 @@ def run_responses(
                 ),
             },
         }
+        if isinstance(composer_meta, dict) and composer_meta:
+            for key in ("composer_matrix_id", "composer_schema_id", "composer_tools_id"):
+                value = str(composer_meta.get(key) or "").strip()
+                if value:
+                    create_kwargs["metadata"][key] = value
         if intent_router:
             try:
                 # OpenAI metadata values must be scalar-ish; store a short JSON string for traceability.
                 create_kwargs["metadata"]["intent_router"] = json.dumps(intent_router, ensure_ascii=False)[:768]
             except Exception:
                 pass
+        if RESPONSES_PROMPT_VARIABLES_ENABLED or prompt_vars_forced:
+            create_kwargs["prompt"] = {
+                "id": OPENAI_PROMPT_ID,
+                "variables": {
+                    "phase": str(phase or ""),
+                    "stage": str(stage or ""),
+                    "user_id": str(user_id or ""),
+                    "thread_id": str(thread_id or ""),
+                    "run_id": str(run_id or ""),
+                },
+            }
         if RESPONSES_INSTRUCTIONS:
             create_kwargs["instructions"] = RESPONSES_INSTRUCTIONS
         if RESPONSES_INCLUDE_TOOLS:
@@ -2829,6 +4066,7 @@ def run_responses(
             if PA_WEB_SEARCH_ALLOWED_DOMAINS:
                 allowed_domains = [d.strip() for d in PA_WEB_SEARCH_ALLOWED_DOMAINS.split(",") if d.strip()]
             tools_payload = build_responses_tools(
+                include=list(tool_include_names or []),
                 include_web_search=bool(PA_WEB_SEARCH_ENABLED) and bool(include_web_search),
                 web_search_context_size=str(PA_WEB_SEARCH_CONTEXT_SIZE or "low"),
                 web_search_allowed_domains=allowed_domains,
@@ -2869,6 +4107,16 @@ def run_responses(
             response = _openai_call(openai_client.responses.create, **create_kwargs)
         except Exception as exc:
             msg = str(exc)
+            if (
+                (not prompt_vars_forced)
+                and ("Missing prompt variables" in msg or "prompt_variable_missing" in msg)
+            ):
+                prompt_vars_forced = True
+                logging.warning(
+                    "Responses prompt requires variables; retrying with prompt.variables "
+                    f"user_id={user_id} thread_id={thread_id}"
+                )
+                continue
             # If the request exceeds TPM due to a large server-side conversation context + large output budget,
             # retry once with a much smaller max_output_tokens.
             if (
@@ -2965,13 +4213,7 @@ def run_responses(
                 "responses_conversation_id": conversation_id,
                 "responses_last_response_id": previous_response_id,
                 "prompt_id": str(OPENAI_PROMPT_ID or ""),
-                "prompt_vars": {
-                    "phase": str(phase or ""),
-                    "stage": str(stage or ""),
-                    "user_id": str(user_id or ""),
-                    "thread_id": str(thread_id or ""),
-                    "run_id": str(run_id or ""),
-                },
+                "prompt_vars_enabled": bool(RESPONSES_PROMPT_VARIABLES_ENABLED or prompt_vars_forced),
                 "stage": str(stage or ""),
                 "phase": str(phase or ""),
                 "tools_included": tools_included_names,
@@ -2984,6 +4226,11 @@ def run_responses(
                 pass
             if intent_router:
                 meta["intent_router"] = intent_router
+            if isinstance(composer_meta, dict) and composer_meta:
+                meta["composer_matrix_id"] = str(composer_meta.get("composer_matrix_id") or "")
+                meta["composer_block_ids"] = list(composer_meta.get("composer_block_ids") or [])
+                meta["composer_schema_id"] = str(composer_meta.get("composer_schema_id") or "")
+                meta["composer_tools_id"] = str(composer_meta.get("composer_tools_id") or "")
             # Persist only after reaching a "final" response to avoid saving a response id with pending tool calls.
             try:
                 if (not WP6_RESPONSES_STATELESS) and persist_handles and isinstance(handles, dict):
@@ -3252,7 +4499,7 @@ def handle_direct_actions(req, body: Dict[str, Any], action: str, user_id: str):
     # Enforce user_id presence
     user_message = body.get("message", "")
     user_id_local = user_id
-    thread_id = body.get("thread_id")
+    thread_id = body.get("thread_id") or body.get("session_id")
     params = body.get("params", {}) or {}
     if not user_id_local:
         return _make_response({"error": "user_id is required for save/get actions"}, status_code=400)
@@ -3493,75 +4740,18 @@ def finalize_response(
     total_ms: float = 0,
     log_interaction: bool = True,
     assistant_response_override: str = "",
-    runtime_used: str = "assistants",
+    runtime_used: str = "responses",
     responses_meta: Dict[str, Any] = None,
+    run_id: str = "",
+    trace_id: str = "",
+    phase: str = "",
+    stage: str = "",
+    persist_run_artifact: bool = False,
 ):
-    """Collect assistant response, save interaction, and return final HttpResponse."""
-    messages = None
-    if not assistant_response_override and runtime_used == "assistants":
-        # Request a limited number of messages to reduce payload and latency.
-        # Use limit=10 conservatively.
-        try:
-            messages = _openai_call(openai_client.beta.threads.messages.list, thread_id=thread_id, limit=10)
-        except TypeError:
-            # Some SDK versions may not accept 'limit' as a kwarg; fall back to call without it.
-            messages = _openai_call(openai_client.beta.threads.messages.list, thread_id=thread_id)
-
-    def _get_attr(msg: Any, key: str):
-        if isinstance(msg, dict):
-            return msg.get(key)
-        return getattr(msg, key, None)
-
-    def _get_role(msg: Any) -> str:
-        return str(_get_attr(msg, "role") or "")
-
-    def _created_at_int(msg: Any):
-        created_at = _get_attr(msg, "created_at")
-        if created_at is None:
-            return None
-        try:
-            return int(created_at)
-        except Exception:
-            return None
-
-    def _extract_text_from_message(msg: Any):
-        contents = _get_attr(msg, "content") or []
-        for item in contents:
-            # SDK object shape: item.text.value
-            try:
-                if hasattr(item, "text") and getattr(item.text, "value", None):
-                    return item.text.value
-            except Exception:
-                pass
-            # REST/dict shape: {"type":"text","text":{"value":"..."}}
-            if isinstance(item, dict):
-                if item.get("type") == "text":
-                    text_obj = item.get("text")
-                    if isinstance(text_obj, dict):
-                        if text_obj.get("value"):
-                            return text_obj.get("value")
-                    elif isinstance(text_obj, str) and text_obj:
-                        return text_obj
-        return None
-
-    assistant_response = assistant_response_override or None
+    """Collect response metadata, save interaction, and return final HttpResponse."""
+    assistant_response = str(assistant_response_override or "").strip()
     if not assistant_response:
-        assistant_response = None
-        if runtime_used == "assistants" and messages is not None:
-            try:
-                data_iter = list(getattr(messages, "data", []) or [])
-                assistant_msgs = [m for m in data_iter if _get_role(m) == "assistant"]
-                if assistant_msgs:
-                    if any(_created_at_int(m) is not None for m in assistant_msgs):
-                        chosen = max(assistant_msgs, key=lambda m: (_created_at_int(m) or -1))
-                    else:
-                        chosen = assistant_msgs[-1]
-                    assistant_response = _extract_text_from_message(chosen)
-            except Exception:
-                assistant_response = None
-
-    if not assistant_response:
-        assistant_response = "No response from assistant."
+        assistant_response = "No response from model."
 
     try:
         user_snip = (user_message or "")[:120]
@@ -3580,7 +4770,7 @@ def finalize_response(
             try:
                 for k in (
                     "prompt_id",
-                    "prompt_vars",
+                    "prompt_vars_enabled",
                     "phase",
                     "stage",
                     "tools_included",
@@ -3590,6 +4780,10 @@ def finalize_response(
                     "intent_artifact_path",
                     "pa_intention",
                     "pa_intent_router",
+                    "composer_matrix_id",
+                    "composer_block_ids",
+                    "composer_schema_id",
+                    "composer_tools_id",
                 ):
                     if k in responses_meta:
                         interaction_metadata[k] = responses_meta.get(k)
@@ -3606,11 +4800,30 @@ def finalize_response(
 
     # `total_ms` can be supplied by caller; default to 0 if not provided.
     tools_ms = sum(call.get("duration_ms", 0) for call in all_tool_calls)
+    run_artifact_path = ""
+    if persist_run_artifact:
+        run_artifact_path = _pa_write_run_artifact(
+            user_id=str(user_id or ""),
+            thread_id=str(thread_id or ""),
+            run_id=str(run_id or ""),
+            trace_id=str(trace_id or ""),
+            runtime_used=str(runtime_used or ""),
+            phase=str(phase or ""),
+            stage=str(stage or ""),
+            user_message=str(user_message or ""),
+            assistant_response=str(assistant_response or ""),
+            all_tool_calls=list(all_tool_calls or []),
+            responses_meta=responses_meta if isinstance(responses_meta, dict) else {},
+            total_ms=float(total_ms or 0),
+        )
+        if run_artifact_path and isinstance(responses_meta, dict):
+            responses_meta["run_artifact_path"] = str(run_artifact_path)
 
     body = {
         "status": "success",
         "response": assistant_response,
         "thread_id": thread_id,
+        "session_id": thread_id,
         "user_id": user_id,
         "runtime_used": runtime_used,
         "vector_store_attached": vector_store_attached,
@@ -3620,6 +4833,8 @@ def finalize_response(
             "tools_ms": tools_ms,
         },
     }
+    if run_artifact_path:
+        body["run_artifact_path"] = str(run_artifact_path)
     if responses_meta:
         body["responses"] = responses_meta
     return _make_response(body, status_code=200)
@@ -3641,17 +4856,9 @@ def _make_response(body: Any, status_code: int = 200):
     return body_text, status_code, {"Content-Type": "application/json"}
 
 
-def _openai_rest_headers(include_beta: bool = True) -> Dict[str, str]:
-    """Build standard headers for OpenAI REST requests, including the
-    OpenAI-Beta header required for the Assistants API when requested.
-    """
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    try:
-        if include_beta:
-            headers["OpenAI-Beta"] = "assistants=v2"
-    except Exception:
-        pass
-    return headers
+def _openai_rest_headers() -> Dict[str, str]:
+    """Build standard headers for OpenAI REST requests."""
+    return {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
 
 def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: str) -> Tuple[str, Dict[str, Any]]:
@@ -3703,7 +4910,7 @@ def execute_tool_call(tool_name: str, tool_arguments: Dict[str, Any], user_id: s
                     "arguments": dispatch_args,
                     "status": "failed",
                     "duration_ms": duration_ms,
-                    "error": result.get("error", "Unknown error"),
+                    "error": result.get("error") or result.get("message") or "Unknown error",
                     "code": result.get("code", "INTERNAL_ERROR"),
                 }
                 return json.dumps(result), info
@@ -4045,7 +5252,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 
         user_message = body.get("message", "")
         user_id, _user_id_source = resolve_user_id(req, body)
-        thread_id = body.get("thread_id")
+        thread_id = body.get("thread_id") or body.get("session_id")
         time_only = bool(body.get("time_only", False))
         action = body.get("action")
         params = body.get("params", {})
@@ -4056,11 +5263,123 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         phase_ui = str(body.get("phase") or "").strip()
         stage_ui = str(body.get("stage") or "").strip()
 
+        def _mentions_gmail(msg: str) -> bool:
+            m = str(msg or "").lower()
+            return any(k in m for k in ("gmail", "mail", "maile", "wiadom", "inbox", "skrzynk"))
+
+        def _mentions_mail_flow(msg: str) -> bool:
+            m = str(msg or "").lower()
+            return any(
+                k in m
+                for k in ("gmail", "mail", "maile", "wiadom", "inbox", "skrzynk", "odpisz", "reply", "wyslij", "send")
+            )
+
+        def _mentions_tasks(msg: str) -> bool:
+            m = str(msg or "").lower()
+            return any(
+                k in m
+                for k in ("task", "tasks", "zadanie", "zadania", "todo", "to-do", "do zrobienia", "co mam jeszcze")
+            )
+
+        if not action and isinstance(user_message, str) and user_message.strip():
+            # Deterministic OAuth gate: if Gmail is not connected, do not involve the LLM.
+            # This prevents "oauth_status loops" and makes the failure mode explicit and testable.
+            if _mentions_gmail(user_message):
+                try:
+                    from shared.gmail_oauth import GmailTokenStore
+
+                    tokens = GmailTokenStore.load_tokens(str(user_id))
+                except Exception as exc:
+                    return _make_response(
+                        {
+                            "status": "error",
+                            "code": "GMAIL_OAUTH_NOT_CONFIGURED",
+                            "error": f"Gmail OAuth token store unavailable: {type(exc).__name__}: {exc}",
+                            "required_action": "configure_gmail_oauth",
+                            "authorized": False,
+                            "user_id": str(user_id),
+                        },
+                        status_code=503,
+                    )
+                if not tokens:
+                    return _make_response(
+                        {
+                            "status": "error",
+                            "code": "NOT_AUTHORIZED",
+                            "error": "Gmail not connected for this user. Use UI Gmail OAuth Connect, then retry.",
+                            "required_action": "gmail_oauth_connect",
+                            "authorized": False,
+                            "user_id": str(user_id),
+                        },
+                        status_code=409,
+                    )
+
         # Direct actions bypass agent/tool loop
         if action in ["save_interaction", "get_interaction_history"]:
             resp_direct = handle_direct_actions(req, body, action, user_id)
             if resp_direct is not None:
                 return resp_direct
+
+        def _is_local_request() -> bool:
+            try:
+                host = str(req.headers.get("host") or req.headers.get("Host") or "")
+            except Exception:
+                host = ""
+            host = host.lower().strip()
+            return host.startswith("localhost") or host.startswith("127.0.0.1")
+
+        request_env = str(body.get("environment") or body.get("env") or "").strip().lower()
+        runtime_env = str(
+            os.environ.get("OMNIFLOW_ENV")
+            or os.environ.get("ENVIRONMENT")
+            or os.environ.get("APP_ENV")
+            or ""
+        ).strip().lower()
+        is_dev_context = bool(_is_local_request() or request_env in ("dev", "local") or runtime_env in ("dev", "local"))
+        persist_run_artifact = bool(PA_RUN_ARTIFACT_ENABLED and (is_dev_context or (not PA_RUN_ARTIFACT_DEV_ONLY)))
+
+        if action == "pa_intention":
+            # Local-only debug endpoint for batch evaluation of the intention prompt.
+            if not (PA_INTENTION_DEBUG_ENDPOINT or OMNIFLOW_DEBUG or _is_local_request()):
+                return _make_response({"error": "pa_intention is disabled"}, status_code=403)
+            if not str(user_message or "").strip():
+                return _make_response({"error": "Missing message"}, status_code=400)
+            if not thread_id:
+                thread_id = f"handle_{uuid.uuid4().hex[:12]}"
+            run_id = uuid.uuid4().hex[:12]
+            if not OPENAI_API_KEY:
+                return _make_response({"error": "Missing env vars: OPENAI_API_KEY", "status": "not_configured"}, status_code=503)
+            openai_client = OpenAI(api_key=OPENAI_API_KEY)
+            try:
+                intent_payload, intent_artifact_path = _pa_run_intention_step(
+                    openai_client=openai_client,
+                    user_id=str(user_id),
+                    thread_id=str(thread_id),
+                    run_id=str(run_id or ""),
+                    phase="P4",
+                    stage="S6",
+                    user_message=str(user_message or ""),
+                    single_step_focus=bool(_mentions_mail_flow(user_message) or _mentions_tasks(user_message)),
+                    raise_on_error=True,
+                )
+            except Exception as exc:
+                return _make_response(
+                    {"error": f"pa_intention_failed: {type(exc).__name__}: {exc}"},
+                    status_code=500,
+                )
+            return _make_response(
+                {
+                    "status": "ok",
+                    "action": "pa_intention",
+                    "user_id": str(user_id),
+                    "thread_id": str(thread_id),
+                    "session_id": str(thread_id),
+                    "run_id": str(run_id),
+                    "intent": intent_payload,
+                    "artifact_path": str(intent_artifact_path or ""),
+                },
+                status_code=200,
+            )
 
         # Deterministic maintenance: rebuild interactions index after merges/imports.
         if action == "pa_rebuild_interactions_index":
@@ -4128,7 +5447,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             if not user_id:
                 return _make_response({"error": "user_id is required", "action": action}, status_code=400)
             if not thread_id:
-                return _make_response({"error": "thread_id is required", "action": action}, status_code=400)
+                return _make_response({"error": "session_id (thread_id) is required", "action": action}, status_code=400)
             handles = _load_handles(str(user_id))
             rp = _get_run_progress(handles if isinstance(handles, dict) else {}, str(thread_id))
             return _make_response(
@@ -4137,6 +5456,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     "action": action,
                     "user_id": str(user_id),
                     "thread_id": str(thread_id),
+                    "session_id": str(thread_id),
                     "has_progress": bool(isinstance(rp, dict) and rp),
                     "run_progress": rp or {},
                 },
@@ -4346,21 +5666,14 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             )
             return _make_response(body_mock, status_code=200)
 
-        # Runtime selection (dual runtime: assistants|responses|auto)
+        # Runtime selection (responses-only; assistants removed)
         try:
             runtime_requested = resolve_runtime(body)
         except ValueError as vex:
             return _make_response({"error": str(vex)}, status_code=400)
 
         if runtime_requested == "auto":
-            if not _missing_env_vars_for_runtime("responses"):
-                runtime_used = "responses"
-            elif not _missing_env_vars_for_runtime("assistants"):
-                runtime_used = "assistants"
-            else:
-                # Prefer listing everything required for both runtimes to aid setup.
-                missing = sorted(set(_missing_env_vars_for_runtime("responses") + _missing_env_vars_for_runtime("assistants")))
-                return _make_response({"error": f"Missing env vars: {', '.join(missing)}", "status": "not_configured"}, status_code=503)
+            runtime_used = "responses"
         else:
             runtime_used = runtime_requested
 
@@ -4402,6 +5715,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 phase_response = "P7"
                 stage_response = "S8"
                 requires_internet = False
+                response_tool_include: List[str] | None = None
+                intent_payload: Dict[str, Any] = {}
+                intent_artifact_path = ""
+                single_step_focus = bool(_mentions_mail_flow(user_message) or _mentions_tasks(user_message))
                 try:
                     intent_payload, intent_artifact_path = _pa_run_intention_step(
                         openai_client=openai_client,
@@ -4411,46 +5728,61 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         phase=phase_intent,
                         stage=stage_intent,
                         user_message=str(user_message or ""),
+                        single_step_focus=single_step_focus,
                     )
                     if isinstance(intent_payload, dict) and intent_payload:
                         requires_internet = bool(intent_payload.get("requires_internet"))
+                        response_tool_include = _pa_runtime_tools_include_from_intent(intent_payload)
+                        # Optional deterministic prefetch after intention. Backend-owned orchestration only.
+                        try:
+                            if not single_step_focus:
+                                prefetch_meta = _pa_execute_prefetch_plan(
+                                    user_id=str(user_id),
+                                    thread_id=str(thread_id),
+                                    run_id=str(run_id or ""),
+                                    intent_payload=intent_payload,
+                                )
+                                if isinstance(prefetch_meta, dict) and prefetch_meta:
+                                    wp6_meta["pa_prefetch"] = prefetch_meta
+                        except Exception:
+                            pass
                         wp6_meta["pa_intention"] = {
                             "model": PA_INTENTION_MODEL,
                             "reasoning_effort": PA_INTENTION_REASONING_EFFORT,
                             "artifact_path": str(intent_artifact_path or ""),
                             "requires_internet": bool(requires_internet),
                             "intent": str(intent_payload.get("intent") or "") if isinstance(intent_payload, dict) else "",
+                            "runtime_tool_include": list(response_tool_include or []),
                         }
                 except Exception:
                     pass
 
                 recent_turns = _wp6_update_recent_user_turns(user_id, str(thread_id), user_message)
-                recent_block = _wp6_format_recent_turns(recent_turns)
                 wp6_meta["recent_user_turns_count"] = int(len(recent_turns or []))
                 wp6_meta["recent_user_turns_chars"] = int(sum(len(str(t or "")) for t in (recent_turns or [])))
 
                 requested_stage = str(body.get("stage") or "").strip().upper()
                 requested_phase = str(body.get("phase") or "").strip().upper()
+                # PA intention is the single source-of-truth for PA routing/policies.
+                # UI-provided phase/stage are treated as debug-only; we do not call legacy intent_router for PA flows.
                 intent_router = None
-                if not requested_stage or not requested_phase:
-                    intent_router = _pa_intent_router(user_message)
-                    if not requested_stage:
-                        requested_stage = str(intent_router.get("recommended_stage") or "").strip().upper()
-                    if not requested_phase:
-                        requested_phase = str(intent_router.get("recommended_phase") or "").strip().upper()
-                if not requested_stage:
-                    requested_stage = "DECISION_SUPPORT"
-                if not requested_phase:
-                    requested_phase = "DISCOVERY"
-                wp6_meta["pa_stage"] = requested_stage
-                wp6_meta["pa_phase"] = requested_phase
-                if intent_router:
-                    wp6_meta["pa_intent_router"] = intent_router
+                try:
+                    if isinstance(intent_payload, dict) and intent_payload:
+                        wp6_meta["pa_function_id"] = str(intent_payload.get("pa_function_id") or "").strip()
+                        wp6_meta["pa_function_name"] = str(intent_payload.get("pa_function_name") or "").strip()
+                        wp6_meta["pa_intention_schema_version"] = str(intent_payload.get("schema_version") or "").strip()
+                except Exception:
+                    pass
+                wp6_meta["pa_phase"] = str(phase_response or "")
+                wp6_meta["pa_stage"] = str(stage_response or "")
+                if phase_ui or stage_ui:
+                    wp6_meta["pa_phase_ui"] = phase_ui
+                    wp6_meta["pa_stage_ui"] = stage_ui
                 logging.info(
-                    "PA routing stage=%s phase=%s need_clarification=%s",
-                    requested_stage,
-                    requested_phase,
-                    bool(intent_router and intent_router.get("need_clarification")),
+                    "PA routing intention_sot phase=%s stage=%s pa_function_id=%s",
+                    str(phase_response or ""),
+                    str(stage_response or ""),
+                    str(wp6_meta.get("pa_function_id") or ""),
                 )
 
                 audit_id = uuid.uuid4().hex[:12] if WP6_FAST_AUDIT_ENABLED else ""
@@ -4500,36 +5832,69 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 wp6_meta["deep_cooldown_ok"] = bool(cooldown_ok)
                 wp6_meta["deep_cooldown_reason"] = cooldown_reason
 
-                requested_mode = str(route_meta.get("context_mode_requested") or "AUTO").upper()
-                auto_mode = requested_mode == "AUTO"
-                deep_allowed = bool(deep_allowed_inputs) and (bool(cooldown_ok) if auto_mode else True)
-                wp6_meta["deep_allowed"] = bool(deep_allowed)
+                requested_mode_raw = str(route_meta.get("context_mode_requested") or "AUTO").upper()
+                if single_step_focus:
+                    wp6_meta["single_step_mode"] = True
+                # WU-11: fast/deep no longer controls routing. Keep only as quality hint for observability.
+                requested_mode = "FAST"
+                auto_mode = False
+                deep_allowed = False
+                wp6_meta["deep_allowed"] = False
+                wp6_meta["quality_hint"] = requested_mode_raw if requested_mode_raw in ("FAST", "DEEP", "AUTO") else "AUTO"
+                route_reason = "deprecated_fast_deep_control_flag"
 
-                # FAST input (evidence-lite) is always built; used both for FAST run and as seed for DEEP builder.
+                # FAST input (single-step): semantic-only context capsule.
                 fast_input_message = user_message
-                if fast_ctx:
-                    fast_input_message = f"[FAST_CONTEXT]\n{fast_ctx}\n\n[USER_MESSAGE]\n{user_message}"
-                if recent_block:
-                    fast_input_message = f"{recent_block}\n\n{fast_input_message}"
+                capsule_json, capsule_meta = _wp6_build_context_capsule(
+                    user_id=str(user_id),
+                    user_message=str(user_message or ""),
+                    recent_turns=list(recent_turns or []),
+                    core_sources=list(core_sources or []),
+                    fast_ctx=str(fast_ctx or ""),
+                    intent_payload=intent_payload if isinstance(intent_payload, dict) else {},
+                )
+                composer_info: Dict[str, Any] = {}
+                if capsule_json:
+                    composer_used = False
+                    pa_id_for_composer = (
+                        str((intent_payload or {}).get("pa_function_id") or "")
+                        if isinstance(intent_payload, dict)
+                        else ""
+                    )
+                    try:
+                        composed = compose_prompt_for_pa(
+                            intent_payload=intent_payload if isinstance(intent_payload, dict) else {},
+                            user_message=str(user_message or ""),
+                            capsule_json=str(capsule_json or ""),
+                        ) if callable(compose_prompt_for_pa) else {}
+                        if isinstance(composed, dict) and bool(composed.get("enabled")):
+                            fast_input_message = str(composed.get("input_message") or "")
+                            composer_info = {
+                                "composer_matrix_id": str(composed.get("matrix_id") or ""),
+                                "composer_block_ids": list(composed.get("block_ids") or []),
+                                "composer_schema_id": str(composed.get("schema_id") or ""),
+                                "composer_tools_id": str(composed.get("tools_id") or ""),
+                            }
+                            wp6_meta["prompt_composer"] = dict(composer_info)
+                            composer_tools = list(composed.get("tool_include_names") or [])
+                            if composer_tools:
+                                response_tool_include = composer_tools
+                            composer_used = True
+                    except Exception:
+                        composer_used = False
+                    if not composer_used and pa_id_for_composer in ("PA-01", "PA-14"):
+                        raise RuntimeError("prompt_composer_required_for_tm_gmail")
+                    if not composer_used:
+                        fast_input_message = f"[CONTEXT_CAPSULE]\n{capsule_json}\n\n[USER_MESSAGE]\n{user_message}"
+                wp6_meta.update(capsule_meta)
 
                 # Routing: AUTO defaults to FAST; DEEP can be entered:
                 # - deterministically (e.g., FAST context empty) before first call, or
                 # - agent-driven after FAST via need_deep/__ROUTE_DEEP__ signal.
                 mode_initial = "FAST"
                 reason_initial = route_reason
-                if requested_mode == "DEEP":
-                    mode_initial = "DEEP"
-                    reason_initial = "explicit"
-                elif requested_mode == "FAST":
-                    mode_initial = "FAST"
-                    reason_initial = "explicit"
-                else:
-                    if deep_allowed and not str(fast_ctx or "").strip():
-                        mode_initial = "DEEP"
-                        reason_initial = "fast_context_empty"
-                    else:
-                        mode_initial = "FAST"
-                        reason_initial = "auto_fast"
+                mode_initial = "FAST"
+                reason_initial = route_reason
 
                 wp6_meta["routing"] = {
                     "mode_requested": requested_mode,
@@ -4624,21 +5989,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 # Run phase 1 (FAST by default, or DEEP deterministically).
                 model_input_message = fast_input_message
                 if mode_initial == "DEEP":
-                    if deep_allowed_inputs:
-                        deep_input_message, pack_meta = _build_deep_input_message()
-                        wp6_meta.update(pack_meta)
-                        if deep_input_message:
-                            model_input_message = deep_input_message
-                            mode_used = "DEEP"
-                            mode_reason = reason_initial
-                        else:
-                            mode_used = "FAST"
-                            mode_reason = f"deep_fallback:{pack_meta.get('error') or 'no_pack'}"
-                            model_input_message = fast_input_message
-                    else:
-                        mode_used = "FAST"
-                        mode_reason = "deep_skipped_insufficient_inputs"
-                        model_input_message = fast_input_message
+                    # Compatibility guard: mode_initial is forced to FAST in WU-11.
+                    model_input_message = fast_input_message
 
                 _emit_run_progress(
                     user_id=str(user_id),
@@ -4646,8 +5998,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     run_id=run_id,
                     trace_id=trace_id,
                     status="in_progress",
-                    stage=("looking_more_data" if mode_initial == "DEEP" else "grasping_context"),
-                    message=("Routing to DEEP" if mode_initial == "DEEP" else "Routing to FAST"),
+                    stage="grasping_context",
+                    message="Routing to FAST",
                     async_save=True,
                 )
                 assistant_response, all_tool_calls, responses_meta, thread_id = run_responses(
@@ -4663,6 +6015,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     stage=stage_response,
                     intent_router=intent_router,
                     include_web_search=bool(requires_internet),
+                    tool_include_names=response_tool_include,
+                    composer_meta=composer_info,
                 )
 
                 # Phase 2 (AUTO only): parse FAST response signal and optionally escalate to DEEP once.
@@ -4708,6 +6062,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                                     stage=stage_response,
                                     intent_router=intent_router,
                                     include_web_search=bool(requires_internet),
+                                    tool_include_names=response_tool_include,
+                                    composer_meta=composer_info,
                                 )
                                 deep_signal, deep_cleaned = _wp6_parse_need_deep_signal(deep_resp or "")
                                 wp6_meta["need_deep_signal_deep"] = deep_signal
@@ -4822,6 +6178,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             try:
                 if isinstance(responses_meta, dict):
                     responses_meta["wp6"] = wp6_meta
+                    if isinstance(intent_payload, dict) and intent_payload:
+                        responses_meta["pa_intention_payload"] = intent_payload
             except Exception:
                 pass
             _emit_run_progress(
@@ -4846,6 +6204,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 assistant_response_override=assistant_response,
                 runtime_used="responses",
                 responses_meta=responses_meta,
+                run_id=str(run_id or ""),
+                trace_id=str(trace_id or ""),
+                phase=str(phase_response or ""),
+                stage=str(stage_response or ""),
+                persist_run_artifact=bool(persist_run_artifact),
             )
 
         # If the caller didn't supply a thread identifier, attempt to restore
@@ -4943,6 +6306,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             total_ms=total_ms,
             log_interaction=log_interaction,
             runtime_used=runtime_used,
+            run_id=str(getattr(run, "id", "") or ""),
+            trace_id=str(trace_id or ""),
+            phase="",
+            stage="",
+            persist_run_artifact=bool(persist_run_artifact),
         )
     # Ensure any uncaught exception returns a Functions-compatible HttpResponse
     except Exception as e:
