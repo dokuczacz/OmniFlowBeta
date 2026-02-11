@@ -1239,11 +1239,15 @@ def _pa_execute_prefetch_plan(
     def _write_mail_snapshot_from_recent(result_payload: Dict[str, Any]) -> None:
         if not isinstance(result_payload, dict):
             return
-        if str(result_payload.get("status") or "").lower() != "ok":
+        payload = dict(result_payload)
+        # Accept both direct tool payload and wrapped dispatch envelope.
+        if str(payload.get("status") or "").lower() == "success" and isinstance(payload.get("result"), dict):
+            payload = dict(payload.get("result") or {})
+        if str(payload.get("status") or "").lower() != "ok":
             return
-        rows = result_payload.get("messages")
+        rows = payload.get("messages")
         if not isinstance(rows, list):
-            return
+            rows = []
         normalized: List[Dict[str, Any]] = []
         for row in rows[:50]:
             if not isinstance(row, dict):
@@ -1261,8 +1265,6 @@ def _pa_execute_prefetch_plan(
                     "labels": list(row.get("labelIds") or [])[:20] if isinstance(row.get("labelIds"), list) else [],
                 }
             )
-        if not normalized:
-            return
         snapshot_payload = {
             "schema_version": "omniflow.pa.mail_snapshot.v1",
             "updated_utc": datetime.datetime.utcnow().isoformat() + "Z",
@@ -5735,15 +5737,14 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         response_tool_include = _pa_runtime_tools_include_from_intent(intent_payload)
                         # Optional deterministic prefetch after intention. Backend-owned orchestration only.
                         try:
-                            if not single_step_focus:
-                                prefetch_meta = _pa_execute_prefetch_plan(
-                                    user_id=str(user_id),
-                                    thread_id=str(thread_id),
-                                    run_id=str(run_id or ""),
-                                    intent_payload=intent_payload,
-                                )
-                                if isinstance(prefetch_meta, dict) and prefetch_meta:
-                                    wp6_meta["pa_prefetch"] = prefetch_meta
+                            prefetch_meta = _pa_execute_prefetch_plan(
+                                user_id=str(user_id),
+                                thread_id=str(thread_id),
+                                run_id=str(run_id or ""),
+                                intent_payload=intent_payload,
+                            )
+                            if isinstance(prefetch_meta, dict) and prefetch_meta:
+                                wp6_meta["pa_prefetch"] = prefetch_meta
                         except Exception:
                             pass
                         wp6_meta["pa_intention"] = {
