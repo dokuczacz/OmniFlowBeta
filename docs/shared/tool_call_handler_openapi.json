@@ -164,47 +164,7 @@
       "post": {
         "operationId": "tool_call_handler_single_endpoint",
         "summary": "Single endpoint for Personal Assistance capabilities",
-        "description": "Unified endpoint for both Custom GPT and native UI. Prefer action=capability_exec for Custom GPT.",
-        "parameters": [
-          {
-            "name": "x-user-id",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string"
-            },
-            "description": "Optional; body.user_id is authoritative if both are present."
-          },
-          {
-            "name": "x-client-type",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "enum": [
-                "custom-gpt",
-                "ui",
-                "operator"
-              ]
-            }
-          },
-          {
-            "name": "x-session-id",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "idempotency-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
+        "description": "Unified endpoint for both Custom GPT and native UI. Prefer action=capability_exec for Custom GPT. First call for a new user must be action=pa_init with params.confirm_create=true.",
         "requestBody": {
           "required": true,
           "content": {
@@ -213,6 +173,16 @@
                 "$ref": "#/components/schemas/ToolCallHandlerRequest"
               },
               "examples": {
+                "bootstrap_pa_init": {
+                  "summary": "Initialize PA starter pack (required once per new user)",
+                  "value": {
+                    "action": "pa_init",
+                    "user_id": "user_default",
+                    "params": {
+                      "confirm_create": true
+                    }
+                  }
+                },
                 "task_create": {
                   "summary": "Create task via capability",
                   "value": {
@@ -278,7 +248,7 @@
             "description": "Unauthorized"
           },
           "409": {
-            "description": "Confirmation required or conflict"
+            "description": "Conflict or bootstrap required (for new users call pa_init with confirm_create=true)"
           },
           "500": {
             "description": "Internal error"
