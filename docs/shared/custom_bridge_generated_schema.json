@@ -30,6 +30,8 @@
           "gmail_send",
           "gmail_list",
           "gmail_get",
+          "gmail_trash",
+          "gmail_delete",
           "gmail_attachment"
         ]
       },
@@ -138,6 +140,26 @@
                   "summary": "gmail_get example",
                   "value": {
                     "action": "gmail_get",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": {
+                      "message_id": "MESSAGE_ID"
+                    }
+                  }
+                },
+                "gmail_trash": {
+                  "summary": "gmail_trash example",
+                  "value": {
+                    "action": "gmail_trash",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": {
+                      "message_id": "MESSAGE_ID"
+                    }
+                  }
+                },
+                "gmail_delete": {
+                  "summary": "gmail_delete example",
+                  "value": {
+                    "action": "gmail_delete",
                     "user_id": "dokuczacz@gmail.com",
                     "payload": {
                       "message_id": "MESSAGE_ID"
