@@ -61,6 +61,7 @@ Keep these values synchronized across `.env.local`, Azure App settings, and any 
 
 - Use the raw URL `https://raw.githubusercontent.com/dokuczacz/OmniFlowBeta/main/docs/shared/custom_bridge_openapi.json` when importing the OpenAPI tool in GPT Builder.
 - For broad end-to-end testing (Blob CRUD, file ops, history, plus bridge), import `https://raw.githubusercontent.com/dokuczacz/OmniFlowBeta/main/backend/custom_gpt_tools/actions_openapi.json` instead.
+- For single-endpoint quasi-MCP mode (recommended for both Custom GPT and native UI), import `https://raw.githubusercontent.com/dokuczacz/OmniFlowBeta/main/docs/shared/tool_call_handler_openapi.json` and call only `/api/tool_call_handler`.
 - In the authentication dialog pick **API key**, store the function key there, choose **Header** → `x-functions-key`, and avoid putting secrets directly into the JSON.
 - Custom GPT should always call `ensure_authorized` first; if the reply has `authorized:false`, open the `authorize_url`, complete consent, then repeat `ensure_authorized` before Gmail actions.
 - If you see `404` with `path: /custom_bridge`, re-import the schema: the correct tool endpoint is `/api/custom_bridge` under the Function App host.
