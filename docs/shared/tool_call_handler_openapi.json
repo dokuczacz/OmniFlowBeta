@@ -1,0 +1,290 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "OmniFlow Personal Assistance API (Single Endpoint)",
+    "version": "1.0.0",
+    "description": "Single-endpoint contract for both native UI and Custom GPT. Public contract is capability-level (personal assistance). Internal low-level tools are hidden behind tool_call_handler orchestration."
+  },
+  "servers": [
+    {
+      "url": "https://agentbackendservice-dfcpcudzeah4b6ae.northeurope-01.azurewebsites.net"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "functionKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-functions-key",
+        "description": "Optional when endpoint runs anonymous; required when function auth is enabled. Configure in GPT Action Authentication, do not hardcode secrets in schema."
+      }
+    },
+    "schemas": {
+      "CapabilityName": {
+        "type": "string",
+        "enum": [
+          "task.create",
+          "task.list",
+          "task.update",
+          "task.complete",
+          "task.delete",
+          "task.delayed",
+          "mail.status",
+          "mail.authorize",
+          "mail.inbox.list",
+          "mail.read",
+          "mail.summarize",
+          "mail.reply",
+          "mail.send",
+          "mail.trash",
+          "mail.delete",
+          "planning.build_day_plan",
+          "memory.interaction.save",
+          "memory.interaction.list",
+          "system.now"
+        ]
+      },
+      "CapabilityExecParams": {
+        "type": "object",
+        "properties": {
+          "capability": {
+            "$ref": "#/components/schemas/CapabilityName"
+          },
+          "confirm": {
+            "type": "boolean",
+            "default": false,
+            "description": "Required for destructive actions like task.delete/mail.trash/mail.delete."
+          },
+          "arguments": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Capability-specific payload."
+          }
+        },
+        "required": [
+          "capability"
+        ],
+        "additionalProperties": false
+      },
+      "ToolCallHandlerRequest": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "capability_exec",
+              "chat",
+              "pa_init",
+              "tool_exec"
+            ],
+            "description": "Use capability_exec for Custom GPT and chat for native UI."
+          },
+          "user_id": {
+            "type": "string",
+            "description": "User namespace identifier."
+          },
+          "thread_id": {
+            "type": "string",
+            "description": "Optional conversation/session identifier."
+          },
+          "params": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CapabilityExecParams"
+              },
+              {
+                "type": "object",
+                "additionalProperties": true
+              }
+            ]
+          },
+          "message": {
+            "type": "string",
+            "description": "Optional chat message for action=chat."
+          }
+        },
+        "required": [
+          "action",
+          "user_id"
+        ],
+        "additionalProperties": true
+      },
+      "ToolCallHandlerResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "success",
+              "ok",
+              "error"
+            ]
+          },
+          "action": {
+            "type": "string"
+          },
+          "capability": {
+            "type": "string"
+          },
+          "result": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": true
+          },
+          "meta": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "security": [
+    {
+      "functionKey": []
+    }
+  ],
+  "paths": {
+    "/api/tool_call_handler": {
+      "post": {
+        "operationId": "tool_call_handler_single_endpoint",
+        "summary": "Single endpoint for Personal Assistance capabilities",
+        "description": "Unified endpoint for both Custom GPT and native UI. Prefer action=capability_exec for Custom GPT.",
+        "parameters": [
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optional; body.user_id is authoritative if both are present."
+          },
+          {
+            "name": "x-client-type",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "custom-gpt",
+                "ui",
+                "operator"
+              ]
+            }
+          },
+          {
+            "name": "x-session-id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "idempotency-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ToolCallHandlerRequest"
+              },
+              "examples": {
+                "task_create": {
+                  "summary": "Create task via capability",
+                  "value": {
+                    "action": "capability_exec",
+                    "user_id": "mario_test",
+                    "params": {
+                      "capability": "task.create",
+                      "confirm": false,
+                      "arguments": {
+                        "title": "Prepare quarterly report",
+                        "due_date": "2026-03-14",
+                        "priority": "high"
+                      }
+                    }
+                  }
+                },
+                "mail_send": {
+                  "summary": "Send email via capability",
+                  "value": {
+                    "action": "capability_exec",
+                    "user_id": "mario_test",
+                    "params": {
+                      "capability": "mail.send",
+                      "confirm": true,
+                      "arguments": {
+                        "to": [
+                          "someone@example.com"
+                        ],
+                        "subject": "Status update",
+                        "body": "Quick project update."
+                      }
+                    }
+                  }
+                },
+                "ui_chat": {
+                  "summary": "Native UI chat",
+                  "value": {
+                    "action": "chat",
+                    "user_id": "mario_test",
+                    "thread_id": "thread-123",
+                    "message": "Show my delayed tasks"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Handled request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolCallHandlerResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "409": {
+            "description": "Confirmation required or conflict"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        }
+      }
+    }
+  }
+}
