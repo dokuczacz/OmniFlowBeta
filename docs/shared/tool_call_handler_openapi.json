@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "OmniFlow Personal Assistance API (Single Endpoint)",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "Single-endpoint contract for both native UI and Custom GPT. Public contract is capability-level (personal assistance). Internal low-level tools are hidden behind tool_call_handler orchestration."
   },
   "servers": [
@@ -60,7 +60,7 @@
           "arguments": {
             "type": "object",
             "additionalProperties": true,
-            "description": "Capability-specific payload."
+            "description": "Capability-specific payload. For memory.interaction.save provide either (user_message + assistant_response) or (role + content). Optional per-call user override can be passed as arguments.user_id."
           }
         },
         "required": [
@@ -264,6 +264,42 @@
                     }
                   }
                 },
+                "interaction_save_pair": {
+                  "summary": "Save interaction with explicit pair fields",
+                  "value": {
+                    "action": "capability_exec",
+                    "user_id": "mario_test",
+                    "params": {
+                      "capability": "memory.interaction.save",
+                      "arguments": {
+                        "thread_id": "thread-123",
+                        "user_message": "Zrob plan dnia",
+                        "assistant_response": "Pewnie, przygotowalem plan dnia.",
+                        "metadata": {
+                          "source": "custom_gpt"
+                        }
+                      }
+                    }
+                  }
+                },
+                "interaction_save_role_content": {
+                  "summary": "Save interaction using role/content compatibility format",
+                  "value": {
+                    "action": "capability_exec",
+                    "user_id": "mario_test",
+                    "params": {
+                      "capability": "memory.interaction.save",
+                      "arguments": {
+                        "thread_id": "thread-123",
+                        "role": "user",
+                        "content": "Przypomnij mi o spotkaniu jutro",
+                        "metadata": {
+                          "source": "custom_gpt"
+                        }
+                      }
+                    }
+                  }
+                },
                 "ui_chat": {
                   "summary": "Native UI chat",
                   "value": {
@@ -374,13 +410,73 @@
                       "error": null,
                       "meta": {}
                     }
+                  },
+                  "interaction_save_success": {
+                    "summary": "Save interaction success",
+                    "value": {
+                      "schema_version": "omniflow.capability_exec.v1",
+                      "status": "success",
+                      "action": "capability_exec",
+                      "capability": "memory.interaction.save",
+                      "result": {
+                        "status": "success",
+                        "saved": true,
+                        "interaction_id": "INT_20260310_200001_123456"
+                      },
+                      "error": null,
+                      "meta": {}
+                    }
                   }
                 }
               }
             }
           },
           "400": {
-            "description": "Validation error"
+            "description": "Validation error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolCallHandlerResponse"
+                },
+                "examples": {
+                  "interaction_save_invalid_payload": {
+                    "summary": "memory.interaction.save payload validation failed",
+                    "value": {
+                      "schema_version": "omniflow.capability_exec.v1",
+                      "status": "error",
+                      "action": "capability_exec",
+                      "capability": "memory.interaction.save",
+                      "result": null,
+                      "error": {
+                        "code": "INVALID_REQUEST",
+                        "message": "Provide arguments.user_message and arguments.assistant_response, or arguments.role + arguments.content."
+                      },
+                      "meta": {}
+                    }
+                  },
+                  "interaction_save_downstream_error": {
+                    "summary": "memory.interaction.save downstream service returned error",
+                    "value": {
+                      "schema_version": "omniflow.capability_exec.v1",
+                      "status": "error",
+                      "action": "capability_exec",
+                      "capability": "memory.interaction.save",
+                      "result": {
+                        "raw": {
+                          "status": "error",
+                          "error": "Missing required fields: 'user_message' or 'assistant_response'"
+                        }
+                      },
+                      "error": {
+                        "code": "SAVE_INTERACTION_FAILED",
+                        "message": "Missing required fields: 'user_message' or 'assistant_response'"
+                      },
+                      "meta": {}
+                    }
+                  }
+                }
+              }
+            }
           },
           "401": {
             "description": "Unauthorized"
