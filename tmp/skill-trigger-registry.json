@@ -1,0 +1,83 @@
+{
+  "version": "1.0",
+  "updated_at_utc": "2026-03-10T00:00:00Z",
+  "skills": {
+    "omniflow-execplan": {
+      "triggers": [
+        "plan",
+        "execplan",
+        "planning",
+        "planowanie",
+        "artifact"
+      ],
+      "bypass_keywords": [
+        "quick",
+        "szybko",
+        "no plan"
+      ]
+    },
+    "omniflow-llm-orchestration": {
+      "triggers": [
+        "orchestration",
+        "phase stage",
+        "payload matrix",
+        "intention routing",
+        "tool loop"
+      ]
+    },
+    "omniflow-data-operator": {
+      "triggers": [
+        "pipeline",
+        "batch",
+        "progress",
+        "eta",
+        "sample output"
+      ]
+    },
+    "omniflow-azure-blob-ops": {
+      "triggers": [
+        "azure blob",
+        "azurite",
+        "blob exists",
+        "prefix count",
+        "blob sample"
+      ]
+    },
+    "omniflow-github-operator": {
+      "triggers": [
+        "git commit",
+        "git push",
+        "pr",
+        "clean status",
+        "ready to finish"
+      ]
+    },
+    "omniflow-step-endcap": {
+      "triggers": [
+        "next steps",
+        "summary",
+        "status update",
+        "done now",
+        "wu target"
+      ]
+    },
+    "gh-fix-ci": {
+      "triggers": [
+        "fix ci",
+        "failing checks",
+        "github actions failed",
+        "pr checks",
+        "debug ci"
+      ]
+    },
+    "gh-address-comments": {
+      "triggers": [
+        "address comments",
+        "review comments",
+        "pr feedback",
+        "resolve threads",
+        "gh comments"
+      ]
+    }
+  }
+}

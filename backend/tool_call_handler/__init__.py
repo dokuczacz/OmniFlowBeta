@@ -5041,23 +5041,26 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
         )
         return body, 400
 
+    # Some clients pass user_id inside params.arguments; prefer it when present.
+    effective_user_id = str(arguments.get("user_id") or user_id or "").strip() or "default"
+
     try:
         if capability == "system.now":
             now_utc = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
             return _capability_response("success", capability, result={"current_time_utc": now_utc}), 200
 
         if capability == "mail.status":
-            result = _bridge_action("oauth_status", str(user_id), {})
+            result = _bridge_action("oauth_status", str(effective_user_id), {})
             return _capability_response("success", capability, result=result), 200
 
         if capability == "mail.authorize":
-            result = _bridge_action("ensure_authorized", str(user_id), {"login_hint": arguments.get("login_hint")})
+            result = _bridge_action("ensure_authorized", str(effective_user_id), {"login_hint": arguments.get("login_hint")})
             return _capability_response("success", capability, result=result), 200
 
         if capability == "mail.inbox.list":
             max_results = int(arguments.get("max_results", 20) or 20)
             payload = {"max_results": max(1, min(50, max_results)), "q": arguments.get("q"), "label": arguments.get("label")}
-            result = _bridge_action("gmail_list", str(user_id), payload)
+            result = _bridge_action("gmail_list", str(effective_user_id), payload)
             messages = list(result.get("messages") or []) if isinstance(result, dict) else []
             metadata_limit = int(arguments.get("metadata_limit", 20) or 20)
             metadata_limit = max(1, min(20, metadata_limit))
@@ -5071,7 +5074,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                 message_obj: Dict[str, Any] = {}
                 if idx < metadata_limit:
                     try:
-                        got = _bridge_action("gmail_get", str(user_id), {"message_id": mid, "format": "metadata"})
+                        got = _bridge_action("gmail_get", str(effective_user_id), {"message_id": mid, "format": "metadata"})
                         message_obj = dict(got.get("message") or {}) if isinstance(got, dict) else {}
                     except Exception:
                         message_obj = {}
@@ -5085,17 +5088,17 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             if not message_id:
                 return _capability_response("error", capability, error={"code": "INVALID_REQUEST", "message": "arguments.message_id is required"}), 400
             payload = {"message_id": message_id, "format": str(arguments.get("format") or "full")}
-            result = _bridge_action("gmail_get", str(user_id), payload)
+            result = _bridge_action("gmail_get", str(effective_user_id), payload)
             return _capability_response("success", capability, result=result), 200
 
         if capability == "mail.summarize":
             max_results = int(arguments.get("max_results", 10) or 10)
-            list_result = _bridge_action("gmail_list", str(user_id), {"max_results": max(1, min(20, max_results))})
+            list_result = _bridge_action("gmail_list", str(effective_user_id), {"max_results": max(1, min(20, max_results))})
             ids = [str(x.get("id")) for x in (list_result.get("messages") or []) if isinstance(x, dict) and x.get("id")]
             summary_items: list[dict] = []
             for mid in ids[:5]:
                 try:
-                    msg = _bridge_action("gmail_get", str(user_id), {"message_id": mid, "format": "metadata"})
+                    msg = _bridge_action("gmail_get", str(effective_user_id), {"message_id": mid, "format": "metadata"})
                     summary_items.append({"message_id": mid, "message": msg.get("message")})
                 except Exception:
                     continue
@@ -5129,7 +5132,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                     capability,
                     error={"code": "INVALID_REQUEST", "message": "arguments.to, arguments.subject and arguments.body are required"},
                 ), 400
-            result = _bridge_action("gmail_send", str(user_id), payload)
+            result = _bridge_action("gmail_send", str(effective_user_id), payload)
             return _capability_response("success", capability, result=result), 200
 
         if capability in ("mail.trash", "mail.delete"):
@@ -5143,11 +5146,11 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             if not message_id:
                 return _capability_response("error", capability, error={"code": "INVALID_REQUEST", "message": "arguments.message_id is required"}), 400
             action = "gmail_trash" if capability == "mail.trash" else "gmail_delete"
-            result = _bridge_action(action, str(user_id), {"message_id": message_id})
+            result = _bridge_action(action, str(effective_user_id), {"message_id": message_id})
             return _capability_response("success", capability, result=result), 200
 
         if capability.startswith("task."):
-            raw = _inprocess_read_blob_file(str(user_id), "TM.json")
+            raw = _inprocess_read_blob_file(str(effective_user_id), "TM.json")
             tm_data = raw.get("data") if isinstance(raw, dict) else None
             if not isinstance(tm_data, list):
                 tm_data = []
@@ -5195,7 +5198,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                 if arguments.get("energy") is not None:
                     entry["energy"] = arguments.get("energy")
                 tm_data.append(entry)
-                _inprocess_upload_data_or_file(str(user_id), "TM.json", tm_data)
+                _inprocess_upload_data_or_file(str(effective_user_id), "TM.json", tm_data)
                 return _capability_response("success", capability, result={"created": entry}), 200
 
             task_id = str(arguments.get("id") or "").strip()
@@ -5215,13 +5218,13 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                     if field in arguments and arguments.get(field) is not None:
                         target[field] = arguments.get(field)
                 target["updated_at"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-                _inprocess_upload_data_or_file(str(user_id), "TM.json", tm_data)
+                _inprocess_upload_data_or_file(str(effective_user_id), "TM.json", tm_data)
                 return _capability_response("success", capability, result={"updated": target, "task_index": task_index}), 200
 
             if capability == "task.complete":
                 target["status"] = "done"
                 target["updated_at"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-                _inprocess_upload_data_or_file(str(user_id), "TM.json", tm_data)
+                _inprocess_upload_data_or_file(str(effective_user_id), "TM.json", tm_data)
                 return _capability_response("success", capability, result={"completed": True, "task_index": task_index}), 200
 
             if capability == "task.delete":
@@ -5235,11 +5238,11 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                     deleted = tm_data[ref["top_index"]]["tasks"].pop(ref["nested_index"])
                 else:
                     deleted = tm_data.pop(ref["top_index"])
-                _inprocess_upload_data_or_file(str(user_id), "TM.json", tm_data)
+                _inprocess_upload_data_or_file(str(effective_user_id), "TM.json", tm_data)
                 return _capability_response("success", capability, result={"deleted": deleted, "task_index": task_index, "id": deleted.get("id")}), 200
 
         if capability == "planning.build_day_plan":
-            raw = _inprocess_read_blob_file(str(user_id), "TM.json")
+            raw = _inprocess_read_blob_file(str(effective_user_id), "TM.json")
             tm_data = raw.get("data") if isinstance(raw, dict) else None
             if not isinstance(tm_data, list):
                 tm_data = []
@@ -5294,24 +5297,63 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             return _capability_response("success", capability, result=result), 200
 
         if capability == "memory.interaction.save":
+            user_message = str(arguments.get("user_message") or "").strip()
+            assistant_response = str(arguments.get("assistant_response") or "").strip()
+            role = str(arguments.get("role") or "").strip().lower()
+            content = str(arguments.get("content") or "").strip()
+
+            normalized_from_role_content = False
+            if content and role in ("user", "assistant") and (not user_message or not assistant_response):
+                normalized_from_role_content = True
+                if role == "user":
+                    user_message = user_message or content
+                    assistant_response = assistant_response or "[pending_assistant_response]"
+                else:
+                    user_message = user_message or "[pending_user_message]"
+                    assistant_response = assistant_response or content
+
+            if not user_message or not assistant_response:
+                return _capability_response(
+                    "error",
+                    capability,
+                    error={
+                        "code": "INVALID_REQUEST",
+                        "message": "Provide arguments.user_message and arguments.assistant_response, or arguments.role + arguments.content.",
+                    },
+                ), 400
+
             save_payload = {
-                "user_message": str(arguments.get("user_message") or ""),
-                "assistant_response": str(arguments.get("assistant_response") or ""),
+                "user_message": user_message,
+                "assistant_response": assistant_response,
                 "thread_id": str(arguments.get("thread_id") or "capability-thread"),
                 "tool_calls": list(arguments.get("tool_calls") or []),
                 "metadata": dict(arguments.get("metadata") or {}),
             }
-            parsed = _inprocess_save_interaction(str(user_id), save_payload)
-            return _capability_response("success", capability, result=parsed if isinstance(parsed, dict) else {"raw": parsed}), 200
+            parsed = _inprocess_save_interaction(str(effective_user_id), save_payload)
+            if isinstance(parsed, dict) and parsed.get("status") == "error":
+                return _capability_response(
+                    "error",
+                    capability,
+                    error={
+                        "code": "SAVE_INTERACTION_FAILED",
+                        "message": str(parsed.get("error") or parsed.get("details") or "Unknown save_interaction error"),
+                    },
+                    result={"raw": parsed},
+                ), 400
+
+            result_payload = parsed if isinstance(parsed, dict) else {"raw": parsed}
+            if normalized_from_role_content:
+                result_payload = {**dict(result_payload or {}), "normalized_from_role_content": True}
+            return _capability_response("success", capability, result=result_payload), 200
 
         if capability == "memory.preferences.get":
-            prefs = _load_preferences(str(user_id))
+            prefs = _load_preferences(str(effective_user_id))
             if not isinstance(prefs, dict) or not prefs:
                 prefs = _wp6_default_preferences()
             return _capability_response("success", capability, result={"preferences": prefs}), 200
 
         if capability == "memory.preferences.update":
-            base = _load_preferences(str(user_id))
+            base = _load_preferences(str(effective_user_id))
             if not isinstance(base, dict) or not base:
                 base = _wp6_default_preferences()
 
@@ -5346,7 +5388,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                     },
                 ), 400
 
-            save_result = _inprocess_upload_data_or_file(str(user_id), "semantics/preferences.json", merged)
+            save_result = _inprocess_upload_data_or_file(str(effective_user_id), "semantics/preferences.json", merged)
             if isinstance(save_result, dict) and save_result.get("status") == "error":
                 return _capability_response(
                     "error",
@@ -5356,7 +5398,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
 
             if PREFERENCES_CACHE_TTL_SECONDS > 0:
                 with CACHE_LOCK:
-                    _prefs_cache[str(user_id)] = {"data": merged, "ts": time.time()}
+                    _prefs_cache[str(effective_user_id)] = {"data": merged, "ts": time.time()}
 
             return _capability_response(
                 "success",
@@ -5372,7 +5414,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             thread_id_arg = str(arguments.get("thread_id") or "").strip()
             if thread_id_arg:
                 history_params["thread_id"] = thread_id_arg
-            parsed = _inprocess_get_interaction_history(str(user_id), history_params)
+            parsed = _inprocess_get_interaction_history(str(effective_user_id), history_params)
             if isinstance(parsed, dict):
                 result = {
                     "interactions": list(parsed.get("interactions") or []),

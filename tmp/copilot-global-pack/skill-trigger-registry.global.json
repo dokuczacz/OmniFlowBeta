@@ -1,0 +1,50 @@
+{
+  "version": "1.0",
+  "skills": {
+    "omniflow-stall-escalation": {
+      "triggers": [
+        "blocked",
+        "stalled",
+        "missing evidence",
+        "cannot proceed",
+        "need split"
+      ]
+    },
+    "omniflow-progress-table-strict": {
+      "triggers": [
+        "status",
+        "progress",
+        "counts",
+        "summary table",
+        "where are we"
+      ]
+    },
+    "omniflow-operator-commands": {
+      "triggers": [
+        "run command",
+        "background",
+        "non blocking",
+        "monitor",
+        "how to run"
+      ]
+    },
+    "omniflow-test-operator": {
+      "triggers": [
+        "test",
+        "verify",
+        "pytest",
+        "ci",
+        "does it work"
+      ]
+    },
+    "omniflow-self-learner-mini": {
+      "triggers": [
+        "explain",
+        "how does it work",
+        "why",
+        "clarify",
+        "i do not understand"
+      ]
+    }
+  }
+}
