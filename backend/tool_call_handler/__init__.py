@@ -1568,6 +1568,38 @@ def _inprocess_upload_data_or_file(user_id: str, target_blob_name: str, file_con
         return {}
 
 
+def _inprocess_save_interaction(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    from save_interaction import main as save_interaction_main
+
+    resp = _inprocess_call_function_main(
+        save_interaction_main,
+        user_id,
+        body={**dict(payload or {}), "user_id": user_id},
+    )
+    try:
+        body_text = resp.get_body().decode("utf-8") if hasattr(resp, "get_body") else str(resp)
+        return json.loads(body_text) if body_text else {}
+    except Exception as exc:
+        _best_effort_debug("inprocess_save_interaction_parse_failed", user_id=str(user_id), error=exc)
+        return {}
+
+
+def _inprocess_get_interaction_history(user_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    from get_interaction_history import main as get_interaction_history_main
+
+    resp = _inprocess_call_function_main(
+        get_interaction_history_main,
+        user_id,
+        params={**dict(params or {}), "user_id": user_id},
+    )
+    try:
+        body_text = resp.get_body().decode("utf-8") if hasattr(resp, "get_body") else str(resp)
+        return json.loads(body_text) if body_text else {}
+    except Exception as exc:
+        _best_effort_debug("inprocess_get_interactions_parse_failed", user_id=str(user_id), error=exc)
+        return {}
+
+
 _WP6_PREFERENCES_SCHEMA_FALLBACK: Dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$id": "omniflow.wp6.preferences.v1",
@@ -4861,6 +4893,306 @@ def _make_response(body: Any, status_code: int = 200):
     return body_text, status_code, {"Content-Type": "application/json"}
 
 
+def _capability_response(status: str, capability: str, *, result: Dict[str, Any] | None = None, error: Dict[str, Any] | None = None, meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "schema_version": "omniflow.capability_exec.v1",
+        "status": status,
+        "action": "capability_exec",
+        "capability": str(capability or ""),
+        "result": result if isinstance(result, dict) else None,
+        "error": error if isinstance(error, dict) else None,
+        "meta": meta if isinstance(meta, dict) else {},
+    }
+    return payload
+
+
+def _tm_flatten_with_refs(tm_data: Any) -> Tuple[list[dict], list[dict]]:
+    rows: list[dict] = []
+    refs: list[dict] = []
+    if not isinstance(tm_data, list):
+        return rows, refs
+    idx = 1
+    for top_i, item in enumerate(tm_data):
+        if isinstance(item, dict) and isinstance(item.get("tasks"), list):
+            nested = item.get("tasks") or []
+            for nested_i, task in enumerate(nested):
+                if not isinstance(task, dict):
+                    continue
+                title = str(task.get("title") or task.get("content") or f"Task {idx}")
+                row = {
+                    "task_index": idx,
+                    "id": task.get("id"),
+                    "title": title,
+                    "status": str(task.get("status") or "unknown"),
+                    "due_date": task.get("due_date"),
+                    "source": "nested",
+                }
+                rows.append(row)
+                refs.append({"kind": "nested", "top_index": top_i, "nested_index": nested_i})
+                idx += 1
+            continue
+        if isinstance(item, dict):
+            title = str(item.get("title") or item.get("content") or item.get("task") or f"Task {idx}")
+            row = {
+                "task_index": idx,
+                "id": item.get("id"),
+                "title": title,
+                "status": str(item.get("status") or "unknown"),
+                "due_date": item.get("due_date"),
+                "source": "top",
+            }
+            rows.append(row)
+            refs.append({"kind": "top", "top_index": top_i})
+            idx += 1
+    return rows, refs
+
+
+def _bridge_action(action: str, user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Keep Gmail behavior aligned with custom_bridge implementation.
+    from custom_bridge.__init__ import ACTION_HANDLERS as BRIDGE_HANDLERS
+
+    handler = BRIDGE_HANDLERS.get(str(action or "").strip())
+    if not callable(handler):
+        raise ValueError(f"Unsupported bridge action: {action}")
+    return handler(str(user_id), dict(payload or {}), None)
+
+
+def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
+    capability = str((params or {}).get("capability") or "").strip()
+    arguments = (params or {}).get("arguments") or {}
+    if not isinstance(arguments, dict):
+        body = _capability_response(
+            "error",
+            capability,
+            error={"code": "INVALID_ARGUMENTS", "message": "params.arguments must be an object"},
+        )
+        return body, 400
+    confirm = bool((params or {}).get("confirm", False))
+
+    if not capability:
+        body = _capability_response(
+            "error",
+            capability,
+            error={"code": "INVALID_REQUEST", "message": "capability is required"},
+        )
+        return body, 400
+
+    try:
+        if capability == "system.now":
+            now_utc = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+            return _capability_response("success", capability, result={"current_time_utc": now_utc}), 200
+
+        if capability == "mail.status":
+            result = _bridge_action("oauth_status", str(user_id), {})
+            return _capability_response("success", capability, result=result), 200
+
+        if capability == "mail.authorize":
+            result = _bridge_action("ensure_authorized", str(user_id), {"login_hint": arguments.get("login_hint")})
+            return _capability_response("success", capability, result=result), 200
+
+        if capability == "mail.inbox.list":
+            max_results = int(arguments.get("max_results", 20) or 20)
+            payload = {"max_results": max(1, min(50, max_results)), "q": arguments.get("q"), "label": arguments.get("label")}
+            result = _bridge_action("gmail_list", str(user_id), payload)
+            return _capability_response("success", capability, result=result), 200
+
+        if capability == "mail.read":
+            message_id = str(arguments.get("message_id") or "").strip()
+            if not message_id:
+                return _capability_response("error", capability, error={"code": "INVALID_REQUEST", "message": "arguments.message_id is required"}), 400
+            payload = {"message_id": message_id, "format": str(arguments.get("format") or "full")}
+            result = _bridge_action("gmail_get", str(user_id), payload)
+            return _capability_response("success", capability, result=result), 200
+
+        if capability == "mail.summarize":
+            max_results = int(arguments.get("max_results", 10) or 10)
+            list_result = _bridge_action("gmail_list", str(user_id), {"max_results": max(1, min(20, max_results))})
+            ids = [str(x.get("id")) for x in (list_result.get("messages") or []) if isinstance(x, dict) and x.get("id")]
+            summary_items: list[dict] = []
+            for mid in ids[:5]:
+                try:
+                    msg = _bridge_action("gmail_get", str(user_id), {"message_id": mid, "format": "metadata"})
+                    summary_items.append({"message_id": mid, "message": msg.get("message")})
+                except Exception:
+                    continue
+            result = {
+                "listed": int(len(ids)),
+                "sampled": int(len(summary_items)),
+                "items": summary_items,
+            }
+            return _capability_response("success", capability, result=result), 200
+
+        if capability in ("mail.send", "mail.reply"):
+            if not confirm:
+                return _capability_response(
+                    "error",
+                    capability,
+                    error={"code": "CONFIRMATION_REQUIRED", "message": "Set params.confirm=true to send email."},
+                ), 409
+            to = arguments.get("to")
+            if isinstance(to, str):
+                to = [to]
+            payload = {
+                "to": list(to or []),
+                "subject": str(arguments.get("subject") or ""),
+                "body": str(arguments.get("body") or ""),
+                "cc": list(arguments.get("cc") or []),
+                "bcc": list(arguments.get("bcc") or []),
+            }
+            if not payload["to"] or not payload["subject"] or not payload["body"]:
+                return _capability_response(
+                    "error",
+                    capability,
+                    error={"code": "INVALID_REQUEST", "message": "arguments.to, arguments.subject and arguments.body are required"},
+                ), 400
+            result = _bridge_action("gmail_send", str(user_id), payload)
+            return _capability_response("success", capability, result=result), 200
+
+        if capability in ("mail.trash", "mail.delete"):
+            if not confirm:
+                return _capability_response(
+                    "error",
+                    capability,
+                    error={"code": "CONFIRMATION_REQUIRED", "message": "Set params.confirm=true for destructive mail action."},
+                ), 409
+            message_id = str(arguments.get("message_id") or "").strip()
+            if not message_id:
+                return _capability_response("error", capability, error={"code": "INVALID_REQUEST", "message": "arguments.message_id is required"}), 400
+            action = "gmail_trash" if capability == "mail.trash" else "gmail_delete"
+            result = _bridge_action(action, str(user_id), {"message_id": message_id})
+            return _capability_response("success", capability, result=result), 200
+
+        if capability.startswith("task."):
+            raw = _inprocess_read_blob_file(str(user_id), "TM.json")
+            tm_data = raw.get("data") if isinstance(raw, dict) else None
+            if not isinstance(tm_data, list):
+                tm_data = []
+            rows, refs = _tm_flatten_with_refs(tm_data)
+
+            if capability == "task.list":
+                return _capability_response("success", capability, result={"tasks": rows, "count": len(rows)}), 200
+
+            if capability == "task.delayed":
+                today = datetime.datetime.utcnow().date().isoformat()
+                delayed = [
+                    r for r in rows
+                    if str(r.get("due_date") or "").strip()
+                    and str(r.get("due_date")) < today
+                    and str(r.get("status") or "").lower() not in ("done", "completed")
+                ]
+                return _capability_response("success", capability, result={"tasks": delayed, "count": len(delayed)}), 200
+
+            if capability == "task.create":
+                title = str(arguments.get("title") or arguments.get("content") or "").strip()
+                if not title:
+                    return _capability_response("error", capability, error={"code": "INVALID_REQUEST", "message": "arguments.title is required"}), 400
+                entry = {
+                    "id": f"TM.LOCAL.{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
+                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                    "title": title,
+                    "status": str(arguments.get("status") or "open"),
+                }
+                if arguments.get("due_date"):
+                    entry["due_date"] = arguments.get("due_date")
+                if arguments.get("priority"):
+                    entry["priority"] = arguments.get("priority")
+                tm_data.append(entry)
+                _inprocess_upload_data_or_file(str(user_id), "TM.json", tm_data)
+                return _capability_response("success", capability, result={"created": entry}), 200
+
+            task_index = int(arguments.get("task_index") or 0)
+            if task_index < 1 or task_index > len(refs):
+                return _capability_response("error", capability, error={"code": "NOT_FOUND", "message": "Invalid task_index"}), 404
+            ref = refs[task_index - 1]
+            if str(ref.get("kind")) == "nested":
+                target = tm_data[ref["top_index"]]["tasks"][ref["nested_index"]]
+            else:
+                target = tm_data[ref["top_index"]]
+
+            if capability == "task.update":
+                for field in ("title", "content", "status", "due_date", "priority"):
+                    if field in arguments and arguments.get(field) is not None:
+                        target[field] = arguments.get(field)
+                _inprocess_upload_data_or_file(str(user_id), "TM.json", tm_data)
+                return _capability_response("success", capability, result={"updated": target, "task_index": task_index}), 200
+
+            if capability == "task.complete":
+                target["status"] = "done"
+                _inprocess_upload_data_or_file(str(user_id), "TM.json", tm_data)
+                return _capability_response("success", capability, result={"completed": True, "task_index": task_index}), 200
+
+            if capability == "task.delete":
+                if not confirm:
+                    return _capability_response(
+                        "error",
+                        capability,
+                        error={"code": "CONFIRMATION_REQUIRED", "message": "Set params.confirm=true for task.delete."},
+                    ), 409
+                if str(ref.get("kind")) == "nested":
+                    deleted = tm_data[ref["top_index"]]["tasks"].pop(ref["nested_index"])
+                else:
+                    deleted = tm_data.pop(ref["top_index"])
+                _inprocess_upload_data_or_file(str(user_id), "TM.json", tm_data)
+                return _capability_response("success", capability, result={"deleted": deleted, "task_index": task_index}), 200
+
+        if capability == "planning.build_day_plan":
+            lo = _inprocess_read_blob_file(str(user_id), "LO.json")
+            result = {
+                "message": "Planning capability placeholder (context-free mode).",
+                "lo": lo.get("data") if isinstance(lo, dict) else None,
+            }
+            return _capability_response("success", capability, result=result), 200
+
+        if capability == "memory.interaction.save":
+            save_payload = {
+                "user_message": str(arguments.get("user_message") or ""),
+                "assistant_response": str(arguments.get("assistant_response") or ""),
+                "thread_id": str(arguments.get("thread_id") or "capability-thread"),
+                "tool_calls": list(arguments.get("tool_calls") or []),
+                "metadata": dict(arguments.get("metadata") or {}),
+            }
+            parsed = _inprocess_save_interaction(str(user_id), save_payload)
+            return _capability_response("success", capability, result=parsed if isinstance(parsed, dict) else {"raw": parsed}), 200
+
+        if capability == "memory.interaction.list":
+            history_params = {
+                "thread_id": str(arguments.get("thread_id") or "capability-thread"),
+                "limit": int(arguments.get("limit", 20) or 20),
+                "offset": int(arguments.get("offset", 0) or 0),
+            }
+            parsed = _inprocess_get_interaction_history(str(user_id), history_params)
+            return _capability_response("success", capability, result=parsed if isinstance(parsed, dict) else {"raw": parsed}), 200
+
+        return _capability_response(
+            "error",
+            capability,
+            error={"code": "UNSUPPORTED_CAPABILITY", "message": f"Capability not supported: {capability}"},
+        ), 400
+    except Exception as exc:
+        logging.error("capability_exec failed for %s: %s", capability, exc, exc_info=True)
+        msg = str(exc or "")
+        if capability.startswith("mail.") and (
+            "oauth2.googleapis.com/token" in msg
+            or "NOT_AUTHORIZED" in msg
+            or "Gmail tokens not found" in msg
+        ):
+            err = _capability_response(
+                "error",
+                capability,
+                error={
+                    "code": "MAIL_AUTH_REQUIRED",
+                    "message": "Email access is not authorized. Gmail authorization is required before mailbox operations can be performed.",
+                },
+            )
+            return err, 409
+        err = _capability_response(
+            "error",
+            capability,
+            error={"code": "INTERNAL_ERROR", "message": msg},
+        )
+        return err, 500
+
+
 def _openai_rest_headers() -> Dict[str, str]:
     """Build standard headers for OpenAI REST requests."""
     return {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
@@ -5324,6 +5656,12 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             resp_direct = handle_direct_actions(req, body, action, user_id)
             if resp_direct is not None:
                 return resp_direct
+
+        # Deterministic capability layer for Custom GPT schema-first integration.
+        # This path intentionally avoids legacy context builder/composer reads.
+        if action == "capability_exec":
+            resp_body, resp_status = _handle_capability_exec(str(user_id), params if isinstance(params, dict) else {})
+            return _make_response(resp_body, status_code=int(resp_status))
 
         def _is_local_request() -> bool:
             try:

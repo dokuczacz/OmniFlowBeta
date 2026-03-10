@@ -164,7 +164,7 @@
       "post": {
         "operationId": "tool_call_handler_single_endpoint",
         "summary": "Single endpoint for Personal Assistance capabilities",
-        "description": "Unified endpoint for both Custom GPT and native UI. Prefer action=capability_exec for Custom GPT. First call for a new user must be action=pa_init with params.confirm_create=true.",
+        "description": "Unified endpoint for both Custom GPT and native UI. Prefer action=capability_exec for Custom GPT. First call for a new user must be action=pa_init with params.confirm_create=true. For Gmail onboarding call capability=mail.authorize first, then call mailbox capabilities.",
         "requestBody": {
           "required": true,
           "content": {
@@ -217,6 +217,18 @@
                     }
                   }
                 },
+                "mail_authorize": {
+                  "summary": "Start or verify Gmail authorization",
+                  "value": {
+                    "action": "capability_exec",
+                    "user_id": "mario_test",
+                    "params": {
+                      "capability": "mail.authorize",
+                      "confirm": false,
+                      "arguments": {}
+                    }
+                  }
+                },
                 "ui_chat": {
                   "summary": "Native UI chat",
                   "value": {
@@ -237,6 +249,47 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ToolCallHandlerResponse"
+                },
+                "examples": {
+                  "mail_authorize_requires_consent": {
+                    "summary": "mail.authorize response when interactive OAuth consent is required",
+                    "value": {
+                      "schema_version": "omniflow.capability_exec.v1",
+                      "status": "success",
+                      "action": "capability_exec",
+                      "capability": "mail.authorize",
+                      "result": {
+                        "action": "ensure_authorized",
+                        "authorized": false,
+                        "user_id": "mario_test",
+                        "scope": "https://mail.google.com/",
+                        "state": "example-state",
+                        "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
+                        "redirect_uri": "https://agentbackendservice-dfcpcudzeah4b6ae.northeurope-01.azurewebsites.net/api/gmail_oauth_callback"
+                      },
+                      "error": null,
+                      "meta": {}
+                    }
+                  },
+                  "mail_authorize_already_connected": {
+                    "summary": "mail.authorize response when account is already connected",
+                    "value": {
+                      "schema_version": "omniflow.capability_exec.v1",
+                      "status": "success",
+                      "action": "capability_exec",
+                      "capability": "mail.authorize",
+                      "result": {
+                        "action": "ensure_authorized",
+                        "authorized": true,
+                        "user_id": "mario_test",
+                        "scope": "https://mail.google.com/",
+                        "saved_at": "2026-03-10T16:13:43Z",
+                        "expires_at": "2026-03-10T17:13:42Z"
+                      },
+                      "error": null,
+                      "meta": {}
+                    }
+                  }
                 }
               }
             }
@@ -248,7 +301,31 @@
             "description": "Unauthorized"
           },
           "409": {
-            "description": "Conflict or bootstrap required (for new users call pa_init with confirm_create=true)"
+            "description": "Conflict or authorization required (for new users call pa_init with confirm_create=true; for Gmail errors use capability=mail.authorize and retry)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolCallHandlerResponse"
+                },
+                "examples": {
+                  "mail_auth_required": {
+                    "summary": "Mailbox operation blocked until Gmail authorization",
+                    "value": {
+                      "schema_version": "omniflow.capability_exec.v1",
+                      "status": "error",
+                      "action": "capability_exec",
+                      "capability": "mail.inbox.list",
+                      "result": null,
+                      "error": {
+                        "code": "MAIL_AUTH_REQUIRED",
+                        "message": "Email access is not authorized. Gmail authorization is required before mailbox operations can be performed."
+                      },
+                      "meta": {}
+                    }
+                  }
+                }
+              }
+            }
           },
           "500": {
             "description": "Internal error"
