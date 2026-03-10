@@ -248,6 +248,7 @@ def handle_ensure_authorized(user_id: str, payload: Dict[str, Any], access_token
 def handle_gmail_send(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
     email = _build_email(payload)
     raw = base64.urlsafe_b64encode(email.as_bytes()).decode("ascii")
+    audit_id = str(uuid.uuid4())
     gmail = GmailClient(user_id, access_token=access_token)
     response = gmail.request("post", "messages/send", json={"raw": raw})
     result = response.json()
@@ -257,6 +258,7 @@ def handle_gmail_send(user_id: str, payload: Dict[str, Any], access_token: str |
         "user_id": user_id,
         "message_id": result.get("id"),
         "thread_id": result.get("threadId"),
+        "audit_id": audit_id,
     }
 
 
@@ -301,6 +303,40 @@ def handle_gmail_get(user_id: str, payload: Dict[str, Any], access_token: str | 
     }
 
 
+def handle_gmail_trash(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
+    message_id = payload.get("message_id")
+    if not message_id:
+        raise ValueError("message_id is required for gmail_trash")
+    audit_id = str(uuid.uuid4())
+    gmail = GmailClient(user_id, access_token=access_token)
+    response = gmail.request("post", f"messages/{message_id}/trash")
+    payload_response = response.json()
+    return {
+        "action": "gmail_trash",
+        "status": "ok",
+        "user_id": user_id,
+        "message_id": payload_response.get("id") or message_id,
+        "thread_id": payload_response.get("threadId"),
+        "audit_id": audit_id,
+    }
+
+
+def handle_gmail_delete(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
+    message_id = payload.get("message_id")
+    if not message_id:
+        raise ValueError("message_id is required for gmail_delete")
+    audit_id = str(uuid.uuid4())
+    gmail = GmailClient(user_id, access_token=access_token)
+    gmail.request("delete", f"messages/{message_id}")
+    return {
+        "action": "gmail_delete",
+        "status": "ok",
+        "user_id": user_id,
+        "message_id": message_id,
+        "audit_id": audit_id,
+    }
+
+
 def handle_gmail_attachment(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
     message_id = payload.get("message_id")
     attachment_id = payload.get("attachment_id")
@@ -326,6 +362,8 @@ ACTION_HANDLERS = {
     "gmail_send": handle_gmail_send,
     "gmail_list": handle_gmail_list,
     "gmail_get": handle_gmail_get,
+    "gmail_trash": handle_gmail_trash,
+    "gmail_delete": handle_gmail_delete,
     "gmail_attachment": handle_gmail_attachment,
 }
 

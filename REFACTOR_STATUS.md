@@ -1,5 +1,13 @@
 # OmniFlowBeta Tool Handler Refactor - Progress Report
 
+## Delta Update (2026-03-10)
+
+- Added backend Gmail lifecycle parity in `custom_bridge`: `gmail_trash` and `gmail_delete` handlers are implemented and wired.
+- Added `audit_id` for side-effect Gmail actions (`gmail_send`, `gmail_trash`, `gmail_delete`) to improve operation traceability.
+- Extended PA normalization with `delete_email` intent mapping and confirmation gate for `send/trash/delete` operations.
+- Added focused tests: `tests/unit/test_custom_bridge_gmail_actions.py`, `tests/unit/test_pa_gmail_delete_confirmation.py`.
+- Added optional live E2E destructive flow flags in `scripts/e2e_pa_live.py`: `--run-destructive-gmail-e2e`, `--destructive-message-id`, `--allow-real-delete`.
+
 **Status**: ALL PHASES COMPLETE (1-6) ✅  
 **Date**: 2026-02-06  
 **Version**: 2.0  

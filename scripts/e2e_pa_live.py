@@ -186,6 +186,64 @@ def assert_interaction_has_tools(entry: Dict[str, Any], expected_any: List[str])
         raise AssertionError(f"expected one of tools={expected_any}, got={sorted(set(names))}")
 
 
+def run_destructive_gmail_flow(
+    cfg: EnvCfg,
+    *,
+    user_id: str,
+    message_id: str,
+    allow_real_delete: bool,
+) -> Dict[str, Any]:
+    oauth = tool_exec(
+        cfg,
+        user_id,
+        tool_name="gmail_action",
+        tool_arguments={"action": "oauth_status", "payload": {}},
+        timeout_s=120,
+    )
+    oauth_res = oauth.get("result") if isinstance(oauth.get("result"), dict) else {}
+    if not bool(oauth_res.get("authorized")):
+        raise AssertionError("destructive_gmail_flow requires authorized Gmail account")
+
+    trash = tool_exec(
+        cfg,
+        user_id,
+        tool_name="gmail_action",
+        tool_arguments={"action": "gmail_trash", "payload": {"message_id": message_id}},
+        timeout_s=120,
+    )
+    trash_res = trash.get("result") if isinstance(trash.get("result"), dict) else {}
+    if str(trash_res.get("status") or "").lower() not in ("ok", "success"):
+        raise AssertionError(f"gmail_trash unexpected result={trash_res}")
+    if not str(trash_res.get("audit_id") or "").strip():
+        raise AssertionError("gmail_trash missing audit_id")
+
+    delete_res: Dict[str, Any] | None = None
+    if allow_real_delete:
+        delete = tool_exec(
+            cfg,
+            user_id,
+            tool_name="gmail_action",
+            tool_arguments={"action": "gmail_delete", "payload": {"message_id": message_id}},
+            timeout_s=120,
+        )
+        delete_res = delete.get("result") if isinstance(delete.get("result"), dict) else {}
+        if str(delete_res.get("status") or "").lower() not in ("ok", "success"):
+            raise AssertionError(f"gmail_delete unexpected result={delete_res}")
+        if not str(delete_res.get("audit_id") or "").strip():
+            raise AssertionError("gmail_delete missing audit_id")
+
+    out: Dict[str, Any] = {
+        "oauth_authorized": True,
+        "trash_status": str(trash_res.get("status") or ""),
+        "trash_audit_id": str(trash_res.get("audit_id") or ""),
+        "delete_executed": bool(allow_real_delete),
+    }
+    if isinstance(delete_res, dict):
+        out["delete_status"] = str(delete_res.get("status") or "")
+        out["delete_audit_id"] = str(delete_res.get("audit_id") or "")
+    return out
+
+
 def find_latest_interaction_entry(cfg: EnvCfg, user_id: str, thread_id: str, *, since_iso: str, max_scan: int = 30) -> Optional[Dict[str, Any]]:
     since_dt = _parse_dt(since_iso) or datetime.min.replace(tzinfo=timezone.utc)
     metas = list_blobs_meta(cfg, user_id, prefix="interactions/")
@@ -215,6 +273,21 @@ def main() -> int:
     ap.add_argument("--env", choices=["local", "prod"], required=True)
     ap.add_argument("--user", required=True)
     ap.add_argument("--tool-handler-url", default="")
+    ap.add_argument(
+        "--run-destructive-gmail-e2e",
+        action="store_true",
+        help="Run explicit destructive Gmail flow (trash, and optional delete). Off by default.",
+    )
+    ap.add_argument(
+        "--destructive-message-id",
+        default="",
+        help="Gmail message_id used by destructive flow. Required when --run-destructive-gmail-e2e is set.",
+    )
+    ap.add_argument(
+        "--allow-real-delete",
+        action="store_true",
+        help="Also perform gmail_delete after gmail_trash. Ignored unless --run-destructive-gmail-e2e is set.",
+    )
     args = ap.parse_args()
 
     if args.env == "local":
@@ -325,6 +398,18 @@ def main() -> int:
         raise AssertionError("could not locate Gmail interaction entry")
     assert_interaction_has_tools(entry_g, expected_any=["gmail_action"])
 
+    destructive_result: Dict[str, Any] | None = None
+    if args.run_destructive_gmail_e2e:
+        message_id = str(args.destructive_message_id or "").strip()
+        if not message_id:
+            raise SystemExit("--destructive-message-id is required when --run-destructive-gmail-e2e is enabled")
+        destructive_result = run_destructive_gmail_flow(
+            cfg,
+            user_id=user_id,
+            message_id=message_id,
+            allow_real_delete=bool(args.allow_real_delete),
+        )
+
     print(
         json.dumps(
             {
@@ -337,6 +422,7 @@ def main() -> int:
                 "tm_items_after": after_n,
                 "intent_artifacts_before": len(intents_before),
                 "intent_artifacts_after": len(intents_after),
+                "destructive_gmail": destructive_result,
             },
             indent=2,
         )

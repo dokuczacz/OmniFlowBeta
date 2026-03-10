@@ -14,6 +14,9 @@
 - OK WP7: semantic indexer (batch-first; queue → artifacts → manifest)
 - OK WP9: reporting (local JSONL writer)
 - OK Monitoring/metrics: done in prod (per project update)
+- OK Email lifecycle parity: backend `gmail_trash` + `gmail_delete` implemented in bridge
+- OK Email side-effect traceability: `audit_id` returned for `gmail_send|gmail_trash|gmail_delete`
+- OK PA confirmation gate: Gmail `send/trash/delete` flagged as confirmation-required paths
 
 ## Remaining (deployment backlog)
 
@@ -21,6 +24,7 @@
 - X WP8: security/auth/quotas (production hardening)
 - X WP11: CI/hardening/prod polish
 - X WP3: vector memory/RAG (parked)
+- X Live E2E destructive scenario rollout (operator-run only with explicit flags and test mailbox)
 
 ## High-signal docs
 

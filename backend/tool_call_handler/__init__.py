@@ -229,7 +229,7 @@ PA_FUNCTION_DEFAULT_ARTIFACTS: Dict[str, List[str]] = {
 
 PA_INTENT_FUNCTION_CATALOG: List[Dict[str, Any]] = [
     {"pa_id": "PA-01", "name": "Task Management", "intents": ["check_tasks", "add_task", "mark_done", "show_delayed", "update_task", "delete_task"]},
-    {"pa_id": "PA-14", "name": "Mail Analysis & Triage", "intents": ["check_gmail", "summarize_inbox", "answer_latest_email", "send_email", "trash_email"]},
+    {"pa_id": "PA-14", "name": "Mail Analysis & Triage", "intents": ["check_gmail", "summarize_inbox", "answer_latest_email", "send_email", "trash_email", "delete_email"]},
     {"pa_id": "PA-13", "name": "Mail Management", "intents": ["list_mailboxes", "show_labels"]},
     {"pa_id": "PA-15", "name": "Mail-to-Action Mapping", "intents": ["mail_to_tasks"]},
     {"pa_id": "PA-02", "name": "Daily Planning", "intents": ["build_day_plan"]},
@@ -268,6 +268,7 @@ PA_GMAIL_INTENT_TO_OPERATION: Dict[str, str] = {
     "answer_latest_email": "send",
     "send_email": "send",
     "trash_email": "trash",
+    "delete_email": "delete",
 }
 
 
@@ -345,6 +346,8 @@ def _pa_detect_tm_operation(text: str, current: str) -> str:
 def _pa_detect_gmail_operation(text: str, current: str) -> str:
     msg = str(text or "").lower()
     op = str(current or "").strip().lower()
+    if any(k in msg for k in ("permanent", "na stale", "hard delete", "usun na stale")):
+        return "delete"
     if any(k in msg for k in ("odpisz", "reply", "wyslij", "send")):
         return "send"
     if any(k in msg for k in ("usun", "skasuj", "trash", "delete")):
@@ -353,7 +356,7 @@ def _pa_detect_gmail_operation(text: str, current: str) -> str:
         return "summarize"
     if any(k in msg for k in ("wypisz", "lista", "list", "nadawca", "temat")):
         return "list"
-    if op in ("list", "get", "summarize", "send", "trash"):
+    if op in ("list", "get", "summarize", "send", "trash", "delete"):
         return op
     return "summarize"
 
@@ -543,10 +546,10 @@ def _pa_backend_normalize_intention_payload(
                         },
                     }
                 ]
-        # Send/trash are side effects, require explicit confirm unless user explicitly disabled confirm.
-        requires_user_confirmation = bool(gmail_op in ("send", "trash") and (not no_confirm_hint))
+        # Send/trash/delete are side effects, require explicit confirm unless user explicitly disabled confirm.
+        requires_user_confirmation = bool(gmail_op in ("send", "trash", "delete") and (not no_confirm_hint))
         if requires_user_confirmation:
-            confirmation_question = "Czy na pewno wykonac operacje Gmail (send/trash)?"
+            confirmation_question = "Czy na pewno wykonac operacje Gmail (send/trash/delete)?"
     elif pa_id == "PA-13":
         required_tools = ["gmail_recent_metadata"]
         prefetch_plan = [
