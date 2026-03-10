@@ -72,39 +72,44 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     logging.info(f"get_interaction_history: user_id={user_id}, thread_id={thread_id}, limit={limit}, offset={offset}")
     
     try:
-        # Use the same dedicated file for interaction logs
-        target_blob_name = "interaction_logs.json"
-        
-        # Get blob client with user isolation
-        blob_client = AzureBlobClient.get_blob_client(target_blob_name, user_id)
-        
-        # 1. Read existing logs
+        interactions = []
+        source = "interactions/index.jsonl"
+
+        # Primary source (current architecture): interactions/index.jsonl.
+        index_blob_client = AzureBlobClient.get_blob_client("interactions/index.jsonl", user_id)
         try:
-            blob_data = blob_client.download_blob()
-            data_str = blob_data.readall().decode('utf-8')
-            logs = json.loads(data_str)
+            index_raw = index_blob_client.download_blob().readall().decode("utf-8")
+            for line in index_raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry, dict):
+                    interactions.append(entry)
         except ResourceNotFoundError:
-            logs = []
-        
-        # 2. Ensure logs is a list
-        if not isinstance(logs, list):
-            logs = []
-        
-        # 3. Filter by thread_id if specified
+            # Backward-compatible fallback for older users.
+            source = "interaction_logs.json"
+            legacy_blob = AzureBlobClient.get_blob_client("interaction_logs.json", user_id)
+            try:
+                legacy_raw = legacy_blob.download_blob().readall().decode("utf-8")
+                legacy = json.loads(legacy_raw)
+                if isinstance(legacy, list):
+                    interactions = [it for it in legacy if isinstance(it, dict)]
+            except ResourceNotFoundError:
+                interactions = []
+
         if thread_id:
-            filtered_logs = [log for log in logs if log.get('thread_id') == thread_id]
+            filtered_logs = [log for log in interactions if str(log.get("thread_id") or "") == thread_id]
         else:
-            filtered_logs = logs
-        
-        # 4. Apply pagination
+            filtered_logs = interactions
+
+        filtered_logs.sort(key=lambda x: str(x.get("timestamp") or ""), reverse=True)
         total_count = len(filtered_logs)
-        
-        # Sort by timestamp (most recent first)
-        filtered_logs.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-        
-        # Apply offset and limit
         paginated_logs = filtered_logs[offset:offset + limit]
-        
+
         response_data = {
             "status": "success",
             "interactions": paginated_logs,
@@ -113,7 +118,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "offset": offset,
             "limit": limit,
             "user_id": user_id,
-            "thread_id": thread_id
+            "thread_id": thread_id,
+            "source": source,
         }
         
         return func.HttpResponse(

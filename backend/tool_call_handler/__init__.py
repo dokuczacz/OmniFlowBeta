@@ -4894,6 +4894,15 @@ def _make_response(body: Any, status_code: int = 200):
 
 
 def _capability_response(status: str, capability: str, *, result: Dict[str, Any] | None = None, error: Dict[str, Any] | None = None, meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    now_epoch = int(time.time())
+    now_utc = datetime.datetime.utcfromtimestamp(now_epoch).replace(microsecond=0).isoformat() + "Z"
+    merged_meta = dict(meta) if isinstance(meta, dict) else {}
+    merged_meta.setdefault("now_utc", now_utc)
+    merged_meta.setdefault("now_epoch", now_epoch)
+    merged_meta.setdefault("request_id", str(uuid.uuid4()))
+    merged_meta.setdefault("run_id", f"cap_{now_epoch}_{uuid.uuid4().hex[:8]}")
+    merged_meta.setdefault("duration_ms", 0)
+
     payload: Dict[str, Any] = {
         "schema_version": "omniflow.capability_exec.v1",
         "status": status,
@@ -4901,7 +4910,7 @@ def _capability_response(status: str, capability: str, *, result: Dict[str, Any]
         "capability": str(capability or ""),
         "result": result if isinstance(result, dict) else None,
         "error": error if isinstance(error, dict) else None,
-        "meta": meta if isinstance(meta, dict) else {},
+        "meta": merged_meta,
     }
     return payload
 
@@ -4925,6 +4934,12 @@ def _tm_flatten_with_refs(tm_data: Any) -> Tuple[list[dict], list[dict]]:
                     "title": title,
                     "status": str(task.get("status") or "unknown"),
                     "due_date": task.get("due_date"),
+                    "priority": task.get("priority"),
+                    "tags": task.get("tags"),
+                    "estimated_time": task.get("estimated_time"),
+                    "energy": task.get("energy"),
+                    "created_at": task.get("created_at"),
+                    "updated_at": task.get("updated_at"),
                     "source": "nested",
                 }
                 rows.append(row)
@@ -4939,12 +4954,61 @@ def _tm_flatten_with_refs(tm_data: Any) -> Tuple[list[dict], list[dict]]:
                 "title": title,
                 "status": str(item.get("status") or "unknown"),
                 "due_date": item.get("due_date"),
+                "priority": item.get("priority"),
+                "tags": item.get("tags"),
+                "estimated_time": item.get("estimated_time"),
+                "energy": item.get("energy"),
+                "created_at": item.get("created_at"),
+                "updated_at": item.get("updated_at"),
                 "source": "top",
             }
             rows.append(row)
             refs.append({"kind": "top", "top_index": top_i})
             idx += 1
     return rows, refs
+
+
+def _next_task_id(rows: list[dict]) -> str:
+    seq = 1
+    for row in rows:
+        raw_id = str(row.get("id") or "")
+        match = re.match(r"^TM\.(\d+)\.", raw_id)
+        if not match:
+            continue
+        try:
+            seq = max(seq, int(match.group(1)) + 1)
+        except Exception:
+            continue
+    ts = datetime.datetime.utcnow().strftime("%Y%m%d%H%M")
+    return f"TM.{seq:03d}.{ts}"
+
+
+def _mail_extract_header(message_obj: Dict[str, Any], header_name: str) -> str:
+    payload = message_obj.get("payload") if isinstance(message_obj, dict) else None
+    headers = payload.get("headers") if isinstance(payload, dict) else None
+    if not isinstance(headers, list):
+        return ""
+    target = str(header_name or "").strip().lower()
+    for item in headers:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip().lower()
+        if name == target:
+            return str(item.get("value") or "").strip()
+    return ""
+
+
+def _mail_enriched_row(raw_item: Dict[str, Any], message_obj: Dict[str, Any]) -> Dict[str, Any]:
+    internal_date = str(message_obj.get("internalDate") or "").strip() if isinstance(message_obj, dict) else ""
+    date_value = _mail_extract_header(message_obj, "Date") or internal_date
+    return {
+        "id": str(raw_item.get("id") or "").strip(),
+        "threadId": str(raw_item.get("threadId") or "").strip(),
+        "from": _mail_extract_header(message_obj, "From"),
+        "subject": _mail_extract_header(message_obj, "Subject"),
+        "snippet": str(message_obj.get("snippet") or "").strip() if isinstance(message_obj, dict) else "",
+        "date": date_value,
+    }
 
 
 def _bridge_action(action: str, user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -4994,6 +5058,26 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             max_results = int(arguments.get("max_results", 20) or 20)
             payload = {"max_results": max(1, min(50, max_results)), "q": arguments.get("q"), "label": arguments.get("label")}
             result = _bridge_action("gmail_list", str(user_id), payload)
+            messages = list(result.get("messages") or []) if isinstance(result, dict) else []
+            metadata_limit = int(arguments.get("metadata_limit", 20) or 20)
+            metadata_limit = max(1, min(20, metadata_limit))
+            enriched: list[dict] = []
+            for idx, raw_item in enumerate(messages):
+                if not isinstance(raw_item, dict):
+                    continue
+                mid = str(raw_item.get("id") or "").strip()
+                if not mid:
+                    continue
+                message_obj: Dict[str, Any] = {}
+                if idx < metadata_limit:
+                    try:
+                        got = _bridge_action("gmail_get", str(user_id), {"message_id": mid, "format": "metadata"})
+                        message_obj = dict(got.get("message") or {}) if isinstance(got, dict) else {}
+                    except Exception:
+                        message_obj = {}
+                enriched.append(_mail_enriched_row(raw_item, message_obj))
+            result["messages"] = enriched
+            result["enriched_count"] = len([m for m in enriched if (m.get("subject") or m.get("from") or m.get("snippet"))])
             return _capability_response("success", capability, result=result), 200
 
         if capability == "mail.read":
@@ -5068,6 +5152,11 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             if not isinstance(tm_data, list):
                 tm_data = []
             rows, refs = _tm_flatten_with_refs(tm_data)
+            id_to_index = {
+                str(row.get("id")): int(row.get("task_index"))
+                for row in rows
+                if str(row.get("id") or "").strip()
+            }
 
             if capability == "task.list":
                 return _capability_response("success", capability, result={"tasks": rows, "count": len(rows)}), 200
@@ -5086,9 +5175,12 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                 title = str(arguments.get("title") or arguments.get("content") or "").strip()
                 if not title:
                     return _capability_response("error", capability, error={"code": "INVALID_REQUEST", "message": "arguments.title is required"}), 400
+                now_utc = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
                 entry = {
-                    "id": f"TM.LOCAL.{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
-                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                    "id": _next_task_id(rows),
+                    "timestamp": now_utc,
+                    "created_at": now_utc,
+                    "updated_at": now_utc,
                     "title": title,
                     "status": str(arguments.get("status") or "open"),
                 }
@@ -5096,13 +5188,22 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                     entry["due_date"] = arguments.get("due_date")
                 if arguments.get("priority"):
                     entry["priority"] = arguments.get("priority")
+                if arguments.get("tags") is not None:
+                    entry["tags"] = list(arguments.get("tags") or [])
+                if arguments.get("estimated_time") is not None:
+                    entry["estimated_time"] = arguments.get("estimated_time")
+                if arguments.get("energy") is not None:
+                    entry["energy"] = arguments.get("energy")
                 tm_data.append(entry)
                 _inprocess_upload_data_or_file(str(user_id), "TM.json", tm_data)
                 return _capability_response("success", capability, result={"created": entry}), 200
 
+            task_id = str(arguments.get("id") or "").strip()
             task_index = int(arguments.get("task_index") or 0)
+            if task_id and task_id in id_to_index:
+                task_index = id_to_index[task_id]
             if task_index < 1 or task_index > len(refs):
-                return _capability_response("error", capability, error={"code": "NOT_FOUND", "message": "Invalid task_index"}), 404
+                return _capability_response("error", capability, error={"code": "NOT_FOUND", "message": "Task not found. Provide arguments.id or valid arguments.task_index."}), 404
             ref = refs[task_index - 1]
             if str(ref.get("kind")) == "nested":
                 target = tm_data[ref["top_index"]]["tasks"][ref["nested_index"]]
@@ -5110,14 +5211,16 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                 target = tm_data[ref["top_index"]]
 
             if capability == "task.update":
-                for field in ("title", "content", "status", "due_date", "priority"):
+                for field in ("title", "content", "status", "due_date", "priority", "tags", "estimated_time", "energy"):
                     if field in arguments and arguments.get(field) is not None:
                         target[field] = arguments.get(field)
+                target["updated_at"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
                 _inprocess_upload_data_or_file(str(user_id), "TM.json", tm_data)
                 return _capability_response("success", capability, result={"updated": target, "task_index": task_index}), 200
 
             if capability == "task.complete":
                 target["status"] = "done"
+                target["updated_at"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
                 _inprocess_upload_data_or_file(str(user_id), "TM.json", tm_data)
                 return _capability_response("success", capability, result={"completed": True, "task_index": task_index}), 200
 
@@ -5133,13 +5236,60 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                 else:
                     deleted = tm_data.pop(ref["top_index"])
                 _inprocess_upload_data_or_file(str(user_id), "TM.json", tm_data)
-                return _capability_response("success", capability, result={"deleted": deleted, "task_index": task_index}), 200
+                return _capability_response("success", capability, result={"deleted": deleted, "task_index": task_index, "id": deleted.get("id")}), 200
 
         if capability == "planning.build_day_plan":
-            lo = _inprocess_read_blob_file(str(user_id), "LO.json")
+            raw = _inprocess_read_blob_file(str(user_id), "TM.json")
+            tm_data = raw.get("data") if isinstance(raw, dict) else None
+            if not isinstance(tm_data, list):
+                tm_data = []
+            rows, _ = _tm_flatten_with_refs(tm_data)
+
+            today = datetime.datetime.utcnow().date().isoformat()
+            overdue = [
+                r for r in rows
+                if str(r.get("due_date") or "").strip()
+                and str(r.get("due_date")) < today
+                and str(r.get("status") or "").lower() not in ("done", "completed")
+            ]
+            due_today = [
+                r for r in rows
+                if str(r.get("due_date") or "").strip() == today
+                and str(r.get("status") or "").lower() not in ("done", "completed")
+            ]
+            in_progress = [
+                r for r in rows
+                if str(r.get("status") or "").lower() in ("in_progress", "in-progress", "doing", "started")
+            ]
+
+            morning = [f"Review delayed task: {r.get('title')}" for r in overdue[:5]]
+            midday = [f"Execute today task: {r.get('title')}" for r in due_today[:5]]
+            afternoon = [f"Continue in-progress task: {r.get('title')}" for r in in_progress[:5]]
+
+            if not morning and overdue:
+                morning = ["Review delayed tasks"]
+            if not midday and due_today:
+                midday = ["Execute planned tasks for today"]
+            if not afternoon and in_progress:
+                afternoon = ["Continue in-progress tasks"]
+
             result = {
-                "message": "Planning capability placeholder (context-free mode).",
-                "lo": lo.get("data") if isinstance(lo, dict) else None,
+                "summary": {
+                    "tasks_total": len(rows),
+                    "overdue_count": len(overdue),
+                    "today_count": len(due_today),
+                    "in_progress_count": len(in_progress),
+                },
+                "sections": {
+                    "Morning": morning,
+                    "Midday": midday,
+                    "Afternoon": afternoon,
+                },
+                "source": {
+                    "now": "system.now (in-process)",
+                    "tasks": "task.list (TM.json)",
+                    "delayed": "task.delayed (derived)",
+                },
             }
             return _capability_response("success", capability, result=result), 200
 
@@ -5154,14 +5304,86 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             parsed = _inprocess_save_interaction(str(user_id), save_payload)
             return _capability_response("success", capability, result=parsed if isinstance(parsed, dict) else {"raw": parsed}), 200
 
+        if capability == "memory.preferences.get":
+            prefs = _load_preferences(str(user_id))
+            if not isinstance(prefs, dict) or not prefs:
+                prefs = _wp6_default_preferences()
+            return _capability_response("success", capability, result={"preferences": prefs}), 200
+
+        if capability == "memory.preferences.update":
+            base = _load_preferences(str(user_id))
+            if not isinstance(base, dict) or not base:
+                base = _wp6_default_preferences()
+
+            if isinstance(arguments.get("preferences"), dict):
+                updates_raw = dict(arguments.get("preferences") or {})
+            else:
+                updates_raw = dict(arguments or {})
+
+            allowed_keys = {"brevity", "fast_mode", "allowed_reads", "disable_history_reads"}
+            updates: Dict[str, Any] = {}
+            for key in allowed_keys:
+                if key in updates_raw:
+                    updates[key] = updates_raw.get(key)
+
+            if "allowed_reads" in updates:
+                updates["allowed_reads"] = [str(x) for x in list(updates.get("allowed_reads") or [])]
+
+            merged = {
+                **dict(base or {}),
+                **updates,
+                "schema_version": "omniflow.wp6.preferences.v1",
+                "updated_utc": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            }
+            ok, reason = _wp6_validate_preferences(merged)
+            if not ok:
+                return _capability_response(
+                    "error",
+                    capability,
+                    error={
+                        "code": "INVALID_PREFERENCES",
+                        "message": f"Invalid preferences payload: {reason}",
+                    },
+                ), 400
+
+            save_result = _inprocess_upload_data_or_file(str(user_id), "semantics/preferences.json", merged)
+            if isinstance(save_result, dict) and save_result.get("status") == "error":
+                return _capability_response(
+                    "error",
+                    capability,
+                    error={"code": "STORAGE_ERROR", "message": str(save_result.get("error") or "Failed to save preferences")},
+                ), 500
+
+            if PREFERENCES_CACHE_TTL_SECONDS > 0:
+                with CACHE_LOCK:
+                    _prefs_cache[str(user_id)] = {"data": merged, "ts": time.time()}
+
+            return _capability_response(
+                "success",
+                capability,
+                result={"preferences": merged, "updated_keys": sorted(list(updates.keys()))},
+            ), 200
+
         if capability == "memory.interaction.list":
             history_params = {
-                "thread_id": str(arguments.get("thread_id") or "capability-thread"),
                 "limit": int(arguments.get("limit", 20) or 20),
                 "offset": int(arguments.get("offset", 0) or 0),
             }
+            thread_id_arg = str(arguments.get("thread_id") or "").strip()
+            if thread_id_arg:
+                history_params["thread_id"] = thread_id_arg
             parsed = _inprocess_get_interaction_history(str(user_id), history_params)
-            return _capability_response("success", capability, result=parsed if isinstance(parsed, dict) else {"raw": parsed}), 200
+            if isinstance(parsed, dict):
+                result = {
+                    "interactions": list(parsed.get("interactions") or []),
+                    "total_count": int(parsed.get("total_count") or 0),
+                    "returned_count": int(parsed.get("returned_count") or 0),
+                    "offset": int(parsed.get("offset") or 0),
+                    "limit": int(parsed.get("limit") or history_params.get("limit") or 20),
+                }
+            else:
+                result = {"interactions": [], "total_count": 0, "returned_count": 0, "offset": 0, "limit": int(history_params.get("limit") or 20), "raw": parsed}
+            return _capability_response("success", capability, result=result), 200
 
         return _capability_response(
             "error",
@@ -5616,6 +5838,43 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             return any(
                 k in m
                 for k in ("task", "tasks", "zadanie", "zadania", "todo", "to-do", "do zrobienia", "co mam jeszcze")
+            )
+
+        def _is_custom_gpt_request() -> bool:
+            try:
+                hdrs = {str(k).lower(): str(v).lower() for k, v in dict(req.headers or {}).items()}
+            except Exception:
+                hdrs = {}
+            ua = str(hdrs.get("user-agent") or "")
+            if any(k.startswith("x-openai-") for k in hdrs.keys()):
+                return True
+            if any(tok in ua for tok in ("chatgpt", "gpt-actions", "openai")):
+                return True
+            hints = " ".join(
+                [
+                    str(body.get("client") or ""),
+                    str(body.get("channel") or ""),
+                    str(body.get("source") or ""),
+                    str(body.get("origin") or ""),
+                    str(body.get("caller") or ""),
+                ]
+            ).lower()
+            return any(
+                x in hints
+                for x in ("custom_gpt", "custom-gpt", "gpt_action", "gpt-action", "chatgpt", "openai_actions")
+            )
+
+        if action == "chat" and _is_custom_gpt_request():
+            return _make_response(
+                {
+                    "status": "error",
+                    "action": "chat",
+                    "error": {
+                        "code": "UNSUPPORTED_FOR_CUSTOM_GPT",
+                        "message": "Custom GPT requests must use action=capability_exec.",
+                    },
+                },
+                status_code=403,
             )
 
         if not action and isinstance(user_message, str) and user_message.strip():
