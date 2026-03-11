@@ -1,149 +1,67 @@
 # OmniFlow Beta
 
-OmniFlow Beta is a **multi-user AI agent backend** built on **Azure Functions + Azure Blob Storage**, with a **Next.js UI**.
+OmniFlow Beta is a multi-user AI orchestration backend on Azure Functions + Azure Blob Storage.
 
-## ✅ Tool Handler Refactor Complete (v2.0)
+This repository exposes a quasi-MCP pattern: one deterministic orchestration endpoint with tool registry, validation, and structured responses.
 
-**Registry-Driven Architecture** - Transformed 4165-line monolith into modular, testable system
+## Test status
 
-- ✅ **Phase 1**: Registry & Contracts (112 tests)
-- ✅ **Phase 2**: Dispatch Pipeline Integration (28 tests)
-- ✅ **Phase 3**: Datasearch Engine (35 tests)
-- ✅ **Phase 4**: WP6 Context Builders (70 tests)
-- ✅ **Phase 5**: WP7 Dual-Mode Indexing (33 tests)
-- ✅ **Phase 6**: Documentation & Contracts (Complete)
-- 📊 **Total**: 278 tests passing | [REFACTOR_STATUS.md](REFACTOR_STATUS.md)
-- 📋 **Contracts**: [docs/TOOL_HANDLER_CONTRACTS.md](docs/TOOL_HANDLER_CONTRACTS.md)
-- 🔄 **Migration**: [docs/MIGRATION_GUIDE.md](docs/MIGRATION_GUIDE.md)
+This project is currently in test/beta mode.
 
-### Key Achievements
-- ✅ **Registry System**: TOOL_SPECS as single source of truth (14 tools)
-- ✅ **Structured Errors**: ToolError with standardized error codes
-- ✅ **Backward Compatible**: Parameter aliasing + graceful fallbacks
-- ✅ **Security**: Field filtering prevents data leaks
-- ✅ **Dataset Search**: Bounded retrieval (Scan → Confirm → Fetch)
-- ✅ **Prompt Caching**: 80-90% efficiency (WP6 FAST/DEEP, WP7 REALTIME/BATCH)
-- ✅ **Cost Savings**: 28-40% reduction (~$30K/year at scale)
-- ✅ **278 Tests**: Comprehensive coverage (112+28+35+70+33)
+Test model (Custom GPT):
 
-## 📜 Privacy policy
-- [Privacy policy](docs/shared/PRIVACY_POLICY.md)
+- [OmniFlow Personal Assistance (test)](https://chatgpt.com/g/g-69b01cec119481919adf992756bcde53-omniflow-personal-assistance)
 
----
+## What you can connect
 
-## Key features (start here)
+- `POST /api/tool_call_handler` - primary orchestration endpoint
+- `POST /api/read_many_blobs` - batch blob reads
+- `POST /api/save_interaction` - interaction log input for semantic processing
 
-- **Multi-user isolation** via `X-User-Id` header (`users/{user_id}/...` namespace in Blob).
-- **Deterministic tool orchestration** via `POST /api/tool_call_handler` (Responses tool-loop).
-- **Storage tools**: list/read/update/delete/upload + `read_many_blobs` (batch multi-read).
-- **Semantic pipeline (WP7)**: queue -> batch -> per-interaction semantic JSON artifacts -> manifest `index` (consumed by WP6).
-- **Hybrid context routing (WP6)**: FAST by default; DEEP available but **not always forceable deterministically** end-to-end.
+For full integration details, see:
 
----
+- `docs/shared/MCP_AND_QUASI_MCP.md`
 
-## API quick peek
+## Why quasi-MCP
 
-- `POST /api/tool_call_handler` - main orchestrator (Responses tool-loop)
-- `POST /api/read_many_blobs` - batch read (preferred over many single reads)
-- `POST /api/save_interaction` - raw interaction log (feeds WP7)
+- Single endpoint orchestration instead of one endpoint per tool
+- Registry-driven tool specs and argument normalization
+- Structured JSON errors and deterministic execution paths
+- Multi-user isolation via `X-User-Id` and namespaced storage
 
----
+## Current project layout
 
-## Current status (Patch 2.0)
+- `backend/` - Azure Functions backend (active in this repo)
+- `ai-chatbot/` - Next.js chat frontend
+- `frontend/` - Streamlit lab frontend (legacy/testing)
+- `docs/` - source-of-truth documentation
+- `tests/` - unit and e2e tests
 
-Task / Work Package | Status
----|---
-WP1 (Responses + dual runtime) | OK (Responses default)
-WP7 (Semantic indexer, batch-first) | OK (queue -> batch -> artifacts -> index)
-WP6 (Context builder + cache) | OK (note: e2e cannot deterministically force `DEEP`)
-WP2 (Next UI) | OK (Streamlit is legacy)
-WP9 (Reporting) | Available (local JSONL writer under `docs/workflow/wp9_reporting/`)
+## Quick start
 
-Legend: OK  X  Pending  Available/Needs constraints
+1. Install backend dependencies: `pip install -r backend/requirements.txt`
+2. Start Azurite: `azurite`
+3. Run functions locally: `cd backend && func start`
 
----
+Optional frontend runs:
 
-## 📁 Project Structure
+- Next.js app: `cd ai-chatbot && pnpm install && pnpm dev`
+- Streamlit lab UI: `cd frontend && streamlit run app.py`
 
-```
-OmniFlowBeta/
-├── backend/              # Azure Functions (legacy, deprecated)
-├── OmniFlowCentral/      # Azure Functions (App2, active deployment)
-├── ai-chatbot/           # Main UI (Next.js, actively maintained)
-├── frontend/             # Lab UI (Streamlit, for testing)
-├── data/                 # Local data files (gitignored)
-├── docs/                 # Documentation (selective tracking)
-├── experiments/          # Experimental features (untracked)
-├── external/             # External templates/dependencies
-├── logs/                 # Runtime logs (gitignored)
-├── scripts/              # Automation scripts
-├── tests/                # Test suites
-├── tools/                # Local tooling (gitignored)
-├── ui_archived/          # Archived UI proposals (gitignored)
-│   ├── ui_next_proposal/ # Future Next.js UI proposal
-│   └── ui_shiny/         # Archived Shiny UI
-└── .azurite/             # Azurite emulator data (gitignored)
-```
+## Key docs
 
----
-
-## Known limitations
-
-## Live demo
-
-- WP6: `DEEP` not deterministically forceable end-to-end.
-- Streamlit UI is legacy/LAB only (primary UI is Next.js).
-
----
-
-## Repo layout
-
-```
-OmniFlowBeta/
-  backend/      # Azure Functions (this folder is the function app root)
-  ui_next/      # Next.js UI (primary)
-  ai-chatbot/   # Next.js AI chat template (reference)
-  frontend/     # Streamlit UI (legacy LAB console)
-  docs/         # Documentation (source of truth)
-  scripts/      # Local helpers (ignored by default)
-```
-
----
-
-## Local run (recommended)
-
-1) Backend deps: `pip install -r backend/requirements.txt`
-2) Start Azurite (optional for local storage): `azurite`
-3) Start Functions: `cd backend && func start`
-4) Start Next UI: `cd ui_next && npm install && npm run dev`
-5) (Optional) Start Streamlit UI: `cd frontend && streamlit run app.py`
-
-### WP7 semantic batch helper
-
-Run `scripts/run_wp7_semantic_batch.ps1` (PowerShell) or `scripts/run_wp7_semantic_batch.py` (straight Python) to launch `tools/wp7_semantic_batch.py` asynchronously. Both scripts forward any extra flags (e.g., `--source`, `--chunks`, `--reasoning`) to the Python helper so your terminal stays free while extracting schema-ready WP7 packs.
-`tools/wp7_semantic_batch.py` also accepts:
-  - `--interactive` to adjust the source/chunk/model/config interactively before each job.
-  - `--debug` to turn on verbose logging (timestamps + DEBUG output).
-  - `--loop`/`--loop-interval` to keep processing batches until a stop flag is detected; pair it with `--stop-after-next-batch` (or invoke the script with that flag alone) to request the loop shuts down after its next completed run.
-To process the entire `Sesje/` archive in order, run `python scripts/wp7_batch/run.py`. The script walks every `.txt` in `C:\Users\Mariusz\OneDrive\Pulpit\ChatGPT\Historia\Sesje`, feeds each through `tools/wp7_semantic_batch.py` (two 5k chunks, schema output), and stores manifests/results under `data/wp7_batch/`. Add `--input-dir`, `--output-dir`, `--chunk-size`, `--chunks`, or `--max-output-tokens` if you need to override the defaults; use `--dry-run` for a preview. Use `--start-index` to resume from a specific transcript if you stopped earlier.
-
-If this saved you time, star the repo.
-
----
-
-## Docs
-
-- Doc index: `docs/README.md`
-- Patch 2.0 status: `docs/PATCH_2_STATUS.md`
-- Semantics (WP7): `docs/WP7_Indexer_Batch.md`
-- Context Builder (WP6): `docs/workflow/wp6_context_builder/README.md`
+- Docs index: `docs/README.md`
+- Quasi-MCP guide: `docs/shared/MCP_AND_QUASI_MCP.md`
 - Deployment: `docs/shared/DEPLOYMENT.md`
-- Tool usage playbook: `FUNCTION_CALLS_PLAYBOOK.md`
+- Tool call playbook: `FUNCTION_CALLS_PLAYBOOK.md`
+- Privacy policy: `docs/shared/PRIVACY_POLICY.md`
 - Changelog: `CHANGELOG.md`
 
----
+## Limitations
+
+- WP6 DEEP path is not deterministically forceable end-to-end in all scenarios.
+- Streamlit frontend is maintained as legacy/lab tooling.
 
 ## License
 
-MIT.
-
+MIT

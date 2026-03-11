@@ -7,9 +7,16 @@ The format is based on Keep a Changelog, and versioning is pragmatic (beta tags 
 ## Unreleased
 
 ### Added
+
 - README: API quick peek + known limitations + star callout.
 
-## v2.0.0-beta (Patch 2.0 baseline)
+### Fixed
+
+- Gmail OAuth re-consent flow now returns `authorize_url` even when token exists but calendar scope is missing.
+- Capability execution now accepts `params.account_slot` as a compatibility fallback when clients do not nest slot in `params.arguments`.
+- Inbox metadata enrichment now preserves the selected account slot for metadata fetches.
+
+## v2.0.0-beta (2026-03-11)
 
 Patch 2.0 focuses on deterministic agent orchestration and semantic/context foundations:
 
@@ -29,4 +36,3 @@ Docs:
 
 - Streamlit LAB UI + blob-first storage tools + single orchestrator endpoint.
 - Kept as historical reference in `docs/OmniFlow_Project_Summary_and_Next_Steps.md`.
-

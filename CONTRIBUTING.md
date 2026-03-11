@@ -6,6 +6,12 @@ Thank you for your interest in contributing to OmniFlow Beta! We welcome contrib
 
 ## How to Contribute
 
+Before opening a PR, read these governance files:
+
+- `.github/instructions/README.md`
+- `.github/skills/README.md`
+- `docs/shared/DOCS_STANDARD.md`
+
 ### Opening Issues
 
 We use GitHub Issues to track bugs, feature requests, and general questions. Before opening a new issue, please:
@@ -52,6 +58,11 @@ To ensure your changes don't break existing functionality, please run the tests 
 5. **Run tests**:
    ```bash
    pytest --verbose --cov=. --cov-report=term-missing
+   ```
+
+6. **Run focused tests for touched paths** (recommended):
+   ```bash
+   pytest tests/unit -q
    ```
 
 Alternatively, you can use the connection string for Azurite with explicit endpoints:
@@ -118,6 +129,7 @@ Before submitting a PR, ensure:
 - [ ] Code follows the project's style guidelines
 - [ ] New features include appropriate tests
 - [ ] Documentation is updated (if applicable)
+- [ ] Quasi-MCP contract references are updated when capability contracts change
 - [ ] Commit messages are clear and descriptive
 - [ ] No secrets or sensitive data are committed
 - [ ] User isolation and security are maintained

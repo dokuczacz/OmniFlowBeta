@@ -1,30 +1,38 @@
 # OmniFlowBeta Documentation Index
 
-This folder is the **source of truth** for project documentation.
+This folder is the source of truth for OmniFlowBeta documentation.
 
-If you are updating docs, follow `docs/shared/DOCS_STANDARD.md`.
+If you update docs, follow `docs/shared/DOCS_STANDARD.md`.
 
-## Quick map (start here)
+## Start here
 
-- Patch 2.0 status (source of truth): `docs/PATCH_2_STATUS.md`
-- Legacy handover (historical): `docs/OmniFlow_Project_Summary_and_Next_Steps.md`
-- WP6 Context Builder (schema + contract): `docs/workflow/wp6_context_builder/README.md`
-- WP7 Semantic Indexer (batch-first): `docs/WP7_Indexer_Batch.md`
-- Deployment (backend + UIs): `docs/shared/DEPLOYMENT.md`
-- User isolation / namespacing: `docs/shared/USER_MANAGEMENT.md`
-- Agent↔agent exchange contract (JSONL): `docs/shared/AGENT_EXCHANGE_TABLE.template.jsonl.md`
-- WP9 reporting (local JSONL writer): `docs/workflow/wp9_reporting/README.md`
+- Project landing: `README.md`
+- Quasi-MCP integration guide: `docs/shared/MCP_AND_QUASI_MCP.md`
+- Deployment guide: `docs/shared/DEPLOYMENT.md`
+- Tool-call playbook: `FUNCTION_CALLS_PLAYBOOK.md`
+
+## Core architecture docs
+
+- Patch 2.0 status: `docs/PATCH_2_STATUS.md`
+- WP6 context builder: `docs/workflow/wp6_context_builder/README.md`
+- WP7 semantic indexer: `docs/WP7_Indexer_Batch.md`
+- WP9 reporting writer: `docs/workflow/wp9_reporting/README.md`
+- User isolation and namespacing: `docs/shared/USER_MANAGEMENT.md`
+
+## Governance and shared references
+
+- Documentation standard: `docs/shared/DOCS_STANDARD.md`
+- Privacy policy: `docs/shared/PRIVACY_POLICY.md`
+- Discussion templates: `docs/shared/GITHUB_DISCUSSIONS_TEMPLATES.md`
 
 ## Environment templates
 
 - Root env template: `.env.example`
 - Azure Functions local template: `backend/local.settings.template.json`
-- Next UI env template: `ui_next/.env.example`
-- AI chat template env: `ai-chatbot/.env.example` and `ai-chatbot/.env.local.example`
-- Streamlit (legacy) secrets template: `frontend/.streamlit/secrets.toml.example`
+- AI chatbot env templates: `ai-chatbot/.env.example`, `ai-chatbot/.env.local.example`
+- Streamlit secrets template: `frontend/.streamlit/secrets.toml.example`
 
-## UI note (Patch 2.0)
+## UI status
 
-- Product UI (Next.js): `ui_next/` (primary)
-- AI chat template (reference): `ai-chatbot/`
-- Legacy LAB UI (Streamlit): `frontend/`
+- Active Next.js app: `ai-chatbot/`
+- Legacy/lab Streamlit app: `frontend/`

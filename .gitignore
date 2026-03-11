@@ -27,6 +27,8 @@ backend/local.settings.json
 
 # GitHub agent instructions (keep local by default)
 .github/instructions/
+!.github/instructions/
+!.github/instructions/README.md
 
 # Logs
 *.log
@@ -114,6 +116,7 @@ docs/*
 !docs/workflow/wp9_reporting/schema_v1.py
 docs/shared/*
 !docs/shared/README.md
+!docs/shared/MCP_AND_QUASI_MCP.md
 !docs/shared/USER_MANAGEMENT.md
 !docs/shared/DEPLOYMENT.md
 !docs/shared/DEMO.md

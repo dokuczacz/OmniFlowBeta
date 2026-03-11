@@ -1,0 +1,14 @@
+# Global default owner
+* @dokuczacz
+
+# Backend and contracts
+/backend/ @dokuczacz
+/docs/shared/ @dokuczacz
+/tests/ @dokuczacz
+
+# Frontends
+/ai-chatbot/ @dokuczacz
+/frontend/ @dokuczacz
+
+# GitHub governance
+/.github/ @dokuczacz
