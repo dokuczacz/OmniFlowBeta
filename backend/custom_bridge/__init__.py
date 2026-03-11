@@ -243,6 +243,12 @@ def handle_ensure_authorized(user_id: str, payload: Dict[str, Any], access_token
         if needs_reauth:
             result["needs_reauth"] = True
             result["needs_reauth_reason"] = "calendar_scope_missing"
+            if GmailOAuthConfig.has_credentials():
+                reauth_state = str(uuid.uuid4())
+                login_hint = payload.get("login_hint")
+                GmailTokenStore.save_state(reauth_state, user_id, slot=account_slot)
+                result["authorize_url"] = GmailOAuthConfig.authorize_url(reauth_state, login_hint=login_hint)
+                result["reauth_state"] = reauth_state
         return result
     if not GmailOAuthConfig.has_credentials():
         raise ValueError("Gmail OAuth configuration is incomplete")
