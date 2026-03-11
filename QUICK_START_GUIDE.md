@@ -22,7 +22,7 @@ Transforms OmniFlowBeta's Tool Handler from a monolithic 3500+ line file into a 
 ## 📚 Read This First
 
 ### For Quick Overview (5 minutes)
-👉 **PLANNING_SUMMARY.md** - High-level summary, status, next steps
+👉 **IMPLEMENTATION_PLAN_UPDATED.md** - High-level summary, status, next steps
 
 ### For Full Understanding (30 minutes)
 👉 **IMPLEMENTATION_PLAN_UPDATED.md** - Complete 6-phase plan with details
@@ -402,7 +402,7 @@ Once Phase 1 is complete and approved:
 
 **Need Approval?** → Review IMPLEMENTATION_PLAN_UPDATED.md with operator
 
-**Need Context?** → Read PLANNING_SUMMARY.md and ARCHITECTURE_ANALYSIS.md
+**Need Context?** → Read IMPLEMENTATION_PLAN_UPDATED.md and ARCHITECTURE_ANALYSIS.md
 
 ---
 
