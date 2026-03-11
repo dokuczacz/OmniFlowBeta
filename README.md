@@ -8,6 +8,20 @@ This repository exposes a quasi-MCP pattern: one deterministic orchestration end
 
 This project is currently in test/beta mode.
 
+## Beta modes
+
+### 1) Native UI beta (full feature path)
+
+Use this mode when you want the full OmniFlow experience, including Context Builder behavior and end-to-end orchestration features.
+
+- Frontend: `ai-chatbot/`
+- Backend: `backend/`
+- Includes WP6 context-building flow and broader feature coverage
+
+### 2) Custom GPT beta (integration path)
+
+Use this mode when you want to connect through OpenAPI/tool calling without running the full native UI stack.
+
 Test model (Custom GPT):
 
 - [OmniFlow Personal Assistance (test)](https://chatgpt.com/g/g-69b01cec119481919adf992756bcde53-omniflow-personal-assistance)
@@ -47,6 +61,10 @@ Optional frontend runs:
 
 - Next.js app: `cd ai-chatbot && pnpm install && pnpm dev`
 - Streamlit lab UI: `cd frontend && streamlit run app.py`
+
+For Custom GPT setup instead of Native UI, follow:
+
+- `docs/shared/MCP_AND_QUASI_MCP.md`
 
 ## Key docs
 

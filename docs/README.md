@@ -11,6 +11,11 @@ If you update docs, follow `docs/shared/DOCS_STANDARD.md`.
 - Deployment guide: `docs/shared/DEPLOYMENT.md`
 - Tool-call playbook: `FUNCTION_CALLS_PLAYBOOK.md`
 
+## Beta modes
+
+- Native UI beta (full Context Builder/features): `ai-chatbot/` + `backend/`
+- Custom GPT beta (integration path): see `docs/shared/MCP_AND_QUASI_MCP.md`
+
 ## Core architecture docs
 
 - Patch 2.0 status: `docs/PATCH_2_STATUS.md`

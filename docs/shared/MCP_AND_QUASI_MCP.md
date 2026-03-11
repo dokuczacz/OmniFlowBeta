@@ -4,9 +4,31 @@
 
 This integration surface is beta/test.
 
+OmniFlow Beta currently has two supported beta modes:
+
+1. Native UI beta (full feature path with Context Builder)
+2. Custom GPT beta (OpenAPI integration path)
+
 Test model:
 
-- https://chatgpt.com/g/g-69b01cec119481919adf992756bcde53-omniflow-personal-assistance
+- [OmniFlow Personal Assistance (test)](https://chatgpt.com/g/g-69b01cec119481919adf992756bcde53-omniflow-personal-assistance)
+
+## Beta mode selection
+
+### 1. Native UI beta (recommended for full capability)
+
+This mode is intended for full product behavior and broadest feature coverage.
+
+- UI: `ai-chatbot/`
+- Backend orchestration: `backend/`
+- Includes Context Builder path (WP6) and end-to-end runtime behaviors
+
+### 2. Custom GPT beta (integration-focused)
+
+This mode is intended for tool-calling integrations via OpenAPI.
+
+- Best for external clients and lightweight agent integration
+- Uses the same backend orchestration endpoint, but without full native UI surface
 
 ## What "quasi-MCP" means here
 
@@ -34,14 +56,20 @@ It is MCP-like in behavior, but not a full MCP transport implementation.
 
 ## Connection paths
 
-### 1. Custom GPT
+### 1. Native UI
+
+1. Run the backend (`cd backend && func start`).
+2. Run the UI (`cd ai-chatbot && pnpm install && pnpm dev`).
+3. Validate full flow including context assembly and capability execution.
+
+### 2. Custom GPT
 
 1. Import OpenAPI schema from `docs/shared/tool_call_handler_openapi.json`.
 2. Configure server URL to your deployed function app.
 3. Provide function key/auth as required by your deployment.
 4. Start with `mail.status`, `mail.authorize`, and `mail.inbox.list` for smoke tests.
 
-### 2. Generic HTTP clients / agents
+### 3. Generic HTTP clients / agents
 
 - Send `action=capability_exec` payloads to `/api/tool_call_handler`.
 - Pass user namespace via `X-User-Id` (or explicit user_id in payload if supported).
