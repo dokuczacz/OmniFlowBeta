@@ -12,6 +12,8 @@ import azure.functions as func
 import requests
 
 from shared.gmail_oauth import GmailOAuthConfig, GmailTokenStore
+from shared.gmail_client import GmailClient
+from shared.azure_client import AzureBlobClient
 
 
 def _response(payload: Dict[str, Any], status_code: int = 200) -> func.HttpResponse:
@@ -70,10 +72,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     if not state_record:
         return _html("Unknown or expired 'state'", status_code=400)
     user_id = str(state_record.get("user_id") or "default").strip() or "default"
+    account_slot = str(state_record.get("slot") or "primary").strip() or "primary"
 
     try:
         token_payload = _exchange_code(code)
-        GmailTokenStore.save_tokens(user_id, token_payload)
+        GmailTokenStore.save_tokens(user_id, token_payload, slot=account_slot)
         GmailTokenStore.delete_state(state)
     except ValueError as exc:
         return _html(str(exc), status_code=400)
@@ -81,4 +84,27 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         logging.error("gmail_oauth_callback failed: %s", exc, exc_info=True)
         return _html("Internal error", status_code=500)
 
+    _try_prefetch_inbox(user_id, account_slot)
     return _html("OAuth completed successfully", status_code=200)
+
+
+def _try_prefetch_inbox(user_id: str, account_slot: str) -> None:
+    """Non-blocking: fetch 20 inbox messages and cache to users/{user_id}/mail/inbox_cache.json."""
+    try:
+        gmail = GmailClient(user_id, account_slot=account_slot)
+        result = gmail.request("get", "messages", params={"maxResults": 20, "labelIds": ["INBOX"]})
+        messages = result.json().get("messages", [])
+        cache = {
+            "fetched_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat() + "Z",
+            "account_slot": account_slot,
+            "messages": messages,
+            "count": len(messages),
+        }
+        blob_client = AzureBlobClient.get_blob_client("mail/inbox_cache.json", user_id)
+        blob_client.upload_blob(
+            json.dumps(cache, ensure_ascii=False).encode("utf-8"),
+            overwrite=True,
+        )
+        logging.info("gmail_oauth_callback: inbox prefetch saved %d messages for %s/%s", len(messages), user_id, account_slot)
+    except Exception as exc:
+        logging.warning("gmail_oauth_callback: inbox prefetch failed (non-blocking): %s", exc)

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "OmniFlow Personal Assistance API (Single Endpoint)",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "description": "Single-endpoint contract for both native UI and Custom GPT. Public contract is capability-level (personal assistance). Internal low-level tools are hidden behind tool_call_handler orchestration."
   },
   "servers": [
@@ -38,6 +38,12 @@
           "mail.send",
           "mail.trash",
           "mail.delete",
+          "mail.accounts.list",
+          "calendar.events.list",
+          "calendar.events.get",
+          "calendar.events.create",
+          "calendar.events.update",
+          "calendar.events.delete",
           "planning.build_day_plan",
           "memory.interaction.save",
           "memory.interaction.list",
@@ -62,7 +68,7 @@
           "arguments": {
             "type": "object",
             "additionalProperties": true,
-            "description": "Capability-specific payload. For memory.interaction.save provide either (user_message + assistant_response) or (role + content). Optional per-call user override can be passed as arguments.user_id."
+            "description": "Capability-specific payload. For memory.interaction.save provide either (user_message + assistant_response) or (role + content). Optional per-call user override can be passed as arguments.user_id. For mail/calendar capabilities you can pass arguments.account_slot = primary|secondary."
           }
         },
         "required": [
@@ -233,6 +239,56 @@
                     }
                   }
                 },
+                "mail_accounts_list": {
+                  "summary": "List connected Gmail accounts (primary/secondary)",
+                  "value": {
+                    "action": "capability_exec",
+                    "user_id": "mario_test",
+                    "params": {
+                      "capability": "mail.accounts.list",
+                      "arguments": {}
+                    }
+                  }
+                },
+                "calendar_events_list": {
+                  "summary": "List upcoming primary calendar events",
+                  "value": {
+                    "action": "capability_exec",
+                    "user_id": "mario_test",
+                    "params": {
+                      "capability": "calendar.events.list",
+                      "arguments": {
+                        "account_slot": "primary",
+                        "max_results": 10,
+                        "time_min": "2026-03-11T00:00:00Z",
+                        "time_max": "2026-03-18T00:00:00Z"
+                      }
+                    }
+                  }
+                },
+                "calendar_events_create": {
+                  "summary": "Create calendar event",
+                  "value": {
+                    "action": "capability_exec",
+                    "user_id": "mario_test",
+                    "params": {
+                      "capability": "calendar.events.create",
+                      "confirm": true,
+                      "arguments": {
+                        "account_slot": "primary",
+                        "summary": "Project sync",
+                        "description": "Weekly team sync",
+                        "start": {
+                          "dateTime": "2026-03-12T09:00:00+01:00"
+                        },
+                        "end": {
+                          "dateTime": "2026-03-12T09:30:00+01:00"
+                        },
+                        "location": "Teams"
+                      }
+                    }
+                  }
+                },
                 "preferences_get": {
                   "summary": "Read long-term user preferences",
                   "value": {
@@ -383,6 +439,60 @@
                         "scope": "https://mail.google.com/",
                         "saved_at": "2026-03-10T16:13:43Z",
                         "expires_at": "2026-03-10T17:13:42Z"
+                      },
+                      "error": null,
+                      "meta": {}
+                    }
+                  },
+                  "mail_accounts_list_success": {
+                    "summary": "mail.accounts.list success",
+                    "value": {
+                      "schema_version": "omniflow.capability_exec.v1",
+                      "status": "success",
+                      "action": "capability_exec",
+                      "capability": "mail.accounts.list",
+                      "result": {
+                        "action": "gmail_accounts_list",
+                        "user_id": "mario_test",
+                        "accounts": [
+                          {
+                            "slot": "primary",
+                            "email_address": "mario.primary@gmail.com",
+                            "saved_at": "2026-03-11T09:00:00Z",
+                            "expires_at": "2026-03-11T10:00:00Z",
+                            "has_calendar_scope": true
+                          },
+                          {
+                            "slot": "secondary",
+                            "email_address": "mario.secondary@gmail.com",
+                            "saved_at": "2026-03-11T09:10:00Z",
+                            "expires_at": "2026-03-11T10:10:00Z",
+                            "has_calendar_scope": true
+                          }
+                        ]
+                      },
+                      "error": null,
+                      "meta": {}
+                    }
+                  },
+                  "calendar_events_list_success": {
+                    "summary": "calendar.events.list success",
+                    "value": {
+                      "schema_version": "omniflow.capability_exec.v1",
+                      "status": "success",
+                      "action": "capability_exec",
+                      "capability": "calendar.events.list",
+                      "result": {
+                        "action": "calendar_list_events",
+                        "status": "ok",
+                        "account_slot": "primary",
+                        "events": [
+                          {
+                            "id": "evt_123",
+                            "summary": "Project sync"
+                          }
+                        ],
+                        "count": 1
                       },
                       "error": null,
                       "meta": {}

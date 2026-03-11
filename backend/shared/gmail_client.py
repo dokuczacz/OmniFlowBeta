@@ -6,16 +6,20 @@ from typing import Any, Dict, Optional
 
 import requests
 
-from .gmail_oauth import GmailOAuthConfig, GmailTokenStore
+from .gmail_oauth import GmailOAuthConfig, GmailTokenStore, VALID_SLOTS
 
 
 class GmailClient:
     BASE_URL = "https://gmail.googleapis.com/gmail/v1/users/me"
+    CALENDAR_BASE_URL = "https://www.googleapis.com/calendar/v3"
 
-    def __init__(self, user_id: str, *, access_token: Optional[str] = None):
+    def __init__(self, user_id: str, *, access_token: Optional[str] = None, account_slot: Optional[str] = None):
         self.user_id = user_id
+        self.account_slot = (account_slot or "primary").strip().lower()
+        if self.account_slot not in VALID_SLOTS:
+            self.account_slot = "primary"
         self._external_access_token = access_token.strip() if isinstance(access_token, str) and access_token.strip() else None
-        self.tokens = GmailTokenStore.load_tokens(user_id) if not self._external_access_token else None
+        self.tokens = GmailTokenStore.load_tokens(user_id, self.account_slot) if not self._external_access_token else None
         if not self._external_access_token and not self.tokens:
             raise ValueError("Gmail tokens not found for user")
 
@@ -56,8 +60,8 @@ class GmailClient:
         response.raise_for_status()
         refreshed = response.json()
         refreshed.setdefault("refresh_token", refresh_token)
-        GmailTokenStore.save_tokens(self.user_id, refreshed)
-        self.tokens = GmailTokenStore.load_tokens(self.user_id)
+        GmailTokenStore.save_tokens(self.user_id, refreshed, self.account_slot)
+        self.tokens = GmailTokenStore.load_tokens(self.user_id, self.account_slot)
 
     def _headers(self) -> Dict[str, str]:
         token = self._ensure_access_token()
@@ -65,6 +69,13 @@ class GmailClient:
 
     def request(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None, json: Optional[Dict[str, Any]] = None) -> requests.Response:
         url = f"{self.BASE_URL}/{path.lstrip('/')}"
+        response = requests.request(method, url, params=params, json=json, headers=self._headers(), timeout=20)
+        response.raise_for_status()
+        return response
+
+    def calendar_request(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None, json: Optional[Dict[str, Any]] = None) -> requests.Response:
+        """Make a Google Calendar API v3 request using the same token as Gmail."""
+        url = f"{self.CALENDAR_BASE_URL}/{path.lstrip('/')}"
         response = requests.request(method, url, params=params, json=json, headers=self._headers(), timeout=20)
         response.raise_for_status()
         return response

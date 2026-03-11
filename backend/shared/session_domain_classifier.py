@@ -57,6 +57,16 @@ _PREFIX_DOMAIN: Dict[str, str] = {
     "system.":                      "OPS",
     "mail.status":                  "OPS",
     "mail.authorize":               "OPS",
+    "mail.accounts.":               "OPS",
+
+    # Calendar read → PLAN
+    "calendar.events.list":         "PLAN",
+    "calendar.events.get":          "PLAN",
+
+    # Calendar write → ACT
+    "calendar.events.create":       "ACT",
+    "calendar.events.update":       "ACT",
+    "calendar.events.delete":       "ACT",
 
     # Session read-only (OPS)
     "memory.session.summary.get":   "OPS",
@@ -80,6 +90,9 @@ _STATE_MUTATING: FrozenSet[str] = frozenset([
     "planning.build_day_plan",
     "memory.preferences.update",
     "memory.interaction.save",
+    "calendar.events.create",
+    "calendar.events.update",
+    "calendar.events.delete",
 ])
 
 

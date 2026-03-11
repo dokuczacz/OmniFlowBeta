@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "OmniFlow Custom Gmail Bridge (generated)",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "Auto-generated schema reflecting ACTION_HANDLERS."
   },
   "servers": [
@@ -32,7 +32,13 @@
           "gmail_get",
           "gmail_trash",
           "gmail_delete",
-          "gmail_attachment"
+          "gmail_attachment",
+          "gmail_accounts_list",
+          "calendar_list_events",
+          "calendar_get_event",
+          "calendar_create_event",
+          "calendar_update_event",
+          "calendar_delete_event"
         ]
       },
       "BridgeRequest": {
