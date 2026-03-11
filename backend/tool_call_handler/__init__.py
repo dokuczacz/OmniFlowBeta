@@ -5137,7 +5137,11 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                 message_obj: Dict[str, Any] = {}
                 if idx < metadata_limit:
                     try:
-                        got = _bridge_action("gmail_get", str(effective_user_id), {"message_id": mid, "format": "metadata"})
+                        got = _bridge_action(
+                            "gmail_get",
+                            str(effective_user_id),
+                            {"message_id": mid, "format": "metadata", "account_slot": account_slot},
+                        )
                         message_obj = dict(got.get("message") or {}) if isinstance(got, dict) else {}
                     except Exception:
                         message_obj = {}
