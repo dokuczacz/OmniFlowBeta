@@ -26,8 +26,7 @@ backend/local.settings.json
 .vscode/
 
 # GitHub agent instructions (keep local by default)
-.github/instructions/
-!.github/instructions/
+.github/instructions/*
 !.github/instructions/README.md
 
 # Logs
