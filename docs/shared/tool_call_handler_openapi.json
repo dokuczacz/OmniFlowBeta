@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "OmniFlow Personal Assistance API (Single Endpoint)",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "description": "Single-endpoint contract for both native UI and Custom GPT. Public contract is capability-level (personal assistance). Internal low-level tools are hidden behind tool_call_handler orchestration."
   },
   "servers": [
@@ -43,7 +43,9 @@
           "memory.interaction.list",
           "memory.preferences.get",
           "memory.preferences.update",
-          "system.now"
+          "system.now",
+          "memory.session.summary.get",
+          "memory.session.events.list"
         ]
       },
       "CapabilityExecParams": {
@@ -300,6 +302,31 @@
                     }
                   }
                 },
+                "session_summary_get": {
+                  "summary": "Get session summary for current day",
+                  "value": {
+                    "action": "capability_exec",
+                    "user_id": "mario_test",
+                    "params": {
+                      "capability": "memory.session.summary.get",
+                      "arguments": {}
+                    }
+                  }
+                },
+                "session_events_list": {
+                  "summary": "List recent session events",
+                  "value": {
+                    "action": "capability_exec",
+                    "user_id": "mario_test",
+                    "params": {
+                      "capability": "memory.session.events.list",
+                      "arguments": {
+                        "limit": 10,
+                        "offset": 0
+                      }
+                    }
+                  }
+                },
                 "ui_chat": {
                   "summary": "Native UI chat",
                   "value": {
@@ -422,6 +449,59 @@
                         "status": "success",
                         "saved": true,
                         "interaction_id": "INT_20260310_200001_123456"
+                      },
+                      "error": null,
+                      "meta": {}
+                    }
+                  },
+                  "session_summary_success": {
+                    "summary": "memory.session.summary.get success",
+                    "value": {
+                      "schema_version": "omniflow.capability_exec.v1",
+                      "status": "success",
+                      "action": "capability_exec",
+                      "capability": "memory.session.summary.get",
+                      "result": {
+                        "session_id": "mario_test_20260311",
+                        "user_id": "mario_test",
+                        "event_count": 12,
+                        "domains_touched": ["ACT", "KNOW", "PREF"],
+                        "artifacts_updated": ["users/mario_test/tasks/TM.json"],
+                        "open_loops": [],
+                        "state_changed_count": 3,
+                        "last_event_utc": "2026-03-11T14:22:00+00:00",
+                        "events_included": 12
+                      },
+                      "error": null,
+                      "meta": {}
+                    }
+                  },
+                  "session_events_list_success": {
+                    "summary": "memory.session.events.list success",
+                    "value": {
+                      "schema_version": "omniflow.capability_exec.v1",
+                      "status": "success",
+                      "action": "capability_exec",
+                      "capability": "memory.session.events.list",
+                      "result": {
+                        "events": [
+                          {
+                            "schema_version": "omniflow.session_manifest.v1",
+                            "event_id": "a1b2c3d4-...",
+                            "session_id": "mario_test_20260311",
+                            "user_id": "mario_test",
+                            "timestamp_utc": "2026-03-11T14:22:00+00:00",
+                            "capability": "task.create",
+                            "domains_touched": ["ACT"],
+                            "state_changed": true,
+                            "gpt_note": "task_id=TASK_001",
+                            "artifacts_updated": [],
+                            "open_loops": []
+                          }
+                        ],
+                        "returned_count": 1,
+                        "limit": 20,
+                        "offset": 0
                       },
                       "error": null,
                       "meta": {}

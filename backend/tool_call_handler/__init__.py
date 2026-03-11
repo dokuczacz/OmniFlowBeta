@@ -6,7 +6,7 @@ import sys
 import time
 import re
 import hashlib
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Optional
 import uuid
 
 try:
@@ -49,6 +49,13 @@ except Exception:
     detach_file_handler = None
 from shared.http_client import requests_get, requests_post
 from shared.mock_agent import build_mock_agent_response, mock_marker, mock_user_id
+
+try:
+    from shared.session_manifest import build_session_event, append_session_event
+    from shared.session_domain_classifier import classify_capability as _classify_cap
+    SESSION_MANIFEST_AVAILABLE = True
+except Exception:  # pragma: no cover
+    SESSION_MANIFEST_AVAILABLE = False
 
 # Phase 2: Import registry-driven dispatch pipeline
 try:
@@ -5021,6 +5028,55 @@ def _bridge_action(action: str, user_id: str, payload: Dict[str, Any]) -> Dict[s
     return handler(str(user_id), dict(payload or {}), None)
 
 
+def _try_record_session_event(
+    user_id: str,
+    params: Dict[str, Any],
+    resp_body: Dict[str, Any],
+    resp_status: int,
+    *,
+    thread_id: Optional[str] = None,
+    interaction_id: Optional[str] = None,
+    request_id: Optional[str] = None,
+) -> None:
+    """Fire-and-forget session event append. Never raises."""
+    if not SESSION_MANIFEST_AVAILABLE:
+        return
+    try:
+        cap = str((params or {}).get("capability") or "").strip()
+        if not cap:
+            return
+        _, is_mutating = _classify_cap(cap)
+        # state_changed: mutating capability + success response
+        state_changed = is_mutating and (resp_status == 200)
+        result = (resp_body or {}).get("result") or {}
+        artifacts_updated: List[str] = []
+        if isinstance(result, dict) and result.get("blob_name"):
+            artifacts_updated = [str(result["blob_name"])]
+        gpt_note: Optional[str] = None
+        if state_changed:
+            # Build a minimal note from result keys for GPT context
+            note_parts = []
+            if isinstance(result, dict):
+                for k in ("interaction_id", "updated_keys", "message_id", "task_id"):
+                    v = result.get(k)
+                    if v:
+                        note_parts.append(f"{k}={v}")
+            gpt_note = "; ".join(note_parts) if note_parts else None
+        event = build_session_event(
+            user_id=user_id,
+            capability=cap,
+            thread_id=thread_id,
+            state_changed=state_changed,
+            artifacts_updated=artifacts_updated,
+            gpt_note=gpt_note,
+            interaction_id=interaction_id,
+            request_id=request_id,
+        )
+        append_session_event(user_id, event)
+    except Exception as exc:  # pragma: no cover
+        logging.warning("_try_record_session_event: %s", exc)
+
+
 def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
     capability = str((params or {}).get("capability") or "").strip()
     arguments = (params or {}).get("arguments") or {}
@@ -5426,6 +5482,22 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             else:
                 result = {"interactions": [], "total_count": 0, "returned_count": 0, "offset": 0, "limit": int(history_params.get("limit") or 20), "raw": parsed}
             return _capability_response("success", capability, result=result), 200
+
+        if capability == "memory.session.summary.get":
+            if not SESSION_MANIFEST_AVAILABLE:
+                return _capability_response("error", capability, error={"code": "UNSUPPORTED_CAPABILITY", "message": "Session manifest not available"}), 400
+            from shared.session_manifest import build_session_summary
+            summary = build_session_summary(str(effective_user_id))
+            return _capability_response("success", capability, result=summary), 200
+
+        if capability == "memory.session.events.list":
+            if not SESSION_MANIFEST_AVAILABLE:
+                return _capability_response("error", capability, error={"code": "UNSUPPORTED_CAPABILITY", "message": "Session manifest not available"}), 400
+            from shared.session_manifest import list_session_events
+            limit = int(arguments.get("limit", 20) or 20)
+            offset = int(arguments.get("offset", 0) or 0)
+            events = list_session_events(str(effective_user_id), limit=max(1, min(100, limit)), offset=max(0, offset))
+            return _capability_response("success", capability, result={"events": events, "returned_count": len(events), "limit": limit, "offset": offset}), 200
 
         return _capability_response(
             "error",
@@ -5961,7 +6033,16 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         # Deterministic capability layer for Custom GPT schema-first integration.
         # This path intentionally avoids legacy context builder/composer reads.
         if action == "capability_exec":
-            resp_body, resp_status = _handle_capability_exec(str(user_id), params if isinstance(params, dict) else {})
+            capability_params = params if isinstance(params, dict) else {}
+            resp_body, resp_status = _handle_capability_exec(str(user_id), capability_params)
+            _try_record_session_event(
+                str(user_id),
+                capability_params,
+                resp_body,
+                int(resp_status),
+                thread_id=str(body.get("thread_id") or "").strip() or None,
+                request_id=str(body.get("request_id") or "").strip() or None,
+            )
             return _make_response(resp_body, status_code=int(resp_status))
 
         def _is_local_request() -> bool:
