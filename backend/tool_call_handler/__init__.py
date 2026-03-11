@@ -5100,24 +5100,28 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
     # Some clients pass user_id inside params.arguments; prefer it when present.
     effective_user_id = str(arguments.get("user_id") or user_id or "").strip() or "default"
 
+    # Compatibility fallback for clients that send account_slot outside params.arguments.
+    def _resolve_account_slot(default: str = "primary") -> str:
+        return str(arguments.get("account_slot") or (params or {}).get("account_slot") or default).strip() or default
+
     try:
         if capability == "system.now":
             now_utc = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
             return _capability_response("success", capability, result={"current_time_utc": now_utc}), 200
 
         if capability == "mail.status":
-            account_slot = str(arguments.get("account_slot") or "primary").strip() or "primary"
+            account_slot = _resolve_account_slot()
             result = _bridge_action("oauth_status", str(effective_user_id), {"account_slot": account_slot})
             return _capability_response("success", capability, result=result), 200
 
         if capability == "mail.authorize":
-            account_slot = str(arguments.get("account_slot") or "primary").strip() or "primary"
+            account_slot = _resolve_account_slot()
             result = _bridge_action("ensure_authorized", str(effective_user_id), {"login_hint": arguments.get("login_hint"), "account_slot": account_slot})
             return _capability_response("success", capability, result=result), 200
 
         if capability == "mail.inbox.list":
             max_results = int(arguments.get("max_results", 20) or 20)
-            account_slot = str(arguments.get("account_slot") or "primary").strip() or "primary"
+            account_slot = _resolve_account_slot()
             payload = {"max_results": max(1, min(50, max_results)), "q": arguments.get("q"), "label": arguments.get("label"), "account_slot": account_slot}
             result = _bridge_action("gmail_list", str(effective_user_id), payload)
             messages = list(result.get("messages") or []) if isinstance(result, dict) else []
@@ -5146,14 +5150,14 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             message_id = str(arguments.get("message_id") or "").strip()
             if not message_id:
                 return _capability_response("error", capability, error={"code": "INVALID_REQUEST", "message": "arguments.message_id is required"}), 400
-            account_slot = str(arguments.get("account_slot") or "primary").strip() or "primary"
+            account_slot = _resolve_account_slot()
             payload = {"message_id": message_id, "format": str(arguments.get("format") or "full"), "account_slot": account_slot}
             result = _bridge_action("gmail_get", str(effective_user_id), payload)
             return _capability_response("success", capability, result=result), 200
 
         if capability == "mail.summarize":
             max_results = int(arguments.get("max_results", 10) or 10)
-            account_slot = str(arguments.get("account_slot") or "primary").strip() or "primary"
+            account_slot = _resolve_account_slot()
             list_result = _bridge_action("gmail_list", str(effective_user_id), {"max_results": max(1, min(20, max_results)), "account_slot": account_slot})
             ids = [str(x.get("id")) for x in (list_result.get("messages") or []) if isinstance(x, dict) and x.get("id")]
             summary_items: list[dict] = []
@@ -5177,7 +5181,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                     capability,
                     error={"code": "CONFIRMATION_REQUIRED", "message": "Set params.confirm=true to send email."},
                 ), 409
-            account_slot = str(arguments.get("account_slot") or "primary").strip() or "primary"
+            account_slot = _resolve_account_slot()
             to = arguments.get("to")
             if isinstance(to, str):
                 to = [to]
@@ -5208,7 +5212,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             message_id = str(arguments.get("message_id") or "").strip()
             if not message_id:
                 return _capability_response("error", capability, error={"code": "INVALID_REQUEST", "message": "arguments.message_id is required"}), 400
-            account_slot = str(arguments.get("account_slot") or "primary").strip() or "primary"
+            account_slot = _resolve_account_slot()
             action = "gmail_trash" if capability == "mail.trash" else "gmail_delete"
             result = _bridge_action(action, str(effective_user_id), {"message_id": message_id, "account_slot": account_slot})
             return _capability_response("success", capability, result=result), 200
@@ -5218,7 +5222,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             return _capability_response("success", capability, result=result), 200
 
         if capability == "calendar.events.list":
-            account_slot = str(arguments.get("account_slot") or "primary").strip() or "primary"
+            account_slot = _resolve_account_slot()
             payload = {
                 "account_slot": account_slot,
                 "time_min": arguments.get("time_min"),
@@ -5232,14 +5236,14 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             event_id = str(arguments.get("event_id") or "").strip()
             if not event_id:
                 return _capability_response("error", capability, error={"code": "INVALID_REQUEST", "message": "arguments.event_id is required"}), 400
-            account_slot = str(arguments.get("account_slot") or "primary").strip() or "primary"
+            account_slot = _resolve_account_slot()
             result = _bridge_action("calendar_get_event", str(effective_user_id), {"event_id": event_id, "account_slot": account_slot})
             return _capability_response("success", capability, result=result), 200
 
         if capability == "calendar.events.create":
             if not confirm:
                 return _capability_response("error", capability, error={"code": "CONFIRMATION_REQUIRED", "message": "Set params.confirm=true to create calendar event."}), 409
-            account_slot = str(arguments.get("account_slot") or "primary").strip() or "primary"
+            account_slot = _resolve_account_slot()
             payload = {k: arguments[k] for k in ("summary", "description", "start", "end", "attendees", "location", "recurrence") if k in arguments}
             payload["account_slot"] = account_slot
             result = _bridge_action("calendar_create_event", str(effective_user_id), payload)
@@ -5249,7 +5253,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             event_id = str(arguments.get("event_id") or "").strip()
             if not event_id:
                 return _capability_response("error", capability, error={"code": "INVALID_REQUEST", "message": "arguments.event_id is required"}), 400
-            account_slot = str(arguments.get("account_slot") or "primary").strip() or "primary"
+            account_slot = _resolve_account_slot()
             payload = {k: arguments[k] for k in ("summary", "description", "start", "end", "attendees", "location", "recurrence") if k in arguments}
             payload["event_id"] = event_id
             payload["account_slot"] = account_slot
@@ -5262,7 +5266,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             event_id = str(arguments.get("event_id") or "").strip()
             if not event_id:
                 return _capability_response("error", capability, error={"code": "INVALID_REQUEST", "message": "arguments.event_id is required"}), 400
-            account_slot = str(arguments.get("account_slot") or "primary").strip() or "primary"
+            account_slot = _resolve_account_slot()
             result = _bridge_action("calendar_delete_event", str(effective_user_id), {"event_id": event_id, "account_slot": account_slot})
             return _capability_response("success", capability, result=result), 200
 
