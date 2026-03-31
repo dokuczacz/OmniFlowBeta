@@ -5182,7 +5182,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             }
             return _capability_response("success", capability, result=result), 200
 
-        if capability in ("mail.send", "mail.reply"):
+        if capability == "mail.send":
             if not confirm:
                 return _capability_response(
                     "error",
@@ -5209,6 +5209,44 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                     error={"code": "INVALID_REQUEST", "message": "arguments.to, arguments.subject and arguments.body are required"},
                 ), 400
             result = _bridge_action("gmail_send", str(effective_user_id), payload)
+            return _capability_response("success", capability, result=result), 200
+
+        if capability == "mail.reply":
+            if not confirm:
+                return _capability_response(
+                    "error",
+                    capability,
+                    error={"code": "CONFIRMATION_REQUIRED", "message": "Set params.confirm=true to send email."},
+                ), 409
+            account_slot = _resolve_account_slot()
+            message_id = str(arguments.get("message_id") or "").strip()
+            body = str(arguments.get("body") or "")
+            if not message_id:
+                return _capability_response(
+                    "error",
+                    capability,
+                    error={"code": "INVALID_REQUEST", "message": "arguments.message_id is required"},
+                ), 400
+            if not body:
+                return _capability_response(
+                    "error",
+                    capability,
+                    error={"code": "INVALID_REQUEST", "message": "arguments.body is required"},
+                ), 400
+            to = arguments.get("to")
+            if isinstance(to, str):
+                to = [to]
+            payload = {
+                "message_id": message_id,
+                "to": list(to or []),
+                "subject": str(arguments.get("subject") or ""),
+                "body": body,
+                "cc": list(arguments.get("cc") or []),
+                "bcc": list(arguments.get("bcc") or []),
+                "attachments": list(arguments.get("attachments") or []),
+                "account_slot": account_slot,
+            }
+            result = _bridge_action("gmail_reply", str(effective_user_id), payload)
             return _capability_response("success", capability, result=result), 200
 
         if capability in ("mail.trash", "mail.delete"):
@@ -5591,10 +5629,11 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
     except Exception as exc:
         logging.error("capability_exec failed for %s: %s", capability, exc, exc_info=True)
         msg = str(exc or "")
-        if capability.startswith("mail.") and (
+        if capability.startswith(("mail.", "calendar.")) and (
             "oauth2.googleapis.com/token" in msg
             or "NOT_AUTHORIZED" in msg
             or "Gmail tokens not found" in msg
+            or "Refresh token missing" in msg
         ):
             err = _capability_response(
                 "error",

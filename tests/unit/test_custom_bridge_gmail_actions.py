@@ -23,9 +23,10 @@ class _FakeResponse:
 class _FakeGmailClient:
     calls = []
 
-    def __init__(self, user_id, *, access_token=None):
+    def __init__(self, user_id, *, access_token=None, account_slot=None):
         self.user_id = user_id
         self.access_token = access_token
+        self.account_slot = account_slot
 
     def request(self, method, path, *, params=None, json=None):
         _FakeGmailClient.calls.append(
@@ -36,8 +37,26 @@ class _FakeGmailClient:
                 "json": json,
                 "user_id": self.user_id,
                 "access_token": self.access_token,
+                "account_slot": self.account_slot,
             }
         )
+        if path.startswith("messages/") and method == "get":
+            return _FakeResponse(
+                {
+                    "threadId": "thr-42",
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "sender@example.com"},
+                            {"name": "Reply-To", "value": "reply@example.com"},
+                            {"name": "Subject", "value": "Original Subject"},
+                            {"name": "Message-ID", "value": "<msg-42@example.com>"},
+                            {"name": "References", "value": "<older@example.com>"},
+                        ]
+                    },
+                }
+            )
+        if path == "messages/send":
+            return _FakeResponse({"id": "msg-sent", "threadId": "thr-42"})
         if path.endswith("/trash"):
             return _FakeResponse({"id": "msg-1", "threadId": "thr-1"})
         return _FakeResponse({})
@@ -82,3 +101,37 @@ def test_handle_gmail_trash_requires_message_id():
 def test_handle_gmail_delete_requires_message_id():
     with pytest.raises(ValueError, match="message_id is required for gmail_delete"):
         bridge.handle_gmail_delete("user-1", {}, None)
+
+
+def test_handle_gmail_reply_success_uses_original_message_metadata():
+    result = bridge.handle_gmail_reply(
+        "user-1",
+        {
+            "message_id": "orig-1",
+            "body": "Reply body",
+            "attachments": [{"fileName": "reply.txt", "contentBase64": "SGVsbG8="}],
+        },
+        "token-3",
+    )
+
+    assert result["action"] == "gmail_reply"
+    assert result["status"] == "sent"
+    assert result["message_id"] == "msg-sent"
+    assert result["thread_id"] == "thr-42"
+    assert result["reply_to_message_id"] == "orig-1"
+    assert uuid.UUID(result["audit_id"])
+    assert _FakeGmailClient.calls[0]["method"] == "get"
+    assert _FakeGmailClient.calls[0]["path"] == "messages/orig-1"
+    assert _FakeGmailClient.calls[1]["method"] == "post"
+    assert _FakeGmailClient.calls[1]["path"] == "messages/send"
+    assert _FakeGmailClient.calls[1]["json"]["threadId"] == "thr-42"
+
+
+def test_handle_gmail_reply_requires_message_id():
+    with pytest.raises(ValueError, match="message_id is required for gmail_reply"):
+        bridge.handle_gmail_reply("user-1", {"body": "Reply body"}, None)
+
+
+def test_handle_gmail_reply_requires_body():
+    with pytest.raises(ValueError, match="body is required for gmail_reply"):
+        bridge.handle_gmail_reply("user-1", {"message_id": "orig-1"}, None)

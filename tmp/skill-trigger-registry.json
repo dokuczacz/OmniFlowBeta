@@ -78,6 +78,15 @@
         "resolve threads",
         "gh comments"
       ]
+    },
+    "mail-agent-operations": {
+      "triggers": [
+        "test custom gpt",
+        "custom gpt regression",
+        "golden tests",
+        "test tasks and mail",
+        "test capability exec"
+      ]
     }
   }
 }

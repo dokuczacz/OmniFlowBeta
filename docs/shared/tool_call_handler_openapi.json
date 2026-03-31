@@ -227,6 +227,27 @@
                     }
                   }
                 },
+                "mail_reply": {
+                  "summary": "Reply to an existing email thread",
+                  "value": {
+                    "action": "capability_exec",
+                    "user_id": "mario_test",
+                    "params": {
+                      "capability": "mail.reply",
+                      "confirm": true,
+                      "arguments": {
+                        "message_id": "18c0f4c1a2b3d4e5",
+                        "body": "Thanks, I will handle it today.",
+                        "attachments": [
+                          {
+                            "fileName": "note.txt",
+                            "contentBase64": "SGVsbG8="
+                          }
+                        ]
+                      }
+                    }
+                  }
+                },
                 "mail_authorize": {
                   "summary": "Start or verify Gmail authorization",
                   "value": {

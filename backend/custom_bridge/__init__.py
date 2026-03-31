@@ -87,6 +87,21 @@ def _guess_mime(file_name: str) -> Tuple[str, str]:
     return maintype, subtype
 
 
+def _mail_extract_header(message_obj: Dict[str, Any], header_name: str) -> str:
+    payload = message_obj.get("payload") if isinstance(message_obj, dict) else None
+    headers = payload.get("headers") if isinstance(payload, dict) else None
+    if not isinstance(headers, list):
+        return ""
+    target = str(header_name or "").strip().lower()
+    for item in headers:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip().lower()
+        if name == target:
+            return str(item.get("value") or "").strip()
+    return ""
+
+
 def _build_email(payload: Dict[str, Any]) -> EmailMessage:
     to = payload.get("to")
     if not to:
@@ -102,6 +117,11 @@ def _build_email(payload: Dict[str, Any]) -> EmailMessage:
     else:
         email["To"] = ", ".join(to)
     email["From"] = from_address
+
+    for header_name, header_value in (payload.get("extra_headers") or {}).items():
+        if header_name and header_value:
+            email[str(header_name)] = str(header_value)
+
     email.set_content(body)
 
     for attachment in payload.get("attachments") or []:
@@ -327,6 +347,79 @@ def handle_gmail_send(user_id: str, payload: Dict[str, Any], access_token: str |
     }
 
 
+def handle_gmail_reply(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
+    message_id = str(payload.get("message_id") or "").strip()
+    body = str(payload.get("body") or "")
+    if not message_id:
+        raise ValueError("message_id is required for gmail_reply")
+    if not body:
+        raise ValueError("body is required for gmail_reply")
+
+    audit_id = str(uuid.uuid4())
+    account_slot = str(payload.get("account_slot") or "primary").strip() or "primary"
+    gmail = GmailClient(user_id, access_token=access_token, account_slot=account_slot)
+    original = gmail.request(
+        "get",
+        f"messages/{message_id}",
+        params={
+            "format": "metadata",
+            "metadataHeaders": ["Reply-To", "From", "Subject", "Message-ID", "References"],
+        },
+    ).json()
+
+    to_value = payload.get("to")
+    if isinstance(to_value, str):
+        to_list = [to_value]
+    elif isinstance(to_value, list):
+        to_list = [str(item).strip() for item in to_value if str(item).strip()]
+    else:
+        reply_target = _mail_extract_header(original, "Reply-To") or _mail_extract_header(original, "From")
+        to_list = [reply_target] if reply_target else []
+    if not to_list:
+        raise ValueError("reply target could not be resolved for gmail_reply")
+
+    original_subject = _mail_extract_header(original, "Subject")
+    subject = str(payload.get("subject") or "").strip() or original_subject or "No Subject"
+    if not subject.lower().startswith("re:"):
+        subject = f"Re: {subject}"
+
+    message_id_header = _mail_extract_header(original, "Message-ID")
+    references = _mail_extract_header(original, "References")
+    merged_references = " ".join(part for part in (references, message_id_header) if part).strip()
+
+    email = _build_email(
+        {
+            "to": to_list,
+            "subject": subject,
+            "body": body,
+            "cc": list(payload.get("cc") or []),
+            "bcc": list(payload.get("bcc") or []),
+            "attachments": list(payload.get("attachments") or []),
+            "from_address": payload.get("from_address") or "me",
+            "extra_headers": {
+                "In-Reply-To": message_id_header,
+                "References": merged_references,
+            },
+        }
+    )
+    raw = base64.urlsafe_b64encode(email.as_bytes()).decode("ascii")
+    send_payload: Dict[str, Any] = {"raw": raw}
+    if original.get("threadId"):
+        send_payload["threadId"] = original.get("threadId")
+    response = gmail.request("post", "messages/send", json=send_payload)
+    result = response.json()
+    return {
+        "action": "gmail_reply",
+        "status": "sent",
+        "user_id": user_id,
+        "account_slot": account_slot,
+        "message_id": result.get("id"),
+        "thread_id": result.get("threadId") or original.get("threadId"),
+        "reply_to_message_id": message_id,
+        "audit_id": audit_id,
+    }
+
+
 def handle_gmail_list(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
     params: Dict[str, Any] = {}
     if max_results := payload.get("max_results"):
@@ -488,6 +581,7 @@ ACTION_HANDLERS = {
     "oauth_status": handle_oauth_status,
     "ensure_authorized": handle_ensure_authorized,
     "gmail_send": handle_gmail_send,
+    "gmail_reply": handle_gmail_reply,
     "gmail_list": handle_gmail_list,
     "gmail_get": handle_gmail_get,
     "gmail_trash": handle_gmail_trash,
