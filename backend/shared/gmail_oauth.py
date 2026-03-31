@@ -74,7 +74,7 @@ class GmailTokenStore:
     def _normalize_user_id(user_id: Optional[str]) -> str:
         if not user_id or not isinstance(user_id, str):
             return "default"
-        normalized = user_id.strip().replace("/", "_").replace("\\", "_") or "default"
+        normalized = user_id.strip().replace("/", "_").replace("\\", "_").replace("..", "__") or "default"
         return normalized
 
     @staticmethod

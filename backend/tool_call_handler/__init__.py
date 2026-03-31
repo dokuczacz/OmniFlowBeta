@@ -5116,7 +5116,11 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
 
         if capability == "mail.authorize":
             account_slot = _resolve_account_slot()
-            result = _bridge_action("ensure_authorized", str(effective_user_id), {"login_hint": arguments.get("login_hint"), "account_slot": account_slot})
+            result = _bridge_action("ensure_authorized", str(effective_user_id), {
+                "login_hint": arguments.get("login_hint"),
+                "account_slot": account_slot,
+                "force": bool(arguments.get("force", False)),
+            })
             return _capability_response("success", capability, result=result), 200
 
         if capability == "mail.inbox.list":
@@ -5195,6 +5199,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                 "body": str(arguments.get("body") or ""),
                 "cc": list(arguments.get("cc") or []),
                 "bcc": list(arguments.get("bcc") or []),
+                "attachments": list(arguments.get("attachments") or []),
                 "account_slot": account_slot,
             }
             if not payload["to"] or not payload["subject"] or not payload["body"]:
@@ -5227,10 +5232,15 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
 
         if capability == "calendar.events.list":
             account_slot = _resolve_account_slot()
+            def _to_rfc3339(val: Any) -> Any:
+                """Normalise bare date YYYY-MM-DD → YYYY-MM-DDT00:00:00Z for Google Calendar."""
+                if isinstance(val, str) and len(val) == 10 and val[4] == "-" and val[7] == "-":
+                    return val + "T00:00:00Z"
+                return val
             payload = {
                 "account_slot": account_slot,
-                "time_min": arguments.get("time_min"),
-                "time_max": arguments.get("time_max"),
+                "time_min": _to_rfc3339(arguments.get("time_min")),
+                "time_max": _to_rfc3339(arguments.get("time_max")),
                 "max_results": arguments.get("max_results"),
             }
             result = _bridge_action("calendar_list_events", str(effective_user_id), payload)
@@ -5324,7 +5334,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                     entry["energy"] = arguments.get("energy")
                 tm_data.append(entry)
                 _inprocess_upload_data_or_file(str(effective_user_id), "TM.json", tm_data)
-                return _capability_response("success", capability, result={"created": entry}), 200
+                return _capability_response("success", capability, result={"created": entry, "task_index": len(tm_data)}), 200
 
             task_id = str(arguments.get("id") or "").strip()
             task_index = int(arguments.get("task_index") or 0)
@@ -5525,10 +5535,15 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                 with CACHE_LOCK:
                     _prefs_cache[str(effective_user_id)] = {"data": merged, "ts": time.time()}
 
+            provided_keys = set(updates_raw.keys()) - {"schema_version", "updated_utc"}
+            unknown_keys = sorted(provided_keys - allowed_keys)
+            result_payload: Dict[str, Any] = {"preferences": merged, "updated_keys": sorted(list(updates.keys()))}
+            if unknown_keys:
+                result_payload["unknown_keys"] = unknown_keys
             return _capability_response(
                 "success",
                 capability,
-                result={"preferences": merged, "updated_keys": sorted(list(updates.keys()))},
+                result=result_payload,
             ), 200
 
         if capability == "memory.interaction.list":

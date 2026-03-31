@@ -71,8 +71,8 @@ class UserNamespace:
         if not user_id or user_id.isspace():
             user_id = UserNamespace.DEFAULT_USER_ID
         
-        # Sanitize user_id - remove problematic characters
-        user_id = user_id.replace("/", "_").replace("\\", "_").strip()
+        # Sanitize user_id - remove problematic characters and path traversal
+        user_id = user_id.replace("/", "_").replace("\\", "_").replace("..", "__").strip()
         
         return f"users{UserNamespace.USER_PREFIX_SEPARATOR}{user_id}{UserNamespace.USER_PREFIX_SEPARATOR}{file_name}"
     
