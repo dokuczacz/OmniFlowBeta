@@ -5372,7 +5372,23 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                     entry["energy"] = arguments.get("energy")
                 tm_data.append(entry)
                 _inprocess_upload_data_or_file(str(effective_user_id), "TM.json", tm_data)
-                return _capability_response("success", capability, result={"created": entry, "task_index": len(tm_data)}), 200
+                # Compute index from flattened refs after persist so returned task_index
+                # matches the same index space used by task.update/task.complete/task.delete.
+                rows_after, _ = _tm_flatten_with_refs(tm_data)
+                created_id = str(entry.get("id") or "").strip()
+                created_index = None
+                if created_id:
+                    for row in rows_after:
+                        if str(row.get("id") or "").strip() == created_id:
+                            try:
+                                created_index = int(row.get("task_index"))
+                            except (TypeError, ValueError):
+                                created_index = None
+                            break
+                if not created_index:
+                    # Fallback to last flattened row if id lookup fails unexpectedly.
+                    created_index = len(rows_after)
+                return _capability_response("success", capability, result={"created": entry, "task_index": created_index}), 200
 
             task_id = str(arguments.get("id") or "").strip()
             task_index = int(arguments.get("task_index") or 0)
@@ -5631,6 +5647,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
         msg = str(exc or "")
         if capability.startswith(("mail.", "calendar.")) and (
             "oauth2.googleapis.com/token" in msg
+            or "Token exchange failed" in msg
             or "NOT_AUTHORIZED" in msg
             or "Gmail tokens not found" in msg
             or "Refresh token missing" in msg
