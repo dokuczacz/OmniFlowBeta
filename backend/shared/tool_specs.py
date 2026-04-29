@@ -532,7 +532,7 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
             "payload": {
                 "type": "dict",
                 "required": False,
-                "description": "Action payload. For gmail_send: {to, subject, body}. For list: {q,label,max_results,page_token}. For get/trash/delete: {message_id}."
+                "description": "Action payload. For gmail_send: {to, subject, body}. For list: {q,label_ids,exclude_label_ids,max_results,page_token,include_spam_trash}. For get/trash/delete: {message_id}."
             }
         },
         "aliases": {

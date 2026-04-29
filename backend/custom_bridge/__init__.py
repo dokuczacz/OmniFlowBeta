@@ -424,12 +424,49 @@ def handle_gmail_list(user_id: str, payload: Dict[str, Any], access_token: str |
     params: Dict[str, Any] = {}
     if max_results := payload.get("max_results"):
         params["maxResults"] = int(max_results)
-    if label := payload.get("label"):
-        params["labelIds"] = label.split(",")
-    if query := payload.get("q"):
-        params["q"] = query
+    base_query = str(payload.get("q") or "").strip()
+    label_ids = payload.get("label_ids") or payload.get("labelIds") or payload.get("label")
+    if isinstance(label_ids, str):
+        label_ids = [item.strip() for item in label_ids.split(",")]
+    if isinstance(label_ids, list):
+        normalized_label_ids = [str(item).strip() for item in label_ids if str(item).strip()]
+        if normalized_label_ids:
+            params["labelIds"] = normalized_label_ids
+    exclude_label_ids = payload.get("exclude_label_ids") or payload.get("excludeLabelIds")
+    if isinstance(exclude_label_ids, str):
+        exclude_label_ids = [item.strip() for item in exclude_label_ids.split(",")]
+    if isinstance(exclude_label_ids, list):
+        excluded = [str(item).strip() for item in exclude_label_ids if str(item).strip()]
+        if excluded:
+            query_parts = [base_query] if base_query else []
+            for label_id in excluded:
+                upper = label_id.upper()
+                if upper == "SPAM":
+                    query_parts.append("-in:spam")
+                elif upper == "TRASH":
+                    query_parts.append("-in:trash")
+                elif upper == "INBOX":
+                    query_parts.append("-in:inbox")
+                elif upper == "SENT":
+                    query_parts.append("-in:sent")
+                elif upper == "DRAFT":
+                    query_parts.append("-in:drafts")
+                elif upper.startswith("CATEGORY_"):
+                    query_parts.append(f"-category:{upper.removeprefix('CATEGORY_').lower()}")
+                elif upper in {"PRIMARY", "SOCIAL", "PROMOTIONS", "UPDATES", "FORUMS"}:
+                    if upper == "PRIMARY":
+                        query_parts.append("-category:primary")
+                    else:
+                        query_parts.append(f"-category:{upper.lower()}")
+                else:
+                    query_parts.append(f"-label:{label_id}")
+            params["q"] = " ".join(part for part in query_parts if part).strip()
+    elif base_query:
+        params["q"] = base_query
     if page_token := payload.get("page_token"):
         params["pageToken"] = page_token
+    if payload.get("include_spam_trash") is not None:
+        params["includeSpamTrash"] = bool(payload.get("include_spam_trash"))
     account_slot = str(payload.get("account_slot") or "primary").strip() or "primary"
     gmail = GmailClient(user_id, access_token=access_token, account_slot=account_slot)
     response = gmail.request("get", "messages", params=params)

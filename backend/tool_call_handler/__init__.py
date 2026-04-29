@@ -5018,6 +5018,28 @@ def _mail_enriched_row(raw_item: Dict[str, Any], message_obj: Dict[str, Any]) ->
     }
 
 
+def _mail_normalize_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, tuple):
+        items = list(value)
+    elif isinstance(value, str):
+        items = value.split(",")
+    else:
+        items = [value]
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
 def _bridge_action(action: str, user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     # Keep Gmail behavior aligned with custom_bridge implementation.
     from custom_bridge.__init__ import ACTION_HANDLERS as BRIDGE_HANDLERS
@@ -5124,9 +5146,17 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             return _capability_response("success", capability, result=result), 200
 
         if capability == "mail.inbox.list":
-            max_results = int(arguments.get("max_results", 20) or 20)
+            max_results = int(arguments.get("max_results", arguments.get("limit", 20)) or 20)
             account_slot = _resolve_account_slot()
-            payload = {"max_results": max(1, min(50, max_results)), "q": arguments.get("q"), "label": arguments.get("label"), "account_slot": account_slot}
+            payload = {
+                "max_results": max(1, min(50, max_results)),
+                "q": arguments.get("q") or arguments.get("query"),
+                "label_ids": _mail_normalize_list(arguments.get("label_ids") or arguments.get("labelIds") or arguments.get("label")),
+                "exclude_label_ids": _mail_normalize_list(arguments.get("exclude_label_ids") or arguments.get("excludeLabelIds")),
+                "include_spam_trash": bool(arguments.get("include_spam_trash", arguments.get("includeSpamTrash", False))),
+                "page_token": arguments.get("page_token") or arguments.get("pageToken"),
+                "account_slot": account_slot,
+            }
             result = _bridge_action("gmail_list", str(effective_user_id), payload)
             messages = list(result.get("messages") or []) if isinstance(result, dict) else []
             metadata_limit = int(arguments.get("metadata_limit", 20) or 20)
