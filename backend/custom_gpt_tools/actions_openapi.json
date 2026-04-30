@@ -470,6 +470,20 @@
                     }
                   }
                 },
+                "gmail_list": {
+                  "summary": "List inbox messages with label visibility",
+                  "value": {
+                    "action": "gmail_list",
+                    "user_id": "mario_test",
+                    "payload": {
+                      "account_slot": "primary",
+                      "label_ids": ["INBOX"],
+                      "exclude_label_ids": ["SPAM", "TRASH"],
+                      "include_spam_trash": false,
+                      "max_results": 10
+                    }
+                  }
+                },
                 "calendar_list_events": {
                   "summary": "Aggregate all accessible calendars in a time range",
                   "value": {

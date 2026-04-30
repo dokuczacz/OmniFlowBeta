@@ -576,7 +576,8 @@
                             "from": "Alice Example <alice@example.com>",
                             "subject": "Project Update",
                             "snippet": "Here is the latest status update...",
-                            "date": "Tue, 10 Mar 2026 16:22:11 +0000"
+                            "date": "Tue, 10 Mar 2026 16:22:11 +0000",
+                            "labelIds": ["INBOX", "CATEGORY_UPDATES"]
                           }
                         ],
                         "enriched_count": 1,
