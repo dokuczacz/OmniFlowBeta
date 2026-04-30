@@ -121,7 +121,7 @@
         "properties": {
           "action": {
             "type": "string",
-            "description": "One of oauth_authorize|oauth_exchange|oauth_status|ensure_authorized|gmail_send|gmail_list|gmail_get|gmail_trash|gmail_delete|gmail_attachment"
+            "description": "One of oauth_authorize|oauth_exchange|oauth_status|ensure_authorized|gmail_send|gmail_list|gmail_search|gmail_get|gmail_trash|gmail_delete|gmail_attachment|gmail_accounts_list|calendar_list_events|calendar_get_event|calendar_create_event|calendar_update_event|calendar_delete_event"
           },
           "user_id": { "type": "string" },
           "payload": { "type": "object", "additionalProperties": true }

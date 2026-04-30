@@ -61,6 +61,61 @@ class _FakeGmailClient:
             return _FakeResponse({"id": "msg-1", "threadId": "thr-1"})
         return _FakeResponse({})
 
+    def calendar_request(self, method, path, *, params=None, json=None):
+        _FakeGmailClient.calls.append(
+            {
+                "method": method,
+                "path": path,
+                "params": params,
+                "json": json,
+                "user_id": self.user_id,
+                "access_token": self.access_token,
+                "account_slot": self.account_slot,
+            }
+        )
+        if method == "get" and path == "users/me/calendarList":
+            return _FakeResponse(
+                {
+                    "items": [
+                        {"id": "primary", "summary": "Primary"},
+                        {"id": "secondary-birthdays", "summary": "Birthdays"},
+                    ]
+                }
+            )
+        if method == "get" and path == "calendars/primary/events":
+            return _FakeResponse(
+                {
+                    "items": [
+                        {
+                            "id": "evt-primary-1",
+                            "summary": "Team Sync",
+                            "start": {"dateTime": "2026-05-08T09:00:00"},
+                            "end": {"dateTime": "2026-05-08T09:30:00"},
+                        }
+                    ]
+                }
+            )
+        if method == "get" and path == "calendars/secondary-birthdays/events":
+            return _FakeResponse(
+                {
+                    "items": [
+                        {
+                            "id": "evt-bday-1",
+                            "summary": "Mama ma urodziny",
+                            "eventType": "birthday",
+                            "start": {"date": "2026-05-07"},
+                            "end": {"date": "2026-05-08"},
+                        }
+                    ]
+                }
+            )
+        if method in {"post", "patch"}:
+            payload = {"id": "evt-1"}
+            if isinstance(json, dict):
+                payload.update(json)
+            return _FakeResponse(payload)
+        return _FakeResponse({})
+
 
 @pytest.fixture(autouse=True)
 def _patch_gmail_client(monkeypatch):
@@ -135,3 +190,86 @@ def test_handle_gmail_reply_requires_message_id():
 def test_handle_gmail_reply_requires_body():
     with pytest.raises(ValueError, match="body is required for gmail_reply"):
         bridge.handle_gmail_reply("user-1", {"message_id": "orig-1"}, None)
+
+
+def test_handle_calendar_create_event_normalizes_nested_start_end():
+    result = bridge.handle_calendar_create_event(
+        "user-1",
+        {
+            "summary": "TEST OmniFlow Calendar",
+            "description": "Test event",
+            "start": {
+                "dateTime": "2026-05-01T10:00:00",
+                "timeZone": "Europe/Zurich",
+            },
+            "end": {
+                "dateTime": "2026-05-01T10:30:00",
+                "timeZone": "Europe/Zurich",
+            },
+        },
+        "token-4",
+    )
+
+    assert result["action"] == "calendar_create_event"
+    assert result["status"] == "ok"
+    assert result["event_id"] == "evt-1"
+    assert _FakeGmailClient.calls[0]["method"] == "post"
+    assert _FakeGmailClient.calls[0]["path"] == "calendars/primary/events"
+    assert _FakeGmailClient.calls[0]["json"]["start"] == {
+        "dateTime": "2026-05-01T10:00:00",
+        "timeZone": "Europe/Zurich",
+    }
+    assert _FakeGmailClient.calls[0]["json"]["end"] == {
+        "dateTime": "2026-05-01T10:30:00",
+        "timeZone": "Europe/Zurich",
+    }
+
+
+def test_handle_calendar_update_event_normalizes_flat_aliases():
+    result = bridge.handle_calendar_update_event(
+        "user-1",
+        {
+            "event_id": "evt-9",
+            "summary": "Updated Calendar Event",
+            "start_dateTime": "2026-05-01T11:00:00",
+            "start_timeZone": "Europe/Zurich",
+            "end_dateTime": "2026-05-01T11:30:00",
+            "end_timeZone": "Europe/Zurich",
+        },
+        "token-5",
+    )
+
+    assert result["action"] == "calendar_update_event"
+    assert result["status"] == "ok"
+    assert _FakeGmailClient.calls[0]["method"] == "patch"
+    assert _FakeGmailClient.calls[0]["path"] == "calendars/primary/events/evt-9"
+    assert _FakeGmailClient.calls[0]["json"]["start"] == {
+        "dateTime": "2026-05-01T11:00:00",
+        "timeZone": "Europe/Zurich",
+    }
+    assert _FakeGmailClient.calls[0]["json"]["end"] == {
+        "dateTime": "2026-05-01T11:30:00",
+        "timeZone": "Europe/Zurich",
+    }
+
+
+def test_handle_calendar_list_events_aggregates_all_calendars():
+    result = bridge.handle_calendar_list_events(
+        "user-1",
+        {
+            "time_min": "2026-05-01T00:00:00Z",
+            "time_max": "2026-05-31T23:59:59Z",
+            "max_results": 20,
+            "include_all_calendars": True,
+        },
+        "token-6",
+    )
+
+    assert result["action"] == "calendar_list_events"
+    assert result["status"] == "ok"
+    assert result["include_all_calendars"] is True
+    assert result["calendar_ids"] == ["primary", "secondary-birthdays"]
+    assert result["count"] == 2
+    assert [event["calendarId"] for event in result["events"]] == ["secondary-birthdays", "primary"]
+    assert result["events"][0]["summary"] == "Mama ma urodziny"
+    assert result["events"][1]["summary"] == "Team Sync"

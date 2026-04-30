@@ -29,6 +29,7 @@
           "ensure_authorized",
           "gmail_send",
           "gmail_list",
+          "gmail_search",
           "gmail_get",
           "gmail_trash",
           "gmail_delete",
@@ -58,7 +59,8 @@
         "required": [
           "action",
           "user_id"
-        ]
+        ],
+        "additionalProperties": false
       },
       "GmailGetPayload": {
         "type": "object",
@@ -92,7 +94,7 @@
     "/api/custom_bridge": {
       "post": {
         "operationId": "custom_bridge",
-        "summary": "Unified GPT tool for Gmail actions.",
+        "summary": "Unified GPT tool for Gmail and Calendar actions.",
         "requestBody": {
           "required": true,
           "content": {
@@ -163,6 +165,20 @@
                     }
                   }
                 },
+                "gmail_search": {
+                  "summary": "gmail_search example",
+                  "value": {
+                    "action": "gmail_search",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": {
+                      "q": "in:inbox category:primary -in:spam -in:trash newer_than:7d",
+                      "label_ids": ["INBOX"],
+                      "exclude_label_ids": ["PROMOTIONS"],
+                      "include_spam_trash": false,
+                      "max_results": 10
+                    }
+                  }
+                },
                 "gmail_get": {
                   "summary": "gmail_get example",
                   "value": {
@@ -201,6 +217,58 @@
                     "payload": {
                       "message_id": "MESSAGE_ID",
                       "attachment_id": "ATTACHMENT_ID"
+                    }
+                  }
+                },
+                "calendar_list_events": {
+                  "summary": "calendar_list_events example",
+                  "value": {
+                    "action": "calendar_list_events",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": {
+                      "account_slot": "primary",
+                      "include_all_calendars": true,
+                      "max_results": 10,
+                      "time_min": "2026-05-01T00:00:00Z",
+                      "time_max": "2026-05-31T23:59:59Z"
+                    }
+                  }
+                },
+                "calendar_create_event": {
+                  "summary": "calendar_create_event example",
+                  "value": {
+                    "action": "calendar_create_event",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": {
+                      "summary": "TEST OmniFlow Calendar",
+                      "description": "Test event",
+                      "start": {
+                        "dateTime": "2026-05-01T10:00:00",
+                        "timeZone": "Europe/Zurich"
+                      },
+                      "end": {
+                        "dateTime": "2026-05-01T10:30:00",
+                        "timeZone": "Europe/Zurich"
+                      }
+                    }
+                  }
+                },
+                "calendar_update_event": {
+                  "summary": "calendar_update_event example",
+                  "value": {
+                    "action": "calendar_update_event",
+                    "user_id": "dokuczacz@gmail.com",
+                    "payload": {
+                      "event_id": "EVENT_ID",
+                      "summary": "Updated title",
+                      "start": {
+                        "dateTime": "2026-05-01T11:00:00",
+                        "timeZone": "Europe/Zurich"
+                      },
+                      "end": {
+                        "dateTime": "2026-05-01T11:30:00",
+                        "timeZone": "Europe/Zurich"
+                      }
                     }
                   }
                 }

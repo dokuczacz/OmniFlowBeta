@@ -482,6 +482,68 @@ def handle_gmail_list(user_id: str, payload: Dict[str, Any], access_token: str |
     }
 
 
+def handle_gmail_search(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
+    result = handle_gmail_list(user_id, payload, access_token=access_token)
+    result["action"] = "gmail_search"
+    result["query"] = str(payload.get("q") or "").strip()
+    return result
+
+
+def _calendar_time_object(payload: Dict[str, Any], field_name: str) -> Dict[str, Any]:
+    value = payload.get(field_name)
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key in ("dateTime", "date", "timeZone"):
+            item = value.get(key)
+            if item is not None and str(item).strip():
+                out[key] = str(item).strip()
+        return out
+
+    def _tz() -> str:
+        return str(
+            payload.get(f"{field_name}_timeZone")
+            or payload.get(f"{field_name}TimeZone")
+            or payload.get(f"{field_name}_timezone")
+            or payload.get("timeZone")
+            or payload.get("time_zone")
+            or ""
+        ).strip()
+
+    if isinstance(value, str) and value.strip():
+        out = {"dateTime": value.strip()}
+        tz = _tz()
+        if tz:
+            out["timeZone"] = tz
+        return out
+
+    for alias in (
+        f"{field_name}_dateTime",
+        f"{field_name}DateTime",
+        f"{field_name}_datetime",
+    ):
+        candidate = payload.get(alias)
+        if isinstance(candidate, str) and candidate.strip():
+            out = {"dateTime": candidate.strip()}
+            tz = _tz()
+            if tz:
+                out["timeZone"] = tz
+            return out
+
+    for alias in (
+        f"{field_name}_date",
+        f"{field_name}Date",
+    ):
+        candidate = payload.get(alias)
+        if isinstance(candidate, str) and candidate.strip():
+            out = {"date": candidate.strip()}
+            tz = _tz()
+            if tz:
+                out["timeZone"] = tz
+            return out
+
+    return {}
+
+
 def handle_gmail_get(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
     message_id = payload.get("message_id")
     if not message_id:
@@ -567,9 +629,46 @@ def handle_calendar_list_events(user_id: str, payload: Dict[str, Any], access_to
         params["timeMin"] = payload["time_min"]
     if payload.get("time_max"):
         params["timeMax"] = payload["time_max"]
-    resp = gmail.calendar_request("get", "calendars/primary/events", params=params)
-    items = resp.json().get("items", [])
-    return {"action": "calendar_list_events", "status": "ok", "account_slot": account_slot, "events": items, "count": len(items)}
+    include_all_calendars = bool(payload.get("include_all_calendars", False))
+    calendar_ids = payload.get("calendar_ids")
+    if isinstance(calendar_ids, str):
+        calendar_ids = [item.strip() for item in calendar_ids.split(",")]
+    if not isinstance(calendar_ids, list):
+        calendar_ids = []
+    calendar_ids = [str(item).strip() for item in calendar_ids if str(item).strip()]
+
+    if include_all_calendars and not calendar_ids:
+        list_resp = gmail.calendar_request("get", "users/me/calendarList", params={"minAccessRole": "reader", "showHidden": True})
+        calendars = list_resp.json().get("items", [])
+        calendar_ids = [
+            str(item.get("id") or "").strip()
+            for item in calendars
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        ]
+
+    if not calendar_ids:
+        calendar_ids = ["primary"]
+
+    events: list[dict] = []
+    for calendar_id in calendar_ids:
+        resp = gmail.calendar_request("get", f"calendars/{calendar_id}/events", params=params)
+        items = resp.json().get("items", [])
+        for item in items:
+            if isinstance(item, dict):
+                enriched = dict(item)
+                enriched.setdefault("calendarId", calendar_id)
+                events.append(enriched)
+
+    events.sort(key=lambda item: str((item or {}).get("start", {}).get("dateTime") or (item or {}).get("start", {}).get("date") or ""))
+    return {
+        "action": "calendar_list_events",
+        "status": "ok",
+        "account_slot": account_slot,
+        "calendar_ids": calendar_ids,
+        "events": events,
+        "count": len(events),
+        "include_all_calendars": include_all_calendars,
+    }
 
 
 def handle_calendar_get_event(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
@@ -585,7 +684,13 @@ def handle_calendar_get_event(user_id: str, payload: Dict[str, Any], access_toke
 def handle_calendar_create_event(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
     account_slot = str(payload.get("account_slot") or "primary").strip() or "primary"
     gmail = GmailClient(user_id, access_token=access_token, account_slot=account_slot)
-    event_body = {k: payload[k] for k in ("summary", "description", "start", "end", "attendees", "location", "recurrence") if k in payload}
+    event_body = {k: payload[k] for k in ("summary", "description", "attendees", "location", "recurrence") if k in payload}
+    start = _calendar_time_object(payload, "start")
+    end = _calendar_time_object(payload, "end")
+    if start:
+        event_body["start"] = start
+    if end:
+        event_body["end"] = end
     resp = gmail.calendar_request("post", "calendars/primary/events", json=event_body)
     created = resp.json()
     return {"action": "calendar_create_event", "status": "ok", "account_slot": account_slot, "event_id": created.get("id"), "event": created}
@@ -597,7 +702,13 @@ def handle_calendar_update_event(user_id: str, payload: Dict[str, Any], access_t
         raise ValueError("event_id is required for calendar_update_event")
     account_slot = str(payload.get("account_slot") or "primary").strip() or "primary"
     gmail = GmailClient(user_id, access_token=access_token, account_slot=account_slot)
-    patch_body = {k: payload[k] for k in ("summary", "description", "start", "end", "attendees", "location", "recurrence") if k in payload}
+    patch_body = {k: payload[k] for k in ("summary", "description", "attendees", "location", "recurrence") if k in payload}
+    start = _calendar_time_object(payload, "start")
+    end = _calendar_time_object(payload, "end")
+    if start:
+        patch_body["start"] = start
+    if end:
+        patch_body["end"] = end
     resp = gmail.calendar_request("patch", f"calendars/primary/events/{event_id}", json=patch_body)
     return {"action": "calendar_update_event", "status": "ok", "account_slot": account_slot, "event": resp.json()}
 
@@ -620,6 +731,7 @@ ACTION_HANDLERS = {
     "gmail_send": handle_gmail_send,
     "gmail_reply": handle_gmail_reply,
     "gmail_list": handle_gmail_list,
+    "gmail_search": handle_gmail_search,
     "gmail_get": handle_gmail_get,
     "gmail_trash": handle_gmail_trash,
     "gmail_delete": handle_gmail_delete,

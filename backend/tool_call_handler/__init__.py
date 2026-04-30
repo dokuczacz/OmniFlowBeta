@@ -97,7 +97,9 @@ if not RESPONSES_INSTRUCTIONS:
     RESPONSES_INSTRUCTIONS = (
         "You are OmniFlow PA. Use tools for any claim about user data.\n"
         "- If asked about tasks, read/update TM.json via tools. Do not claim writes without a write tool call.\n"
-        "- If asked about Gmail, prefer gmail_recent_metadata to fetch recent message metadata; do not ask for 50 if user requested 20.\n"
+        "- If asked about Gmail, use mail.search for query-based filtering and gmail_recent_metadata for lightweight recent metadata; do not ask for 50 if user requested 20.\n"
+        "- For calendar.events.create/update, send start and end as nested objects with dateTime and timeZone.\n"
+        "- For calendar.events.list, prefer include_all_calendars=true when the user asks for their calendar broadly, and use calendar_ids to narrow to specific calendars.\n"
         "- For gmail_action gmail_send, always provide JSON with payload.to, payload.subject, payload.body.\n"
         "- For gmail_action gmail_get/gmail_trash/gmail_delete, always provide payload.message_id.\n"
         "- If a Gmail tool returns NOT_AUTHORIZED, instruct user to Connect.\n"
@@ -5184,6 +5186,49 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             result["enriched_count"] = len([m for m in enriched if (m.get("subject") or m.get("from") or m.get("snippet"))])
             return _capability_response("success", capability, result=result), 200
 
+        if capability == "mail.search":
+            max_results = int(arguments.get("max_results", arguments.get("limit", 20)) or 20)
+            account_slot = _resolve_account_slot()
+            query = str(arguments.get("query") or arguments.get("q") or "").strip()
+            if not query:
+                return _capability_response("error", capability, error={"code": "INVALID_REQUEST", "message": "arguments.query is required"}), 400
+            payload = {
+                "max_results": max(1, min(50, max_results)),
+                "q": query,
+                "label_ids": _mail_normalize_list(arguments.get("label_ids") or arguments.get("labelIds")),
+                "exclude_label_ids": _mail_normalize_list(arguments.get("exclude_label_ids") or arguments.get("excludeLabelIds")),
+                "include_spam_trash": bool(arguments.get("include_spam_trash", arguments.get("includeSpamTrash", False))),
+                "page_token": arguments.get("page_token") or arguments.get("pageToken"),
+                "account_slot": account_slot,
+            }
+            result = _bridge_action("gmail_search", str(effective_user_id), payload)
+            messages = list(result.get("messages") or []) if isinstance(result, dict) else []
+            metadata_limit = int(arguments.get("metadata_limit", 20) or 20)
+            metadata_limit = max(1, min(20, metadata_limit))
+            enriched: list[dict] = []
+            for idx, raw_item in enumerate(messages):
+                if not isinstance(raw_item, dict):
+                    continue
+                mid = str(raw_item.get("id") or "").strip()
+                if not mid:
+                    continue
+                message_obj: Dict[str, Any] = {}
+                if idx < metadata_limit:
+                    try:
+                        got = _bridge_action(
+                            "gmail_get",
+                            str(effective_user_id),
+                            {"message_id": mid, "format": "metadata", "account_slot": account_slot},
+                        )
+                        message_obj = dict(got.get("message") or {}) if isinstance(got, dict) else {}
+                    except Exception:
+                        message_obj = {}
+                enriched.append(_mail_enriched_row(raw_item, message_obj))
+            result["messages"] = enriched
+            result["enriched_count"] = len([m for m in enriched if (m.get("subject") or m.get("from") or m.get("snippet"))])
+            result["query"] = query
+            return _capability_response("success", capability, result=result), 200
+
         if capability == "mail.read":
             message_id = str(arguments.get("message_id") or "").strip()
             if not message_id:
@@ -5310,6 +5355,8 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
                 "time_min": _to_rfc3339(arguments.get("time_min")),
                 "time_max": _to_rfc3339(arguments.get("time_max")),
                 "max_results": arguments.get("max_results"),
+                "calendar_ids": arguments.get("calendar_ids") or arguments.get("calendarIds"),
+                "include_all_calendars": bool(arguments.get("include_all_calendars", arguments.get("includeAllCalendars", True))),
             }
             result = _bridge_action("calendar_list_events", str(effective_user_id), payload)
             return _capability_response("success", capability, result=result), 200
