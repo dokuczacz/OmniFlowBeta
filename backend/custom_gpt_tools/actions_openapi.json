@@ -3,7 +3,7 @@
   "info": {
     "title": "Agent Backend Service (Custom GPT Actions)",
     "version": "1.0.0",
-    "description": "OpenAPI schema for Custom GPT Actions. Function keys are passed via the required `code` query parameter on every endpoint. Optional multi-user isolation via `user_id` param/body. For Gmail and Calendar features, pass action-specific fields inside `payload`."
+    "description": "DEPRECATED legacy bridge schema. Do not use this as the primary agent contract. Use docs/shared/tool_call_handler_openapi.json and /api/tool_call_handler for capability-level access. This file is kept only for low-level bridge compatibility and internal troubleshooting. Function keys are passed via the required `code` query parameter on every endpoint. Optional multi-user isolation via `user_id` param/body. For Gmail and Calendar features, pass action-specific fields inside `payload`."
   },
   "servers": [
     {

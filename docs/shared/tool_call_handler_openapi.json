@@ -3,7 +3,7 @@
   "info": {
     "title": "OmniFlow Personal Assistance API (Single Endpoint)",
     "version": "1.0.3",
-    "description": "Single-endpoint contract for both native UI and Custom GPT. Public contract is capability-level (personal assistance). Internal low-level tools are hidden behind tool_call_handler orchestration."
+    "description": "Single-endpoint contract for both native UI and Custom GPT. This is the canonical source of truth for agent integrations. Public contract is capability-level (personal assistance). Internal low-level tools are hidden behind tool_call_handler orchestration."
   },
   "servers": [
     {

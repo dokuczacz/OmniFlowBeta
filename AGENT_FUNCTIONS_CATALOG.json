@@ -1,7 +1,9 @@
 {
   "schema_version": "omniflow.agent_functions.v1",
-  "source_of_truth": "backend/custom_gpt_tools/actions_openapi.json",
+  "source_of_truth": "docs/shared/tool_call_handler_openapi.json",
   "notes": [
+    "Use docs/shared/tool_call_handler_openapi.json as the only active agent schema for capability-level access.",
+    "backend/custom_gpt_tools/actions_openapi.json is legacy/bridge-only and must not be used as the primary agent schema.",
     "Always pass full blob paths exactly as returned by list_blobs (e.g. interactions/semantic/index.jsonl).",
     "Prefer batch reads via read_many_blobs to reduce latency and context usage.",
     "All tools support optional user isolation via x-user-id header or user_id field (if omitted, backend defaults to 'default')."
