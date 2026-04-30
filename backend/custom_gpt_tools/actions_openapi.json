@@ -127,7 +127,7 @@
           "payload": {
             "type": "object",
             "additionalProperties": true,
-            "description": "Action-specific payload. Common mail fields: account_slot, max_results, q/query, label_ids, exclude_label_ids, include_spam_trash, page_token. `gmail_search` requires query (or q). Common calendar list fields: account_slot, time_min, time_max, max_results, include_all_calendars, calendar_ids. Calendar create/update should send start/end as objects like {dateTime, timeZone} or {date, timeZone}; flat aliases like start_dateTime/start_timeZone and end_dateTime/end_timeZone are also accepted."
+            "description": "Action-specific payload. Common mail fields: account_slot, max_results, q/query, category, label_ids, exclude_label_ids, include_spam_trash, page_token. `gmail_search` requires query (or q). Common calendar list fields: account_slot, time_min, time_max, max_results, include_all_calendars, calendar_ids. Calendar create/update should send start/end as objects like {dateTime, timeZone} or {date, timeZone}; flat aliases like start_dateTime/start_timeZone and end_dateTime/end_timeZone are also accepted."
           }
         },
         "required": ["action"],
@@ -463,6 +463,7 @@
                     "payload": {
                       "account_slot": "primary",
                       "query": "in:inbox category:primary -in:spam -in:trash newer_than:7d",
+                      "category": "primary",
                       "label_ids": ["INBOX"],
                       "exclude_label_ids": ["PROMOTIONS"],
                       "include_spam_trash": false,
@@ -477,6 +478,7 @@
                     "user_id": "mario_test",
                     "payload": {
                       "account_slot": "primary",
+                      "category": "primary",
                       "label_ids": ["INBOX"],
                       "exclude_label_ids": ["SPAM", "TRASH"],
                       "include_spam_trash": false,

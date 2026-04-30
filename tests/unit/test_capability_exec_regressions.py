@@ -159,6 +159,40 @@ def test_custom_bridge_mail_list_merges_exclusions_into_query(monkeypatch):
     assert captured["params"]["pageToken"] == "cursor-123"
 
 
+def test_custom_bridge_mail_list_merges_category_into_query(monkeypatch):
+    import custom_bridge.__init__ as bridge
+
+    captured = {}
+
+    class FakeGmail:
+        def __init__(self, user_id, access_token=None, account_slot="primary"):
+            captured["user_id"] = user_id
+            captured["account_slot"] = account_slot
+
+        def request(self, method, path, params=None):
+            captured["method"] = method
+            captured["path"] = path
+            captured["params"] = params or {}
+            return type("Resp", (), {"json": lambda self: {"messages": [], "nextPageToken": None, "resultSizeEstimate": 0}})()
+
+    monkeypatch.setattr(bridge, "GmailClient", FakeGmail)
+
+    result = bridge.handle_gmail_list(
+        "u1",
+        {
+            "max_results": 10,
+            "q": "in:inbox newer_than:30d",
+            "category": "primary",
+            "account_slot": "primary",
+        },
+    )
+
+    assert result["status"] == "ok"
+    assert captured["method"] == "get"
+    assert captured["path"] == "messages"
+    assert captured["params"]["q"] == "in:inbox newer_than:30d category:primary"
+
+
 def test_mail_search_uses_query_and_forwards_to_gmail_search(monkeypatch):
     captured = {}
 
@@ -196,6 +230,35 @@ def test_mail_search_uses_query_and_forwards_to_gmail_search(monkeypatch):
     assert captured["payload"]["exclude_label_ids"] == ["PROMOTIONS"]
     assert captured["payload"]["include_spam_trash"] is False
     assert captured["payload"]["page_token"] == "cursor-456"
+
+
+def test_mail_inbox_list_forwards_category(monkeypatch):
+    captured = {}
+
+    def fake_bridge_action(action, _user_id, payload):
+        captured["action"] = action
+        captured["payload"] = payload
+        return {"messages": [], "next_page_token": None, "result_size_estimate": 0}
+
+    monkeypatch.setattr(handler, "_bridge_action", fake_bridge_action)
+
+    body, status = handler._handle_capability_exec(
+        "u1",
+        {
+            "capability": "mail.inbox.list",
+            "confirm": False,
+            "arguments": {
+                "account_slot": "primary",
+                "limit": 10,
+                "category": "primary",
+            },
+        },
+    )
+
+    assert status == 200
+    assert body["status"] == "success"
+    assert captured["action"] == "gmail_list"
+    assert captured["payload"]["category"] == "primary"
 
 
 def test_mail_inbox_list_enriched_response_keeps_label_ids(monkeypatch):

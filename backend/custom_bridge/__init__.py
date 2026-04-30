@@ -426,6 +426,13 @@ def handle_gmail_list(user_id: str, payload: Dict[str, Any], access_token: str |
     if max_results := payload.get("max_results"):
         params["maxResults"] = int(max_results)
     base_query = str(payload.get("q") or "").strip()
+    category_value = str(payload.get("category") or "").strip()
+    if category_value:
+        normalized_category = category_value.lower()
+        if normalized_category.startswith("category:"):
+            normalized_category = normalized_category.split(":", 1)[1].strip()
+        if normalized_category in {"primary", "social", "promotions", "updates", "forums"}:
+            base_query = " ".join(part for part in (base_query, f"category:{normalized_category}") if part).strip()
     label_ids = payload.get("label_ids") or payload.get("labelIds") or payload.get("label")
     if isinstance(label_ids, str):
         label_ids = [item.strip() for item in label_ids.split(",")]

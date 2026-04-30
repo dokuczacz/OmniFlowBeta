@@ -5155,6 +5155,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             payload = {
                 "max_results": max(1, min(50, max_results)),
                 "q": arguments.get("q") or arguments.get("query"),
+                "category": arguments.get("category"),
                 "label_ids": _mail_normalize_list(arguments.get("label_ids") or arguments.get("labelIds") or arguments.get("label")),
                 "exclude_label_ids": _mail_normalize_list(arguments.get("exclude_label_ids") or arguments.get("excludeLabelIds")),
                 "include_spam_trash": bool(arguments.get("include_spam_trash", arguments.get("includeSpamTrash", False))),
@@ -5197,6 +5198,7 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             payload = {
                 "max_results": max(1, min(50, max_results)),
                 "q": query,
+                "category": arguments.get("category"),
                 "label_ids": _mail_normalize_list(arguments.get("label_ids") or arguments.get("labelIds")),
                 "exclude_label_ids": _mail_normalize_list(arguments.get("exclude_label_ids") or arguments.get("excludeLabelIds")),
                 "include_spam_trash": bool(arguments.get("include_spam_trash", arguments.get("includeSpamTrash", False))),
