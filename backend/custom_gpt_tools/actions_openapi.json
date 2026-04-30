@@ -3,7 +3,7 @@
   "info": {
     "title": "Agent Backend Service (Custom GPT Actions)",
     "version": "1.0.0",
-    "description": "OpenAPI schema for Custom GPT Actions. Function keys are passed via the required `code` query parameter on every endpoint. Optional multi-user isolation via `x-user-id` header or `user_id` param/body."
+    "description": "OpenAPI schema for Custom GPT Actions. Function keys are passed via the required `code` query parameter on every endpoint. Optional multi-user isolation via `user_id` param/body."
   },
   "servers": [
     {
@@ -28,7 +28,7 @@
         "properties": {
           "target_blob_name": { "type": "string", "description": "Target file name inside the user's namespace (e.g. TM.json)." },
           "new_entry": { "type": "string", "description": "JSON-encoded entry (string). Example: \"{\\\"id\\\":\\\"TM.001.202512151230\\\",...}\"" },
-          "user_id": { "type": "string", "description": "Optional user namespace (can also be sent as x-user-id header)." }
+          "user_id": { "type": "string", "description": "Optional user namespace." }
         },
         "required": ["target_blob_name", "new_entry"],
         "additionalProperties": false
@@ -111,7 +111,7 @@
           "tail_bytes": { "type": "integer", "minimum": 1024, "maximum": 262144, "default": 65536, "description": "Max bytes to read from the end when using tail_lines." },
           "max_bytes_per_file": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 262144, "description": "Max bytes per file (prefix read). Larger blobs are truncated." },
           "parse_json": { "type": "boolean", "default": true, "description": "If true, tries to JSON-decode each file; falls back to text on parse failure." },
-          "user_id": { "type": "string", "description": "Optional user namespace (can also be sent as x-user-id header)." }
+          "user_id": { "type": "string", "description": "Optional user namespace." }
         },
         "required": ["files"],
         "additionalProperties": false
@@ -147,13 +147,6 @@
         "summary": "Returns current UTC time",
         "parameters": [
           {
-            "name": "x-user-id",
-            "in": "header",
-            "required": false,
-            "schema": { "type": "string" },
-            "description": "Optional user namespace. If omitted, backend uses 'default'."
-          },
-          {
             "name": "code",
             "in": "query",
             "required": true,
@@ -175,13 +168,6 @@
         "operationId": "list_blobs",
         "summary": "Returns a list of all files in the user's Azure Blob namespace",
         "parameters": [
-          {
-            "name": "x-user-id",
-            "in": "header",
-            "required": false,
-            "schema": { "type": "string" },
-            "description": "Optional user namespace. If omitted, backend uses 'default'."
-          },
           { "name": "prefix", "in": "query", "required": false, "schema": { "type": "string" } },
           { "name": "user_id", "in": "query", "required": false, "schema": { "type": "string" } },
           {
@@ -204,13 +190,6 @@
         "operationId": "read_blob_file",
         "summary": "Reads and returns the content of a specific blob file by name (supports batch via POST body in backend)",
         "parameters": [
-          {
-            "name": "x-user-id",
-            "in": "header",
-            "required": false,
-            "schema": { "type": "string" },
-            "description": "Optional user namespace. If omitted, backend uses 'default'."
-          },
           { "name": "file_name", "in": "query", "required": true, "schema": { "type": "string", "example": "TM.json" } },
           { "name": "user_id", "in": "query", "required": false, "schema": { "type": "string" } },
           {
@@ -233,13 +212,6 @@
         "operationId": "read_many_blobs",
         "summary": "Reads many blob files in one request with safety limits (supports optional tail for JSONL/text)",
         "parameters": [
-          {
-            "name": "x-user-id",
-            "in": "header",
-            "required": false,
-            "schema": { "type": "string" },
-            "description": "Optional user namespace. If omitted, backend uses 'default'."
-          },
           {
             "name": "code",
             "in": "query",
@@ -269,13 +241,6 @@
         "summary": "Returns JSON file content with optional simple filter (server-side)",
         "parameters": [
           {
-            "name": "x-user-id",
-            "in": "header",
-            "required": false,
-            "schema": { "type": "string" },
-            "description": "Optional user namespace. If omitted, backend uses 'default'."
-          },
-          {
             "name": "code",
             "in": "query",
             "required": true,
@@ -301,13 +266,6 @@
         "operationId": "add_new_data",
         "summary": "Add new entry to JSON file (new_entry must be JSON encoded as string)",
         "parameters": [
-          {
-            "name": "x-user-id",
-            "in": "header",
-            "required": false,
-            "schema": { "type": "string" },
-            "description": "Optional user namespace. If omitted, backend uses 'default'."
-          },
           {
             "name": "code",
             "in": "query",
@@ -335,13 +293,6 @@
         "summary": "Find & update entry inside JSON file",
         "parameters": [
           {
-            "name": "x-user-id",
-            "in": "header",
-            "required": false,
-            "schema": { "type": "string" },
-            "description": "Optional user namespace. If omitted, backend uses 'default'."
-          },
-          {
             "name": "code",
             "in": "query",
             "required": true,
@@ -367,13 +318,6 @@
         "operationId": "remove_data_entry",
         "summary": "Remove entry matching key/value from JSON file",
         "parameters": [
-          {
-            "name": "x-user-id",
-            "in": "header",
-            "required": false,
-            "schema": { "type": "string" },
-            "description": "Optional user namespace. If omitted, backend uses 'default'."
-          },
           {
             "name": "code",
             "in": "query",
@@ -401,13 +345,6 @@
         "summary": "Create or replace file in Azure Blob Storage (file_content must be JSON string or text)",
         "parameters": [
           {
-            "name": "x-user-id",
-            "in": "header",
-            "required": false,
-            "schema": { "type": "string" },
-            "description": "Optional user namespace. If omitted, backend uses 'default'."
-          },
-          {
             "name": "code",
             "in": "query",
             "required": true,
@@ -433,13 +370,6 @@
         "operationId": "manage_files",
         "summary": "Manage files: list, delete, rename",
         "parameters": [
-          {
-            "name": "x-user-id",
-            "in": "header",
-            "required": false,
-            "schema": { "type": "string" },
-            "description": "Optional user namespace. If omitted, backend uses 'default'."
-          },
           {
             "name": "code",
             "in": "query",
@@ -467,13 +397,6 @@
         "summary": "Save user/assistant interaction to blob logs",
         "parameters": [
           {
-            "name": "x-user-id",
-            "in": "header",
-            "required": false,
-            "schema": { "type": "string" },
-            "description": "Optional user namespace. If omitted, backend uses 'default'."
-          },
-          {
             "name": "code",
             "in": "query",
             "required": true,
@@ -499,13 +422,6 @@
         "operationId": "get_interaction_history",
         "summary": "Returns interaction logs (optional thread filter + pagination)",
         "parameters": [
-          {
-            "name": "x-user-id",
-            "in": "header",
-            "required": false,
-            "schema": { "type": "string" },
-            "description": "Optional user namespace. If omitted, backend uses 'default'."
-          },
           { "name": "thread_id", "in": "query", "required": false, "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 50, "minimum": 1, "maximum": 1000 } },
           { "name": "offset", "in": "query", "required": false, "schema": { "type": "integer", "default": 0, "minimum": 0 } },
@@ -558,13 +474,6 @@
         "operationId": "custom_gpt_tools",
         "summary": "Returns server-side tool metadata for Custom GPT (shape depends on backend implementation)",
         "parameters": [
-          {
-            "name": "x-user-id",
-            "in": "header",
-            "required": false,
-            "schema": { "type": "string" },
-            "description": "Optional user namespace. If omitted, backend uses 'default'."
-          },
           {
             "name": "code",
             "in": "query",
