@@ -79,6 +79,7 @@ class _FakeGmailClient:
                     "items": [
                         {"id": "primary", "summary": "Primary"},
                         {"id": "secondary-birthdays", "summary": "Birthdays"},
+                        {"id": "pl.polish#holiday@group.v.calendar.google.com", "summary": "Polish Holidays"},
                     ]
                 }
             )
@@ -105,6 +106,19 @@ class _FakeGmailClient:
                             "eventType": "birthday",
                             "start": {"date": "2026-05-07"},
                             "end": {"date": "2026-05-08"},
+                        }
+                    ]
+                }
+            )
+        if method == "get" and path == "calendars/pl.polish%23holiday%40group.v.calendar.google.com/events":
+            return _FakeResponse(
+                {
+                    "items": [
+                        {
+                            "id": "evt-holiday-1",
+                            "summary": "Swieto",
+                            "start": {"date": "2026-05-03"},
+                            "end": {"date": "2026-05-04"},
                         }
                     ]
                 }
@@ -268,8 +282,14 @@ def test_handle_calendar_list_events_aggregates_all_calendars():
     assert result["action"] == "calendar_list_events"
     assert result["status"] == "ok"
     assert result["include_all_calendars"] is True
-    assert result["calendar_ids"] == ["primary", "secondary-birthdays"]
-    assert result["count"] == 2
-    assert [event["calendarId"] for event in result["events"]] == ["secondary-birthdays", "primary"]
-    assert result["events"][0]["summary"] == "Mama ma urodziny"
-    assert result["events"][1]["summary"] == "Team Sync"
+    assert result["calendar_ids"] == ["primary", "secondary-birthdays", "pl.polish#holiday@group.v.calendar.google.com"]
+    assert result["count"] == 3
+    assert [event["calendarId"] for event in result["events"]] == [
+        "pl.polish#holiday@group.v.calendar.google.com",
+        "secondary-birthdays",
+        "primary",
+    ]
+    assert result["events"][0]["summary"] == "Swieto"
+    assert result["events"][0]["calendarId"] == "pl.polish#holiday@group.v.calendar.google.com"
+    assert result["events"][1]["summary"] == "Mama ma urodziny"
+    assert result["events"][2]["summary"] == "Team Sync"

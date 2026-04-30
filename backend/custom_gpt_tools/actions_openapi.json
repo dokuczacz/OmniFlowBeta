@@ -3,7 +3,7 @@
   "info": {
     "title": "Agent Backend Service (Custom GPT Actions)",
     "version": "1.0.0",
-    "description": "OpenAPI schema for Custom GPT Actions. Function keys are passed via the required `code` query parameter on every endpoint. Optional multi-user isolation via `user_id` param/body."
+    "description": "OpenAPI schema for Custom GPT Actions. Function keys are passed via the required `code` query parameter on every endpoint. Optional multi-user isolation via `user_id` param/body. For Gmail and Calendar features, pass action-specific fields inside `payload`."
   },
   "servers": [
     {
@@ -124,7 +124,11 @@
             "description": "One of oauth_authorize|oauth_exchange|oauth_status|ensure_authorized|gmail_send|gmail_list|gmail_search|gmail_get|gmail_trash|gmail_delete|gmail_attachment|gmail_accounts_list|calendar_list_events|calendar_get_event|calendar_create_event|calendar_update_event|calendar_delete_event"
           },
           "user_id": { "type": "string" },
-          "payload": { "type": "object", "additionalProperties": true }
+          "payload": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Action-specific payload. Common mail fields: account_slot, max_results, q/query, label_ids, exclude_label_ids, include_spam_trash, page_token. `gmail_search` requires query (or q). Common calendar list fields: account_slot, time_min, time_max, max_results, include_all_calendars, calendar_ids. Calendar create/update should send start/end as objects like {dateTime, timeZone} or {date, timeZone}; flat aliases like start_dateTime/start_timeZone and end_dateTime/end_timeZone are also accepted."
+          }
         },
         "required": ["action"],
         "additionalProperties": false
@@ -444,12 +448,63 @@
     "/api/custom_bridge": {
       "post": {
         "operationId": "custom_bridge",
-        "summary": "Single bridge endpoint for Gmail actions",
+        "summary": "Single bridge endpoint for Gmail and Calendar actions",
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/BridgeRequest" }
+              "schema": { "$ref": "#/components/schemas/BridgeRequest" },
+              "examples": {
+                "gmail_search": {
+                  "summary": "Search Gmail with native query syntax",
+                  "value": {
+                    "action": "gmail_search",
+                    "user_id": "mario_test",
+                    "payload": {
+                      "account_slot": "primary",
+                      "query": "in:inbox category:primary -in:spam -in:trash newer_than:7d",
+                      "label_ids": ["INBOX"],
+                      "exclude_label_ids": ["PROMOTIONS"],
+                      "include_spam_trash": false,
+                      "max_results": 20
+                    }
+                  }
+                },
+                "calendar_list_events": {
+                  "summary": "Aggregate all accessible calendars in a time range",
+                  "value": {
+                    "action": "calendar_list_events",
+                    "user_id": "mario_test",
+                    "payload": {
+                      "account_slot": "secondary",
+                      "time_min": "2026-05-01T00:00:00Z",
+                      "time_max": "2026-05-31T23:59:59Z",
+                      "max_results": 20,
+                      "include_all_calendars": true
+                    }
+                  }
+                },
+                "calendar_create_event": {
+                  "summary": "Create a timed calendar event",
+                  "value": {
+                    "action": "calendar_create_event",
+                    "user_id": "mario_test",
+                    "payload": {
+                      "account_slot": "primary",
+                      "summary": "Project sync",
+                      "description": "Weekly team sync",
+                      "start": {
+                        "dateTime": "2026-05-01T10:00:00",
+                        "timeZone": "Europe/Zurich"
+                      },
+                      "end": {
+                        "dateTime": "2026-05-01T10:30:00",
+                        "timeZone": "Europe/Zurich"
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         },

@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from typing import Any, Dict, Tuple
+from urllib.parse import quote
 
 import azure.functions as func
 import requests
@@ -651,7 +652,8 @@ def handle_calendar_list_events(user_id: str, payload: Dict[str, Any], access_to
 
     events: list[dict] = []
     for calendar_id in calendar_ids:
-        resp = gmail.calendar_request("get", f"calendars/{calendar_id}/events", params=params)
+        encoded_calendar_id = quote(calendar_id, safe="")
+        resp = gmail.calendar_request("get", f"calendars/{encoded_calendar_id}/events", params=params)
         items = resp.json().get("items", [])
         for item in items:
             if isinstance(item, dict):
