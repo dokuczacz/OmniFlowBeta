@@ -69,7 +69,7 @@
           "arguments": {
             "type": "object",
             "additionalProperties": true,
-            "description": "Capability-specific payload. For memory.interaction.save provide either (user_message + assistant_response) or (role + content). Optional per-call user override can be passed as arguments.user_id. For mail/calendar capabilities you can pass arguments.account_slot = primary|secondary. For calendar.events.create and calendar.events.update, send start/end as objects like {dateTime, timeZone} (or use start_dateTime/start_timeZone and end_dateTime/end_timeZone aliases). For calendar.events.list you can pass include_all_calendars=true to aggregate all accessible calendars, or calendar_ids to narrow scope. For mail.inbox.list you can pass q/query, category, label_ids, exclude_label_ids, include_spam_trash, page_token, and max_results/limit. For mail.search pass query (or q) plus optional category, label_ids, exclude_label_ids, include_spam_trash, page_token, and max_results/limit. For mail.authorize pass arguments.force=true to force a new OAuth consent even if a token already exists (use when token is expired or revoked)."
+            "description": "Capability-specific payload. For memory.interaction.save provide either (user_message + assistant_response) or (role + content). Optional per-call user override can be passed as arguments.user_id. For mail/calendar capabilities you can pass arguments.account_slot = primary|secondary. For calendar.events.create and calendar.events.update, send start/end as objects like {dateTime, timeZone} (or use start_dateTime/start_timeZone and end_dateTime/end_timeZone aliases). For calendar.events.list you can pass include_all_calendars=true to aggregate all accessible calendars, or calendar_ids to narrow scope. For mail.inbox.list you can pass q/query, category, label_ids, exclude_label_ids, include_spam_trash, page_token, and max_results/limit. For mail.search pass query (or q) plus optional category, label_ids, exclude_label_ids, include_spam_trash, page_token, and max_results/limit. For mail.status and mail.authorize, pass account_slot to inspect or reauthorize a specific mailbox slot; lifecycle-aware responses may include requires_reauth, reauth_reason, authorize_url, and authorization_url. For mail.authorize pass arguments.force=true to force a new OAuth consent even if a token already exists (use when token is expired or revoked)."
           }
         },
         "required": [
@@ -258,6 +258,20 @@
                       "capability": "mail.authorize",
                       "confirm": false,
                       "arguments": {}
+                    }
+                  }
+                },
+                "mail_status": {
+                  "summary": "Inspect lifecycle-aware Gmail auth status for one slot",
+                  "value": {
+                    "action": "capability_exec",
+                    "user_id": "mario_test",
+                    "params": {
+                      "capability": "mail.status",
+                      "confirm": false,
+                      "arguments": {
+                        "account_slot": "secondary"
+                      }
                     }
                   }
                 },
@@ -455,11 +469,54 @@
                       "result": {
                         "action": "ensure_authorized",
                         "authorized": false,
+                        "requires_reauth": true,
                         "user_id": "mario_test",
+                        "account_slot": "primary",
                         "scope": "https://mail.google.com/",
                         "state": "example-state",
+                        "reauth_reason": "no_token",
                         "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
+                        "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
                         "redirect_uri": "https://agentbackendservice-dfcpcudzeah4b6ae.northeurope-01.azurewebsites.net/api/gmail_oauth_callback"
+                      },
+                      "error": null,
+                      "meta": {}
+                    }
+                  },
+                  "mail_status_requires_reauth": {
+                    "summary": "mail.status response when stored token exists but the slot needs reauthorization",
+                    "value": {
+                      "schema_version": "omniflow.capability_exec.v1",
+                      "status": "success",
+                      "action": "capability_exec",
+                      "capability": "mail.status",
+                      "result": {
+                        "action": "oauth_status",
+                        "authorized": false,
+                        "requires_reauth": true,
+                        "reauth_reason": "refresh_http_400",
+                        "user_id": "mario_test",
+                        "account_slot": "secondary",
+                        "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
+                        "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
+                        "accounts": [
+                          {
+                            "slot": "primary",
+                            "authorized": true,
+                            "requires_reauth": false,
+                            "email_address": "mario.primary@gmail.com",
+                            "has_calendar_scope": true
+                          },
+                          {
+                            "slot": "secondary",
+                            "authorized": false,
+                            "requires_reauth": true,
+                            "reauth_reason": "refresh_http_400",
+                            "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
+                            "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
+                            "has_calendar_scope": false
+                          }
+                        ]
                       },
                       "error": null,
                       "meta": {}
@@ -475,10 +532,13 @@
                       "result": {
                         "action": "ensure_authorized",
                         "authorized": true,
+                        "requires_reauth": false,
                         "user_id": "mario_test",
+                        "account_slot": "primary",
                         "scope": "https://mail.google.com/",
                         "saved_at": "2026-03-10T16:13:43Z",
-                        "expires_at": "2026-03-10T17:13:42Z"
+                        "expires_at": "2026-03-10T17:13:42Z",
+                        "has_calendar_scope": true
                       },
                       "error": null,
                       "meta": {}

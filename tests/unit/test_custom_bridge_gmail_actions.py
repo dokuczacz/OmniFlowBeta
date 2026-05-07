@@ -2,8 +2,10 @@ import os
 import sys
 import importlib
 import uuid
+from types import SimpleNamespace
 
 import pytest
+import requests
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "backend"))
 if ROOT not in sys.path:
@@ -293,3 +295,90 @@ def test_handle_calendar_list_events_aggregates_all_calendars():
     assert result["events"][0]["calendarId"] == "pl.polish#holiday@group.v.calendar.google.com"
     assert result["events"][1]["summary"] == "Mama ma urodziny"
     assert result["events"][2]["summary"] == "Team Sync"
+
+
+def test_handle_oauth_status_reports_reauth_when_slot_missing(monkeypatch):
+    monkeypatch.setattr(bridge.GmailTokenStore, "load_tokens", lambda user_id, slot=None: None)
+    saved_states = []
+    monkeypatch.setattr(bridge.GmailTokenStore, "save_state", lambda state, user_id, slot=None: saved_states.append((user_id, slot, state)))
+    monkeypatch.setattr(bridge.GmailOAuthConfig, "has_credentials", classmethod(lambda cls: True))
+    monkeypatch.setattr(bridge.GmailOAuthConfig, "authorize_url", classmethod(lambda cls, state, login_hint=None: f"https://auth.example/{state}"))
+    monkeypatch.setattr(bridge.GmailOAuthConfig, "SCOPES", "scope-a scope-b")
+    monkeypatch.setattr(bridge.GmailOAuthConfig, "REDIRECT_URI", "https://app.example/callback")
+
+    result = bridge.handle_oauth_status("user-1", {"account_slot": "secondary"})
+
+    assert result["authorized"] is False
+    assert result["requires_reauth"] is True
+    assert result["reauth_reason"] == "no_token"
+    assert result["account_slot"] == "secondary"
+    assert result["authorize_url"].startswith("https://auth.example/")
+    assert result["authorization_url"] == result["authorize_url"]
+    assert all(slot == "secondary" for _, slot, _ in saved_states)
+
+
+def test_handle_oauth_status_reports_refresh_failure(monkeypatch):
+    expired = {
+        "access_token": "old-token",
+        "refresh_token": "refresh-token",
+        "expires_at": "2020-01-01T00:00:00+00:00",
+        "scope": "https://mail.google.com/",
+        "saved_at": "2020-01-01T00:00:00+00:00",
+    }
+    monkeypatch.setattr(bridge.GmailTokenStore, "load_tokens", lambda user_id, slot=None: expired)
+    monkeypatch.setattr(bridge.GmailTokenStore, "save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bridge.GmailOAuthConfig, "has_credentials", classmethod(lambda cls: True))
+    monkeypatch.setattr(bridge.GmailOAuthConfig, "authorize_url", classmethod(lambda cls, state, login_hint=None: f"https://auth.example/{state}"))
+    monkeypatch.setattr(bridge.GmailOAuthConfig, "REDIRECT_URI", "https://app.example/callback")
+
+    class FailingGmail:
+        def __init__(self, user_id, *, access_token=None, account_slot=None):
+            pass
+
+        def request(self, method, path, *, params=None, json=None):
+            response = SimpleNamespace(status_code=400, url="https://oauth2.googleapis.com/token")
+            raise requests.HTTPError("refresh failed", response=response)
+
+    monkeypatch.setattr(bridge, "GmailClient", FailingGmail)
+
+    result = bridge.handle_oauth_status("user-1", {"account_slot": "primary"})
+
+    assert result["authorized"] is False
+    assert result["requires_reauth"] is True
+    assert result["reauth_reason"] == "refresh_http_400"
+
+
+def test_handle_ensure_authorized_and_status_share_same_verdict(monkeypatch):
+    token = {
+        "access_token": "live-token",
+        "refresh_token": "refresh-token",
+        "expires_at": "2030-01-01T00:00:00+00:00",
+        "scope": "https://mail.google.com/",
+        "saved_at": "2026-05-07T08:00:00+00:00",
+    }
+    monkeypatch.setattr(bridge.GmailTokenStore, "load_tokens", lambda user_id, slot=None: token)
+    saved_states = []
+    monkeypatch.setattr(bridge.GmailTokenStore, "save_state", lambda state, user_id, slot=None: saved_states.append((user_id, slot, state)))
+    monkeypatch.setattr(bridge.GmailOAuthConfig, "has_credentials", classmethod(lambda cls: True))
+    monkeypatch.setattr(bridge.GmailOAuthConfig, "authorize_url", classmethod(lambda cls, state, login_hint=None: f"https://auth.example/{state}"))
+    monkeypatch.setattr(bridge.GmailOAuthConfig, "REDIRECT_URI", "https://app.example/callback")
+
+    class HealthyGmail:
+        def __init__(self, user_id, *, access_token=None, account_slot=None):
+            self.account_slot = account_slot
+
+        def request(self, method, path, *, params=None, json=None):
+            return _FakeResponse({"emailAddress": f"{self.account_slot}@example.com"})
+
+    monkeypatch.setattr(bridge, "GmailClient", HealthyGmail)
+
+    status_result = bridge.handle_oauth_status("user-1", {"account_slot": "secondary"})
+    authorize_result = bridge.handle_ensure_authorized("user-1", {"account_slot": "secondary"})
+
+    assert status_result["authorized"] is True
+    assert authorize_result["authorized"] is True
+    assert status_result["requires_reauth"] is True
+    assert authorize_result["requires_reauth"] is True
+    assert status_result["reauth_reason"] == "calendar_scope_missing"
+    assert authorize_result["reauth_reason"] == "calendar_scope_missing"
+    assert any(slot == "secondary" for _, slot, _ in saved_states)

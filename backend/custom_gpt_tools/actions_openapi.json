@@ -127,7 +127,7 @@
           "payload": {
             "type": "object",
             "additionalProperties": true,
-            "description": "Action-specific payload. Common mail fields: account_slot, max_results, q/query, category, label_ids, exclude_label_ids, include_spam_trash, page_token. `gmail_search` requires query (or q). Common calendar list fields: account_slot, time_min, time_max, max_results, include_all_calendars, calendar_ids. Calendar create/update should send start/end as objects like {dateTime, timeZone} or {date, timeZone}; flat aliases like start_dateTime/start_timeZone and end_dateTime/end_timeZone are also accepted."
+            "description": "Action-specific payload. Common mail fields: account_slot, max_results, q/query, category, label_ids, exclude_label_ids, include_spam_trash, page_token. `gmail_search` requires query (or q). `oauth_status` and `ensure_authorized` are lifecycle-aware and may return requires_reauth, reauth_reason, authorize_url, and authorization_url. Common calendar list fields: account_slot, time_min, time_max, max_results, include_all_calendars, calendar_ids. Calendar create/update should send start/end as objects like {dateTime, timeZone} or {date, timeZone}; flat aliases like start_dateTime/start_timeZone and end_dateTime/end_timeZone are also accepted."
           }
         },
         "required": ["action"],
@@ -468,6 +468,27 @@
                       "exclude_label_ids": ["PROMOTIONS"],
                       "include_spam_trash": false,
                       "max_results": 20
+                    }
+                  }
+                },
+                "oauth_status": {
+                  "summary": "Inspect lifecycle-aware Gmail auth status for a mailbox slot",
+                  "value": {
+                    "action": "oauth_status",
+                    "user_id": "mario_test",
+                    "payload": {
+                      "account_slot": "secondary"
+                    }
+                  }
+                },
+                "ensure_authorized": {
+                  "summary": "Return reauth URL when the stored token is missing, expired, or unusable",
+                  "value": {
+                    "action": "ensure_authorized",
+                    "user_id": "mario_test",
+                    "payload": {
+                      "account_slot": "secondary",
+                      "force": false
                     }
                   }
                 },

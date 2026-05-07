@@ -202,66 +202,208 @@ def handle_oauth_exchange(user_id: str, payload: Dict[str, Any], __: str | None 
     }
 
 
-def handle_oauth_status(user_id: str, _: Dict[str, Any], __: str | None = None) -> Dict[str, Any]:
-    accounts = GmailTokenStore.list_connected_accounts(user_id)
-    if not accounts:
-        return {"action": "oauth_status", "authorized": False, "user_id": user_id, "accounts": []}
-    # Enrich with live profile if possible
-    enriched = []
-    for acc in accounts:
-        slot = acc["slot"]
-        email_address = acc.get("email_address")
-        if not email_address:
-            try:
-                gmail = GmailClient(user_id, account_slot=slot)
-                profile = gmail.request("get", "profile").json()
-                email_address = profile.get("emailAddress")
-            except Exception:
-                pass
-        enriched.append({**acc, "email_address": email_address})
-    try:
-        primary = next((a for a in enriched if a["slot"] == "primary"), enriched[0])
-    except Exception:
-        primary = {}
-    return {
-        "action": "oauth_status",
-        "authorized": True,
-        "user_id": user_id,
-        "email_address": primary.get("email_address"),
-        "accounts": enriched,
-    }
+def handle_oauth_status(user_id: str, payload: Dict[str, Any], __: str | None = None) -> Dict[str, Any]:
+    return _build_oauth_status(user_id, payload or {})
 
 
 def _is_token_expired(stored: Dict[str, Any]) -> bool:
     """Return True if the stored token's expires_at is in the past."""
     expires_at = stored.get("expires_at")
     if not expires_at:
-        return False
+        return True
     try:
         from datetime import datetime, timezone
         exp = datetime.fromisoformat(str(expires_at))
         return exp <= datetime.now(timezone.utc)
     except (ValueError, TypeError):
-        return False
+        return True
 
 
-def _build_reauth_response(user_id: str, account_slot: str, payload: Dict[str, Any], reason: str) -> Dict[str, Any]:
+def _build_reauth_response(
+    user_id: str,
+    account_slot: str,
+    payload: Dict[str, Any],
+    reason: str,
+    *,
+    include_reauth_link: bool = True,
+) -> Dict[str, Any]:
     """Build a reauth-required response with a fresh authorize_url."""
-    if not GmailOAuthConfig.has_credentials():
+    if include_reauth_link and not GmailOAuthConfig.has_credentials():
         raise ValueError("Gmail OAuth configuration is incomplete")
-    reauth_state = str(uuid.uuid4())
-    login_hint = payload.get("login_hint")
-    GmailTokenStore.save_state(reauth_state, user_id, slot=account_slot)
-    return {
+    result = {
         "action": "ensure_authorized",
         "authorized": False,
+        "requires_reauth": True,
         "user_id": user_id,
         "account_slot": account_slot,
         "scope": GmailOAuthConfig.SCOPES,
-        "state": reauth_state,
-        "authorize_url": GmailOAuthConfig.authorize_url(reauth_state, login_hint=login_hint),
-        "redirect_uri": GmailOAuthConfig.REDIRECT_URI,
         "reauth_reason": reason,
+    }
+    if include_reauth_link:
+        reauth_state = str(uuid.uuid4())
+        login_hint = payload.get("login_hint")
+        GmailTokenStore.save_state(reauth_state, user_id, slot=account_slot)
+        authorize_url = GmailOAuthConfig.authorize_url(reauth_state, login_hint=login_hint)
+        result["state"] = reauth_state
+        result["authorize_url"] = authorize_url
+        result["authorization_url"] = authorize_url
+        result["redirect_uri"] = GmailOAuthConfig.REDIRECT_URI
+    return result
+
+
+def _auth_success_response(
+    user_id: str,
+    account_slot: str,
+    stored: Dict[str, Any],
+    *,
+    email_address: str | None = None,
+    needs_reauth: bool = False,
+    reauth_reason: str = "",
+    payload: Dict[str, Any] | None = None,
+    include_reauth_link: bool = True,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "action": "ensure_authorized",
+        "authorized": True,
+        "requires_reauth": bool(needs_reauth),
+        "user_id": user_id,
+        "account_slot": account_slot,
+        "scope": stored.get("scope"),
+        "expires_at": stored.get("expires_at"),
+        "saved_at": stored.get("saved_at"),
+        "has_calendar_scope": has_calendar_scope(stored),
+    }
+    if email_address:
+        result["email_address"] = email_address
+    if needs_reauth and reauth_reason:
+        result["reauth_reason"] = reauth_reason
+        if include_reauth_link and GmailOAuthConfig.has_credentials():
+            reauth_state = str(uuid.uuid4())
+            login_hint = (payload or {}).get("login_hint")
+            GmailTokenStore.save_state(reauth_state, user_id, slot=account_slot)
+            authorize_url = GmailOAuthConfig.authorize_url(reauth_state, login_hint=login_hint)
+            result["reauth_state"] = reauth_state
+            result["authorize_url"] = authorize_url
+            result["authorization_url"] = authorize_url
+            result["redirect_uri"] = GmailOAuthConfig.REDIRECT_URI
+    return result
+
+
+def _evaluate_auth_state(
+    user_id: str,
+    account_slot: str,
+    payload: Dict[str, Any],
+    *,
+    include_reauth_link: bool = True,
+) -> Dict[str, Any]:
+    stored = GmailTokenStore.load_tokens(user_id, slot=account_slot)
+    if not stored:
+        return _build_reauth_response(user_id, account_slot, payload, reason="no_token", include_reauth_link=include_reauth_link)
+
+    has_refresh = bool(str(stored.get("refresh_token") or "").strip())
+    if _is_token_expired(stored) and not has_refresh:
+        return _build_reauth_response(
+            user_id,
+            account_slot,
+            payload,
+            reason="token_expired_no_refresh",
+            include_reauth_link=include_reauth_link,
+        )
+
+    email_address = str(stored.get("email_address") or "").strip() or None
+    try:
+        gmail = GmailClient(user_id, account_slot=account_slot)
+        profile = gmail.request("get", "profile").json()
+        email_address = str(profile.get("emailAddress") or "").strip() or email_address
+        refreshed = GmailTokenStore.load_tokens(user_id, slot=account_slot) or stored
+        stored = refreshed
+    except requests.HTTPError as exc:
+        response = exc.response
+        status_code = getattr(response, "status_code", None)
+        response_url = str(getattr(response, "url", "") or "")
+        if "oauth2.googleapis.com/token" in response_url:
+            return _build_reauth_response(
+                user_id,
+                account_slot,
+                payload,
+                reason=f"refresh_http_{status_code or 'unknown'}",
+                include_reauth_link=include_reauth_link,
+            )
+        if status_code in (401, 403):
+            return _build_reauth_response(
+                user_id,
+                account_slot,
+                payload,
+                reason=f"profile_http_{status_code}",
+                include_reauth_link=include_reauth_link,
+            )
+    except ValueError as exc:
+        message = str(exc or "").strip()
+        if message in {"Refresh token missing", "Access token missing from Gmail token store"}:
+            return _build_reauth_response(
+                user_id,
+                account_slot,
+                payload,
+                reason=message.lower().replace(" ", "_"),
+                include_reauth_link=include_reauth_link,
+            )
+    except requests.RequestException:
+        pass
+    except Exception:
+        pass
+
+    needs_reauth = not has_calendar_scope(stored)
+    return _auth_success_response(
+        user_id,
+        account_slot,
+        stored,
+        email_address=email_address,
+        needs_reauth=needs_reauth,
+        reauth_reason="calendar_scope_missing" if needs_reauth else "",
+        payload=payload,
+        include_reauth_link=include_reauth_link,
+    )
+
+
+def _build_oauth_status(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    requested_slot = str(payload.get("account_slot") or "primary").strip() or "primary"
+    account_results = []
+    for slot in ("primary", "secondary"):
+        status = _evaluate_auth_state(user_id, slot, payload, include_reauth_link=(slot == requested_slot))
+        account_results.append(
+            {
+                "slot": slot,
+                "authorized": bool(status.get("authorized")),
+                "requires_reauth": bool(status.get("requires_reauth")),
+                "reauth_reason": status.get("reauth_reason"),
+                "email_address": status.get("email_address"),
+                "saved_at": status.get("saved_at"),
+                "expires_at": status.get("expires_at"),
+                "has_calendar_scope": bool(status.get("has_calendar_scope")),
+                **({"authorize_url": status.get("authorize_url")} if status.get("authorize_url") else {}),
+                **({"authorization_url": status.get("authorization_url")} if status.get("authorization_url") else {}),
+                **({"reauth_state": status.get("reauth_state")} if status.get("reauth_state") else {}),
+                **({"redirect_uri": status.get("redirect_uri")} if status.get("redirect_uri") else {}),
+            }
+        )
+
+    slot_status = next((item for item in account_results if item["slot"] == requested_slot), account_results[0] if account_results else {})
+    return {
+        "action": "oauth_status",
+        "authorized": bool(slot_status.get("authorized")),
+        "requires_reauth": bool(slot_status.get("requires_reauth")),
+        "reauth_reason": slot_status.get("reauth_reason"),
+        "user_id": user_id,
+        "account_slot": requested_slot,
+        "email_address": slot_status.get("email_address"),
+        "saved_at": slot_status.get("saved_at"),
+        "expires_at": slot_status.get("expires_at"),
+        "has_calendar_scope": bool(slot_status.get("has_calendar_scope")),
+        **({"authorize_url": slot_status.get("authorize_url")} if slot_status.get("authorize_url") else {}),
+        **({"authorization_url": slot_status.get("authorization_url")} if slot_status.get("authorization_url") else {}),
+        **({"reauth_state": slot_status.get("reauth_state")} if slot_status.get("reauth_state") else {}),
+        **({"redirect_uri": slot_status.get("redirect_uri")} if slot_status.get("redirect_uri") else {}),
+        "accounts": account_results,
     }
 
 
@@ -270,63 +412,15 @@ def handle_ensure_authorized(user_id: str, payload: Dict[str, Any], access_token
         return {
             "action": "ensure_authorized",
             "authorized": True,
+            "requires_reauth": False,
             "user_id": user_id,
             "scope": GmailOAuthConfig.SCOPES,
         }
     account_slot = str(payload.get("account_slot") or "primary").strip() or "primary"
     force = bool(payload.get("force", False))
-
-    stored = GmailTokenStore.load_tokens(user_id, slot=account_slot)
-
-    # Force reauth: discard stored token and generate fresh authorize_url
-    if force or not stored:
-        return _build_reauth_response(user_id, account_slot, payload, reason="force" if force else "no_token")
-
-    # Expired with no refresh_token: cannot self-heal, must reauth
-    has_refresh = bool(str(stored.get("refresh_token") or "").strip())
-    if _is_token_expired(stored) and not has_refresh:
-        return _build_reauth_response(user_id, account_slot, payload, reason="token_expired_no_refresh")
-
-    # Probe token liveness via profile API (triggers refresh if expired but refresh_token present)
-    email_address = None
-    auth_failure = False
-    auth_failure_reason = ""
-    try:
-        gmail = GmailClient(user_id, account_slot=account_slot)
-        profile = gmail.request("get", "profile").json()
-        email_address = profile.get("emailAddress")
-    except requests.HTTPError as exc:
-        if exc.response is not None and exc.response.status_code in (401, 403):
-            auth_failure = True
-            auth_failure_reason = f"profile_http_{exc.response.status_code}"
-        # else: transient network error – keep authorized, don't block
-    except Exception:
-        pass  # transient or network error; keep existing authorized state
-
-    if auth_failure:
-        return _build_reauth_response(user_id, account_slot, payload, reason=auth_failure_reason)
-
-    needs_reauth = not has_calendar_scope(stored)
-    result: Dict[str, Any] = {
-        "action": "ensure_authorized",
-        "authorized": True,
-        "user_id": user_id,
-        "account_slot": account_slot,
-        **({"email_address": email_address} if email_address else {}),
-        "scope": stored.get("scope"),
-        "expires_at": stored.get("expires_at"),
-        "saved_at": stored.get("saved_at"),
-    }
-    if needs_reauth:
-        result["needs_reauth"] = True
-        result["needs_reauth_reason"] = "calendar_scope_missing"
-        if GmailOAuthConfig.has_credentials():
-            reauth_state = str(uuid.uuid4())
-            login_hint = payload.get("login_hint")
-            GmailTokenStore.save_state(reauth_state, user_id, slot=account_slot)
-            result["authorize_url"] = GmailOAuthConfig.authorize_url(reauth_state, login_hint=login_hint)
-            result["reauth_state"] = reauth_state
-    return result
+    if force:
+        return _build_reauth_response(user_id, account_slot, payload, reason="force")
+    return _evaluate_auth_state(user_id, account_slot, payload)
 
 
 def handle_gmail_send(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
