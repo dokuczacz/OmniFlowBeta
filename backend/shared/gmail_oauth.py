@@ -125,7 +125,13 @@ class GmailTokenStore:
         return container_client.get_blob_client(blob_path)
 
     @classmethod
-    def save_state(cls, state: str, user_id: Optional[str], slot: Optional[str] = None) -> None:
+    def save_state(
+        cls,
+        state: str,
+        user_id: Optional[str],
+        slot: Optional[str] = None,
+        metadata: Optional[Dict[str, object]] = None,
+    ) -> None:
         blob_client = cls._state_blob_client(state)
         record = {
             "state": state,
@@ -133,6 +139,11 @@ class GmailTokenStore:
             "slot": cls._normalize_slot(slot),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
+        if isinstance(metadata, dict):
+            for key, value in metadata.items():
+                if value is None:
+                    continue
+                record[str(key)] = value
         blob_client.upload_blob(json.dumps(record, ensure_ascii=False).encode("utf-8"), overwrite=True)
 
     @classmethod

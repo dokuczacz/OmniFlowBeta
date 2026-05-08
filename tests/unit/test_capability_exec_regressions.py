@@ -312,6 +312,49 @@ def test_mail_inbox_list_enriched_response_keeps_label_ids(monkeypatch):
     assert messages[0]["from"] == "alerts@example.com"
 
 
+def test_mail_inbox_list_enriched_response_falls_back_to_message_label_ids(monkeypatch):
+    def fake_bridge_action(action, _user_id, payload):
+        if action == "gmail_list":
+            return {
+                "messages": [
+                    {
+                        "id": "msg-1",
+                        "threadId": "thr-1",
+                    }
+                ],
+                "next_page_token": None,
+                "result_size_estimate": 1,
+            }
+        if action == "gmail_get":
+            return {
+                "message": {
+                    "labelIds": ["UNREAD", "INBOX"],
+                    "snippet": "Build completed",
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "alerts@example.com"},
+                            {"name": "Subject", "value": "CI status"},
+                        ]
+                    },
+                }
+            }
+        raise AssertionError(f"Unexpected action: {action}")
+
+    monkeypatch.setattr(handler, "_bridge_action", fake_bridge_action)
+
+    body, status = handler._handle_capability_exec(
+        "u1",
+        {
+            "capability": "mail.inbox.list",
+            "confirm": False,
+            "arguments": {"account_slot": "primary", "limit": 5},
+        },
+    )
+
+    assert status == 200
+    assert body["result"]["messages"][0]["labelIds"] == ["UNREAD", "INBOX"]
+
+
 def test_calendar_events_list_defaults_to_all_calendars(monkeypatch):
     captured = {}
 

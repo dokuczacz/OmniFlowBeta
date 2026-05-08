@@ -14,6 +14,8 @@ import requests
 from shared.gmail_oauth import GmailOAuthConfig, GmailTokenStore
 from shared.gmail_client import GmailClient
 from shared.azure_client import AzureBlobClient
+from shared.gmail_oauth import has_calendar_scope
+from shared.user_profile import upsert_gmail_identity
 
 
 def _response(payload: Dict[str, Any], status_code: int = 200) -> func.HttpResponse:
@@ -84,8 +86,33 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         logging.error("gmail_oauth_callback failed: %s", exc, exc_info=True)
         return _html("Internal error", status_code=500)
 
+    _try_attach_gmail_identity(user_id, account_slot, state_record)
     _try_prefetch_inbox(user_id, account_slot)
     return _html("OAuth completed successfully", status_code=200)
+
+
+def _try_attach_gmail_identity(user_id: str, account_slot: str, state_record: Dict[str, Any]) -> None:
+    try:
+        gmail = GmailClient(user_id, account_slot=account_slot)
+        profile = gmail.request("get", "profile").json()
+        email_address = str(profile.get("emailAddress") or "").strip().lower()
+        if not email_address:
+            return
+        stored = GmailTokenStore.load_tokens(user_id, slot=account_slot) or {}
+        if str(stored.get("email_address") or "").strip().lower() != email_address:
+            updated = dict(stored)
+            updated["email_address"] = email_address
+            GmailTokenStore.save_tokens(user_id, updated, slot=account_slot)
+            stored = GmailTokenStore.load_tokens(user_id, slot=account_slot) or updated
+        upsert_gmail_identity(
+            user_id,
+            account_slot,
+            email_address,
+            display_name=state_record.get("display_name"),
+            has_calendar_scope=has_calendar_scope(stored),
+        )
+    except Exception as exc:
+        logging.warning("gmail_oauth_callback: profile sync failed (non-blocking): %s", exc)
 
 
 def _try_prefetch_inbox(user_id: str, account_slot: str) -> None:

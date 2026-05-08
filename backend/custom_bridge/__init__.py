@@ -10,6 +10,7 @@ import mimetypes
 import uuid
 from datetime import datetime, timezone
 from email.message import EmailMessage
+from email.utils import getaddresses
 from typing import Any, Dict, Tuple
 from urllib.parse import quote
 
@@ -22,6 +23,7 @@ from shared.config import AzureConfig
 from shared.gmail_client import GmailClient
 from shared.gmail_oauth import GmailOAuthConfig, GmailTokenStore
 from shared.gmail_oauth import has_calendar_scope
+from shared.user_profile import load_user_profile, upsert_gmail_identity
 
 
 def _parse_json(req: func.HttpRequest) -> Dict[str, Any]:
@@ -103,6 +105,19 @@ def _mail_extract_header(message_obj: Dict[str, Any], header_name: str) -> str:
     return ""
 
 
+def _mail_extract_addresses(message_obj: Dict[str, Any], header_name: str) -> list[str]:
+    header_value = _mail_extract_header(message_obj, header_name)
+    if not header_value:
+        return []
+    parsed = getaddresses([header_value])
+    out: list[str] = []
+    for _, address in parsed:
+        normalized = str(address or "").strip()
+        if normalized:
+            out.append(normalized)
+    return out
+
+
 def _build_email(payload: Dict[str, Any]) -> EmailMessage:
     to = payload.get("to")
     if not to:
@@ -118,6 +133,20 @@ def _build_email(payload: Dict[str, Any]) -> EmailMessage:
     else:
         email["To"] = ", ".join(to)
     email["From"] = from_address
+    cc = payload.get("cc")
+    if isinstance(cc, str) and cc.strip():
+        email["Cc"] = cc.strip()
+    elif isinstance(cc, list):
+        cc_items = [str(item).strip() for item in cc if str(item).strip()]
+        if cc_items:
+            email["Cc"] = ", ".join(cc_items)
+    bcc = payload.get("bcc")
+    if isinstance(bcc, str) and bcc.strip():
+        email["Bcc"] = bcc.strip()
+    elif isinstance(bcc, list):
+        bcc_items = [str(item).strip() for item in bcc if str(item).strip()]
+        if bcc_items:
+            email["Bcc"] = ", ".join(bcc_items)
 
     for header_name, header_value in (payload.get("extra_headers") or {}).items():
         if header_name and header_value:
@@ -172,7 +201,13 @@ def handle_oauth_authorize(user_id: str, payload: Dict[str, Any], __: str | None
     state = str(uuid.uuid4())
     login_hint = payload.get("login_hint")
     account_slot = str(payload.get("account_slot") or "primary").strip() or "primary"
-    GmailTokenStore.save_state(state, user_id, slot=account_slot)
+    profile_name = str(payload.get("display_name") or payload.get("profile_name") or "").strip()
+    GmailTokenStore.save_state(
+        state,
+        user_id,
+        slot=account_slot,
+        metadata={"display_name": profile_name} if profile_name else None,
+    )
     authorize_url = GmailOAuthConfig.authorize_url(state, login_hint=login_hint)
     return {
         "action": "oauth_authorize",
@@ -242,7 +277,13 @@ def _build_reauth_response(
     if include_reauth_link:
         reauth_state = str(uuid.uuid4())
         login_hint = payload.get("login_hint")
-        GmailTokenStore.save_state(reauth_state, user_id, slot=account_slot)
+        profile_name = str(payload.get("display_name") or payload.get("profile_name") or "").strip()
+        GmailTokenStore.save_state(
+            reauth_state,
+            user_id,
+            slot=account_slot,
+            metadata={"display_name": profile_name} if profile_name else None,
+        )
         authorize_url = GmailOAuthConfig.authorize_url(reauth_state, login_hint=login_hint)
         result["state"] = reauth_state
         result["authorize_url"] = authorize_url
@@ -275,12 +316,25 @@ def _auth_success_response(
     }
     if email_address:
         result["email_address"] = email_address
+    profile = load_user_profile(user_id)
+    display_name = str(profile.get("display_name") or "").strip()
+    primary_email = str(profile.get("primary_email") or "").strip()
+    if display_name:
+        result["display_name"] = display_name
+    if primary_email:
+        result["primary_email"] = primary_email
     if needs_reauth and reauth_reason:
         result["reauth_reason"] = reauth_reason
         if include_reauth_link and GmailOAuthConfig.has_credentials():
             reauth_state = str(uuid.uuid4())
             login_hint = (payload or {}).get("login_hint")
-            GmailTokenStore.save_state(reauth_state, user_id, slot=account_slot)
+            profile_name = str((payload or {}).get("display_name") or (payload or {}).get("profile_name") or "").strip()
+            GmailTokenStore.save_state(
+                reauth_state,
+                user_id,
+                slot=account_slot,
+                metadata={"display_name": profile_name} if profile_name else None,
+            )
             authorize_url = GmailOAuthConfig.authorize_url(reauth_state, login_hint=login_hint)
             result["reauth_state"] = reauth_state
             result["authorize_url"] = authorize_url
@@ -317,6 +371,19 @@ def _evaluate_auth_state(
         email_address = str(profile.get("emailAddress") or "").strip() or email_address
         refreshed = GmailTokenStore.load_tokens(user_id, slot=account_slot) or stored
         stored = refreshed
+        if email_address and str(stored.get("email_address") or "").strip() != email_address:
+            stored = dict(stored)
+            stored["email_address"] = email_address
+            GmailTokenStore.save_tokens(user_id, stored, slot=account_slot)
+            stored = GmailTokenStore.load_tokens(user_id, slot=account_slot) or stored
+        if email_address:
+            upsert_gmail_identity(
+                user_id,
+                account_slot,
+                email_address,
+                display_name=payload.get("display_name") or payload.get("profile_name"),
+                has_calendar_scope=has_calendar_scope(stored),
+            )
     except requests.HTTPError as exc:
         response = exc.response
         status_code = getattr(response, "status_code", None)
@@ -388,6 +455,9 @@ def _build_oauth_status(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
         )
 
     slot_status = next((item for item in account_results if item["slot"] == requested_slot), account_results[0] if account_results else {})
+    profile = load_user_profile(user_id)
+    display_name = str(profile.get("display_name") or "").strip()
+    primary_email = str(profile.get("primary_email") or "").strip()
     return {
         "action": "oauth_status",
         "authorized": bool(slot_status.get("authorized")),
@@ -403,6 +473,8 @@ def _build_oauth_status(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
         **({"authorization_url": slot_status.get("authorization_url")} if slot_status.get("authorization_url") else {}),
         **({"reauth_state": slot_status.get("reauth_state")} if slot_status.get("reauth_state") else {}),
         **({"redirect_uri": slot_status.get("redirect_uri")} if slot_status.get("redirect_uri") else {}),
+        **({"display_name": display_name} if display_name else {}),
+        **({"primary_email": primary_email} if primary_email else {}),
         "accounts": account_results,
     }
 
@@ -458,7 +530,7 @@ def handle_gmail_reply(user_id: str, payload: Dict[str, Any], access_token: str 
         f"messages/{message_id}",
         params={
             "format": "metadata",
-            "metadataHeaders": ["Reply-To", "From", "Subject", "Message-ID", "References"],
+            "metadataHeaders": ["Reply-To", "From", "Sender", "To", "Subject", "Message-ID", "Message-Id", "In-Reply-To", "References"],
         },
     ).json()
 
@@ -468,8 +540,11 @@ def handle_gmail_reply(user_id: str, payload: Dict[str, Any], access_token: str 
     elif isinstance(to_value, list):
         to_list = [str(item).strip() for item in to_value if str(item).strip()]
     else:
-        reply_target = _mail_extract_header(original, "Reply-To") or _mail_extract_header(original, "From")
-        to_list = [reply_target] if reply_target else []
+        to_list = []
+        for header_name in ("Reply-To", "From", "Sender", "To"):
+            to_list = _mail_extract_addresses(original, header_name)
+            if to_list:
+                break
     if not to_list:
         raise ValueError("reply target could not be resolved for gmail_reply")
 
@@ -478,7 +553,7 @@ def handle_gmail_reply(user_id: str, payload: Dict[str, Any], access_token: str 
     if not subject.lower().startswith("re:"):
         subject = f"Re: {subject}"
 
-    message_id_header = _mail_extract_header(original, "Message-ID")
+    message_id_header = _mail_extract_header(original, "Message-ID") or _mail_extract_header(original, "In-Reply-To")
     references = _mail_extract_header(original, "References")
     merged_references = " ".join(part for part in (references, message_id_header) if part).strip()
 
@@ -513,6 +588,23 @@ def handle_gmail_reply(user_id: str, payload: Dict[str, Any], access_token: str 
         "reply_to_message_id": message_id,
         "audit_id": audit_id,
     }
+
+
+def handle_gmail_accounts_list(user_id: str, payload: Dict[str, Any], __: str | None = None) -> Dict[str, Any]:
+    del payload
+    profile = load_user_profile(user_id)
+    result = {
+        "action": "gmail_accounts_list",
+        "user_id": user_id,
+        "accounts": GmailTokenStore.list_connected_accounts(user_id),
+    }
+    display_name = str(profile.get("display_name") or "").strip()
+    primary_email = str(profile.get("primary_email") or "").strip()
+    if display_name:
+        result["display_name"] = display_name
+    if primary_email:
+        result["primary_email"] = primary_email
+    return result
 
 
 def handle_gmail_list(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
@@ -839,11 +931,7 @@ ACTION_HANDLERS = {
     "gmail_trash": handle_gmail_trash,
     "gmail_delete": handle_gmail_delete,
     "gmail_attachment": handle_gmail_attachment,
-    "gmail_accounts_list": lambda uid, pl, _: {
-        "action": "gmail_accounts_list",
-        "user_id": uid,
-        "accounts": GmailTokenStore.list_connected_accounts(uid),
-    },
+    "gmail_accounts_list": handle_gmail_accounts_list,
     "calendar_list_events": handle_calendar_list_events,
     "calendar_get_event": handle_calendar_get_event,
     "calendar_create_event": handle_calendar_create_event,

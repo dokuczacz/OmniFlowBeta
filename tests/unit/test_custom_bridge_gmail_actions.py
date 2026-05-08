@@ -24,6 +24,14 @@ class _FakeResponse:
 
 class _FakeGmailClient:
     calls = []
+    profile_response = {"emailAddress": "person@example.com"}
+    message_headers = [
+        {"name": "From", "value": "sender@example.com"},
+        {"name": "Reply-To", "value": "reply@example.com"},
+        {"name": "Subject", "value": "Original Subject"},
+        {"name": "Message-ID", "value": "<msg-42@example.com>"},
+        {"name": "References", "value": "<older@example.com>"},
+    ]
 
     def __init__(self, user_id, *, access_token=None, account_slot=None):
         self.user_id = user_id
@@ -47,16 +55,12 @@ class _FakeGmailClient:
                 {
                     "threadId": "thr-42",
                     "payload": {
-                        "headers": [
-                            {"name": "From", "value": "sender@example.com"},
-                            {"name": "Reply-To", "value": "reply@example.com"},
-                            {"name": "Subject", "value": "Original Subject"},
-                            {"name": "Message-ID", "value": "<msg-42@example.com>"},
-                            {"name": "References", "value": "<older@example.com>"},
-                        ]
-                    },
+                        "headers": list(_FakeGmailClient.message_headers)
+                    }
                 }
             )
+        if path == "profile" and method == "get":
+            return _FakeResponse(dict(_FakeGmailClient.profile_response))
         if path == "messages/send":
             return _FakeResponse({"id": "msg-sent", "threadId": "thr-42"})
         if path.endswith("/trash"):
@@ -136,7 +140,18 @@ class _FakeGmailClient:
 @pytest.fixture(autouse=True)
 def _patch_gmail_client(monkeypatch):
     _FakeGmailClient.calls = []
+    _FakeGmailClient.profile_response = {"emailAddress": "person@example.com"}
+    _FakeGmailClient.message_headers = [
+        {"name": "From", "value": "sender@example.com"},
+        {"name": "Reply-To", "value": "reply@example.com"},
+        {"name": "Subject", "value": "Original Subject"},
+        {"name": "Message-ID", "value": "<msg-42@example.com>"},
+        {"name": "References", "value": "<older@example.com>"},
+    ]
     monkeypatch.setattr(bridge, "GmailClient", _FakeGmailClient)
+    monkeypatch.setattr(bridge, "load_user_profile", lambda user_id: {"display_name": "MarioBros", "primary_email": "person@example.com"})
+    monkeypatch.setattr(bridge, "upsert_gmail_identity", lambda *args, **kwargs: {})
+    monkeypatch.setattr(bridge.GmailTokenStore, "save_tokens", lambda *args, **kwargs: None)
 
 
 def test_handle_gmail_trash_success():
@@ -206,6 +221,25 @@ def test_handle_gmail_reply_requires_message_id():
 def test_handle_gmail_reply_requires_body():
     with pytest.raises(ValueError, match="body is required for gmail_reply"):
         bridge.handle_gmail_reply("user-1", {"message_id": "orig-1"}, None)
+
+
+def test_handle_gmail_reply_falls_back_to_to_header_when_sender_headers_missing():
+    _FakeGmailClient.message_headers = [
+        {"name": "To", "value": "target@example.com"},
+        {"name": "Subject", "value": "Original Subject"},
+        {"name": "Message-ID", "value": "<msg-42@example.com>"},
+    ]
+
+    result = bridge.handle_gmail_reply(
+        "user-1",
+        {"message_id": "orig-2", "body": "Reply body"},
+        "token-33",
+    )
+
+    assert result["status"] == "sent"
+    send_call = _FakeGmailClient.calls[1]
+    raw_bytes = bridge.base64.urlsafe_b64decode(send_call["json"]["raw"] + "===")
+    assert b"To: target@example.com" in raw_bytes
 
 
 def test_handle_calendar_create_event_normalizes_nested_start_end():
@@ -300,7 +334,11 @@ def test_handle_calendar_list_events_aggregates_all_calendars():
 def test_handle_oauth_status_reports_reauth_when_slot_missing(monkeypatch):
     monkeypatch.setattr(bridge.GmailTokenStore, "load_tokens", lambda user_id, slot=None: None)
     saved_states = []
-    monkeypatch.setattr(bridge.GmailTokenStore, "save_state", lambda state, user_id, slot=None: saved_states.append((user_id, slot, state)))
+    monkeypatch.setattr(
+        bridge.GmailTokenStore,
+        "save_state",
+        lambda state, user_id, slot=None, metadata=None: saved_states.append((user_id, slot, state, metadata)),
+    )
     monkeypatch.setattr(bridge.GmailOAuthConfig, "has_credentials", classmethod(lambda cls: True))
     monkeypatch.setattr(bridge.GmailOAuthConfig, "authorize_url", classmethod(lambda cls, state, login_hint=None: f"https://auth.example/{state}"))
     monkeypatch.setattr(bridge.GmailOAuthConfig, "SCOPES", "scope-a scope-b")
@@ -314,7 +352,7 @@ def test_handle_oauth_status_reports_reauth_when_slot_missing(monkeypatch):
     assert result["account_slot"] == "secondary"
     assert result["authorize_url"].startswith("https://auth.example/")
     assert result["authorization_url"] == result["authorize_url"]
-    assert all(slot == "secondary" for _, slot, _ in saved_states)
+    assert all(slot == "secondary" for _, slot, _, _ in saved_states)
 
 
 def test_handle_oauth_status_reports_refresh_failure(monkeypatch):
@@ -358,7 +396,11 @@ def test_handle_ensure_authorized_and_status_share_same_verdict(monkeypatch):
     }
     monkeypatch.setattr(bridge.GmailTokenStore, "load_tokens", lambda user_id, slot=None: token)
     saved_states = []
-    monkeypatch.setattr(bridge.GmailTokenStore, "save_state", lambda state, user_id, slot=None: saved_states.append((user_id, slot, state)))
+    monkeypatch.setattr(
+        bridge.GmailTokenStore,
+        "save_state",
+        lambda state, user_id, slot=None, metadata=None: saved_states.append((user_id, slot, state, metadata)),
+    )
     monkeypatch.setattr(bridge.GmailOAuthConfig, "has_credentials", classmethod(lambda cls: True))
     monkeypatch.setattr(bridge.GmailOAuthConfig, "authorize_url", classmethod(lambda cls, state, login_hint=None: f"https://auth.example/{state}"))
     monkeypatch.setattr(bridge.GmailOAuthConfig, "REDIRECT_URI", "https://app.example/callback")
@@ -381,4 +423,4 @@ def test_handle_ensure_authorized_and_status_share_same_verdict(monkeypatch):
     assert authorize_result["requires_reauth"] is True
     assert status_result["reauth_reason"] == "calendar_scope_missing"
     assert authorize_result["reauth_reason"] == "calendar_scope_missing"
-    assert any(slot == "secondary" for _, slot, _ in saved_states)
+    assert any(slot == "secondary" for _, slot, _, _ in saved_states)

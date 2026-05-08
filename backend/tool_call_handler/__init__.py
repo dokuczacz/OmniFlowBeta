@@ -5011,6 +5011,8 @@ def _mail_enriched_row(raw_item: Dict[str, Any], message_obj: Dict[str, Any]) ->
     internal_date = str(message_obj.get("internalDate") or "").strip() if isinstance(message_obj, dict) else ""
     date_value = _mail_extract_header(message_obj, "Date") or internal_date
     label_ids = list(raw_item.get("labelIds") or []) if isinstance(raw_item.get("labelIds"), list) else []
+    if not label_ids and isinstance(message_obj, dict) and isinstance(message_obj.get("labelIds"), list):
+        label_ids = list(message_obj.get("labelIds") or [])
     return {
         "id": str(raw_item.get("id") or "").strip(),
         "threadId": str(raw_item.get("threadId") or "").strip(),

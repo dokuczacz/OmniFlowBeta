@@ -127,7 +127,7 @@
           "payload": {
             "type": "object",
             "additionalProperties": true,
-            "description": "Action-specific payload. Common mail fields: account_slot, max_results, q/query, category, label_ids, exclude_label_ids, include_spam_trash, page_token. `gmail_search` requires query (or q). `oauth_status` and `ensure_authorized` are lifecycle-aware and may return requires_reauth, reauth_reason, authorize_url, and authorization_url. Common calendar list fields: account_slot, time_min, time_max, max_results, include_all_calendars, calendar_ids. Calendar create/update should send start/end as objects like {dateTime, timeZone} or {date, timeZone}; flat aliases like start_dateTime/start_timeZone and end_dateTime/end_timeZone are also accepted."
+            "description": "Action-specific payload. Common mail fields: account_slot, max_results, q/query, category, label_ids, exclude_label_ids, include_spam_trash, page_token. `gmail_search` requires query (or q). `oauth_authorize` may also accept display_name/profile_name to persist a lightweight pseudo-login/profile label after OAuth. `oauth_status` and `ensure_authorized` are lifecycle-aware and may return requires_reauth, reauth_reason, authorize_url, authorization_url, display_name, and primary_email. Common calendar list fields: account_slot, time_min, time_max, max_results, include_all_calendars, calendar_ids. Calendar create/update should send start/end as objects like {dateTime, timeZone} or {date, timeZone}; flat aliases like start_dateTime/start_timeZone and end_dateTime/end_timeZone are also accepted."
           }
         },
         "required": ["action"],
