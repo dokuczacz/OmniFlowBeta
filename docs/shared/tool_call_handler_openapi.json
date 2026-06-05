@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "OmniFlow Personal Assistance API (Single Endpoint)",
-    "version": "1.0.3",
+    "version": "1.0.4",
     "description": "Single-endpoint contract for both native UI and Custom GPT. This is the canonical source of truth for agent integrations. Public contract is capability-level (personal assistance). Internal low-level tools are hidden behind tool_call_handler orchestration."
   },
   "servers": [
@@ -75,7 +75,7 @@
           "arguments": {
             "type": "object",
             "additionalProperties": true,
-            "description": "Capability-specific payload. For memory.interaction.save provide either (user_message + assistant_response) or (role + content). Optional per-call user override can be passed as arguments.user_id. For mail/calendar capabilities you can pass arguments.account_slot = primary|secondary. For mail.authorize you may also pass arguments.display_name (or profile_name) to persist a lightweight pseudo-login/profile label after OAuth. For mail.find provide either query/q or structured filters like sender/from, subject, text, newer_than_days, unread and optionally latest=true to auto-select the newest matching message. For mail.thread.get provide thread_id. For mail.attachment.get provide message_id and attachment_id. For mail.modify provide message_id plus state changes such as mark_read, mark_unread, archive, unarchive, star, unstar, important, unimportant, add_label_ids, or remove_label_ids; set confirm=true because this mutates mailbox state. For calendar.events.create and calendar.events.update, send start/end as objects like {dateTime, timeZone} (or use start_dateTime/start_timeZone and end_dateTime/end_timeZone aliases). For calendar.events.list you can pass include_all_calendars=true to aggregate all accessible calendars, or calendar_ids to narrow scope. For calendar.calendars.list you can optionally pass min_access_role. For calendar.freebusy.get provide time_min, time_max and optionally calendar_ids. For mail.inbox.list you can pass q/query, category, label_ids, exclude_label_ids, include_spam_trash, page_token, and max_results/limit. For mail.search pass query (or q) plus optional category, label_ids, exclude_label_ids, include_spam_trash, page_token, and max_results/limit. For mail.status and mail.authorize, pass account_slot to inspect or reauthorize a specific mailbox slot; lifecycle-aware responses may include requires_reauth, reauth_reason, authorize_url, authorization_url, display_name, and primary_email. For mail.authorize pass arguments.force=true to force a new OAuth consent even if a token already exists (use when token is expired or revoked)."
+            "description": "Capability-specific payload. For memory.interaction.save provide either (user_message + assistant_response) or (role + content). Optional per-call user override can be passed as arguments.user_id. For mail/calendar capabilities you can pass arguments.account_slot = primary|secondary. For mail.authorize and mail.status you may also pass arguments.display_name (or profile_name) to persist or refresh a lightweight pseudo-login/profile label after OAuth, plus arguments.login_hint to prefill the Google account chooser. For mail.find provide either query/q or structured filters like sender/from, subject, text, newer_than_days, unread and optionally latest=true to auto-select the newest matching message. For mail.thread.get provide thread_id. For mail.attachment.get provide message_id and attachment_id. For mail.modify provide message_id plus state changes such as mark_read, mark_unread, archive, unarchive, star, unstar, important, unimportant, add_label_ids, or remove_label_ids; set confirm=true because this mutates mailbox state. For calendar.events.create and calendar.events.update, send start/end as objects like {dateTime, timeZone} (or use start_dateTime/start_timeZone and end_dateTime/end_timeZone aliases). For calendar.events.list you can pass include_all_calendars=true to aggregate all accessible calendars, or calendar_ids to narrow scope. For calendar.calendars.list you can optionally pass min_access_role. For calendar.freebusy.get provide time_min, time_max and optionally calendar_ids. For mail.inbox.list you can pass q/query, category, label_ids, exclude_label_ids, include_spam_trash, page_token, and max_results/limit. For mail.search pass query (or q) plus optional category, label_ids, exclude_label_ids, include_spam_trash, page_token, and max_results/limit. For mail.status and mail.authorize, pass account_slot to inspect or reauthorize a specific mailbox slot; lifecycle-aware responses may include requires_reauth, reauth_reason, authorize_url, authorization_url, display_name, and primary_email. For mail.authorize pass arguments.force=true to force a new OAuth consent even if a token already exists (use when token is expired or revoked)."
           }
         },
         "required": [
@@ -263,7 +263,11 @@
                     "params": {
                       "capability": "mail.authorize",
                       "confirm": false,
-                      "arguments": {}
+                      "arguments": {
+                        "account_slot": "secondary",
+                        "login_hint": "horodecki.mariusz@gmail.com",
+                        "display_name": "MarioBros"
+                      }
                     }
                   }
                 },
@@ -276,7 +280,9 @@
                       "capability": "mail.status",
                       "confirm": false,
                       "arguments": {
-                        "account_slot": "secondary"
+                        "account_slot": "secondary",
+                        "login_hint": "horodecki.mariusz@gmail.com",
+                        "profile_name": "MarioBros"
                       }
                     }
                   }
