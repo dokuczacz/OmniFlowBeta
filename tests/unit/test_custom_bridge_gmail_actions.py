@@ -85,6 +85,8 @@ class _FakeGmailClient:
             return _FakeResponse(dict(_FakeGmailClient.profile_response))
         if path == "messages/send":
             return _FakeResponse({"id": "msg-sent", "threadId": "thr-42"})
+        if "/attachments/" in path and method == "get":
+            return _FakeResponse({"data": "SGVsbG8=", "size": 8})
         if path.endswith("/modify") and method == "post":
             message_id = path.split("/")[1]
             label_ids = list(json.get("addLabelIds") or []) if isinstance(json, dict) else []
@@ -153,6 +155,18 @@ class _FakeGmailClient:
                             "end": {"date": "2026-05-04"},
                         }
                     ]
+                }
+            )
+        if method == "post" and path == "freeBusy":
+            return _FakeResponse(
+                {
+                    "calendars": {
+                        "primary": {
+                            "busy": [
+                                {"start": "2026-05-08T09:00:00Z", "end": "2026-05-08T09:30:00Z"}
+                            ]
+                        }
+                    }
                 }
             )
         if method in {"post", "patch"}:
@@ -309,6 +323,20 @@ def test_handle_gmail_modify_translates_state_flags_to_label_changes():
     assert modify_call["json"]["removeLabelIds"] == ["CATEGORY_UPDATES", "INBOX", "UNREAD"]
 
 
+def test_handle_gmail_attachment_returns_data_and_size():
+    result = bridge.handle_gmail_attachment(
+        "user-1",
+        {"message_id": "msg-7", "attachment_id": "att-1", "account_slot": "primary"},
+        "token-36",
+    )
+
+    assert result["action"] == "gmail_attachment"
+    assert result["status"] == "ok"
+    assert result["account_slot"] == "primary"
+    assert result["message_id"] == "msg-7"
+    assert result["attachment_id"] == "att-1"
+
+
 def test_handle_calendar_create_event_normalizes_nested_start_end():
     result = bridge.handle_calendar_create_event(
         "user-1",
@@ -411,6 +439,25 @@ def test_handle_calendar_list_calendars_returns_accessible_calendar_metadata():
     assert result["count"] == 3
     assert result["calendars"][0]["id"] == "primary"
     assert result["calendars"][1]["id"] == "secondary-birthdays"
+
+
+def test_handle_calendar_freebusy_returns_busy_ranges():
+    result = bridge.handle_calendar_freebusy(
+        "user-1",
+        {
+            "account_slot": "primary",
+            "time_min": "2026-05-08T00:00:00Z",
+            "time_max": "2026-05-08T23:59:59Z",
+            "calendar_ids": ["primary"],
+        },
+        "token-8",
+    )
+
+    assert result["action"] == "calendar_freebusy"
+    assert result["status"] == "ok"
+    assert result["calendar_ids"] == ["primary"]
+    assert result["calendars"][0]["calendarId"] == "primary"
+    assert result["calendars"][0]["busy"][0]["start"] == "2026-05-08T09:00:00Z"
 
 
 def test_handle_oauth_status_reports_reauth_when_slot_missing(monkeypatch):

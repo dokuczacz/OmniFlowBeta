@@ -5382,6 +5382,20 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             result = _bridge_action("gmail_thread_get", str(effective_user_id), payload)
             return _capability_response("success", capability, result=result), 200
 
+        if capability == "mail.attachment.get":
+            message_id = str(arguments.get("message_id") or "").strip()
+            attachment_id = str(arguments.get("attachment_id") or arguments.get("attachmentId") or "").strip()
+            if not message_id or not attachment_id:
+                return _capability_response(
+                    "error",
+                    capability,
+                    error={"code": "INVALID_REQUEST", "message": "arguments.message_id and arguments.attachment_id are required"},
+                ), 400
+            account_slot = _resolve_account_slot()
+            payload = {"message_id": message_id, "attachment_id": attachment_id, "account_slot": account_slot}
+            result = _bridge_action("gmail_attachment", str(effective_user_id), payload)
+            return _capability_response("success", capability, result=result), 200
+
         if capability == "mail.summarize":
             max_results = int(arguments.get("max_results", 10) or 10)
             account_slot = _resolve_account_slot()
@@ -5518,6 +5532,17 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
         if capability == "calendar.calendars.list":
             account_slot = _resolve_account_slot()
             result = _bridge_action("calendar_list_calendars", str(effective_user_id), {"account_slot": account_slot})
+            return _capability_response("success", capability, result=result), 200
+
+        if capability == "calendar.freebusy.get":
+            account_slot = _resolve_account_slot()
+            payload = {
+                "account_slot": account_slot,
+                "time_min": arguments.get("time_min"),
+                "time_max": arguments.get("time_max"),
+                "calendar_ids": arguments.get("calendar_ids") or arguments.get("calendarIds"),
+            }
+            result = _bridge_action("calendar_freebusy", str(effective_user_id), payload)
             return _capability_response("success", capability, result=result), 200
 
         if capability == "calendar.events.list":

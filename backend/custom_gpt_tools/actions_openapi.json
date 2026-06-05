@@ -121,13 +121,13 @@
         "properties": {
           "action": {
             "type": "string",
-            "description": "One of oauth_authorize|oauth_exchange|oauth_status|ensure_authorized|gmail_send|gmail_reply|gmail_list|gmail_search|gmail_get|gmail_thread_get|gmail_modify|gmail_trash|gmail_delete|gmail_attachment|gmail_accounts_list|calendar_list_calendars|calendar_list_events|calendar_get_event|calendar_create_event|calendar_update_event|calendar_delete_event"
+            "description": "One of oauth_authorize|oauth_exchange|oauth_status|ensure_authorized|gmail_send|gmail_reply|gmail_list|gmail_search|gmail_get|gmail_thread_get|gmail_modify|gmail_trash|gmail_delete|gmail_attachment|gmail_accounts_list|calendar_list_calendars|calendar_freebusy|calendar_list_events|calendar_get_event|calendar_create_event|calendar_update_event|calendar_delete_event"
           },
           "user_id": { "type": "string" },
           "payload": {
             "type": "object",
             "additionalProperties": true,
-            "description": "Action-specific payload. Common mail fields: account_slot, max_results, q/query, category, label_ids, exclude_label_ids, include_spam_trash, page_token. `gmail_search` requires query (or q). `oauth_authorize` may also accept display_name/profile_name to persist a lightweight pseudo-login/profile label after OAuth. `oauth_status` and `ensure_authorized` are lifecycle-aware and may return requires_reauth, reauth_reason, authorize_url, authorization_url, display_name, and primary_email. Common calendar list fields: account_slot, time_min, time_max, max_results, include_all_calendars, calendar_ids, min_access_role. Calendar create/update should send start/end as objects like {dateTime, timeZone} or {date, timeZone}; flat aliases like start_dateTime/start_timeZone and end_dateTime/end_timeZone are also accepted."
+            "description": "Action-specific payload. Common mail fields: account_slot, max_results, q/query, category, label_ids, exclude_label_ids, include_spam_trash, page_token, message_id, attachment_id, thread_id. `gmail_search` requires query (or q). `oauth_authorize` may also accept display_name/profile_name to persist a lightweight pseudo-login/profile label after OAuth. `oauth_status` and `ensure_authorized` are lifecycle-aware and may return requires_reauth, reauth_reason, authorize_url, authorization_url, display_name, and primary_email. Common calendar list fields: account_slot, time_min, time_max, max_results, include_all_calendars, calendar_ids, min_access_role. Calendar create/update should send start/end as objects like {dateTime, timeZone} or {date, timeZone}; flat aliases like start_dateTime/start_timeZone and end_dateTime/end_timeZone are also accepted."
           }
         },
         "required": ["action"],

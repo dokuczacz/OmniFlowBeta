@@ -439,6 +439,61 @@ def test_mail_modify_forwards_state_flags_and_labels(monkeypatch):
     assert captured["payload"]["remove_label_ids"] == ["CATEGORY_UPDATES"]
 
 
+def test_mail_attachment_get_forwards_ids(monkeypatch):
+    captured = {}
+
+    def fake_bridge_action(action, _user_id, payload):
+        captured["action"] = action
+        captured["payload"] = payload
+        return {"message_id": payload["message_id"], "attachment_id": payload["attachment_id"], "data": "SGVsbG8="}
+
+    monkeypatch.setattr(handler, "_bridge_action", fake_bridge_action)
+
+    body, status = handler._handle_capability_exec(
+        "u1",
+        {
+            "capability": "mail.attachment.get",
+            "confirm": False,
+            "arguments": {"account_slot": "secondary", "message_id": "msg-1", "attachment_id": "att-9"},
+        },
+    )
+
+    assert status == 200
+    assert body["status"] == "success"
+    assert captured["action"] == "gmail_attachment"
+    assert captured["payload"]["account_slot"] == "secondary"
+
+
+def test_calendar_freebusy_get_forwards_range(monkeypatch):
+    captured = {}
+
+    def fake_bridge_action(action, _user_id, payload):
+        captured["action"] = action
+        captured["payload"] = payload
+        return {"calendar_ids": payload["calendar_ids"], "calendars": []}
+
+    monkeypatch.setattr(handler, "_bridge_action", fake_bridge_action)
+
+    body, status = handler._handle_capability_exec(
+        "u1",
+        {
+            "capability": "calendar.freebusy.get",
+            "confirm": False,
+            "arguments": {
+                "account_slot": "primary",
+                "time_min": "2026-05-08T00:00:00Z",
+                "time_max": "2026-05-08T23:59:59Z",
+                "calendar_ids": ["primary", "team"],
+            },
+        },
+    )
+
+    assert status == 200
+    assert body["status"] == "success"
+    assert captured["action"] == "calendar_freebusy"
+    assert captured["payload"]["calendar_ids"] == ["primary", "team"]
+
+
 def test_mail_inbox_list_forwards_category(monkeypatch):
     captured = {}
 

@@ -910,8 +910,11 @@ def handle_gmail_attachment(user_id: str, payload: Dict[str, Any], access_token:
         "action": "gmail_attachment",
         "status": "ok",
         "user_id": user_id,
+        "account_slot": account_slot,
+        "message_id": message_id,
         "attachment_id": attachment_id,
         "data": payload_response.get("data"),
+        "size": payload_response.get("size"),
     }
 
 
@@ -999,6 +1002,49 @@ def handle_calendar_list_calendars(user_id: str, payload: Dict[str, Any], access
     }
 
 
+def handle_calendar_freebusy(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
+    account_slot = str(payload.get("account_slot") or "primary").strip() or "primary"
+    time_min = str(payload.get("time_min") or "").strip()
+    time_max = str(payload.get("time_max") or "").strip()
+    if not time_min or not time_max:
+        raise ValueError("time_min and time_max are required for calendar_freebusy")
+    gmail = GmailClient(user_id, access_token=access_token, account_slot=account_slot)
+    calendar_ids = payload.get("calendar_ids")
+    if isinstance(calendar_ids, str):
+        calendar_ids = [item.strip() for item in calendar_ids.split(",")]
+    if not isinstance(calendar_ids, list):
+        calendar_ids = []
+    normalized_ids = [str(item).strip() for item in calendar_ids if str(item).strip()]
+    if not normalized_ids:
+        normalized_ids = ["primary"]
+    request_body = {
+        "timeMin": time_min,
+        "timeMax": time_max,
+        "items": [{"id": calendar_id} for calendar_id in normalized_ids],
+    }
+    resp = gmail.calendar_request("post", "freeBusy", json=request_body)
+    payload_response = resp.json()
+    calendars = payload_response.get("calendars", {}) if isinstance(payload_response, dict) else {}
+    busy_by_calendar: list[dict] = []
+    for calendar_id in normalized_ids:
+        entry = calendars.get(calendar_id, {}) if isinstance(calendars, dict) else {}
+        busy_by_calendar.append(
+            {
+                "calendarId": calendar_id,
+                "busy": list(entry.get("busy") or []) if isinstance(entry, dict) else [],
+            }
+        )
+    return {
+        "action": "calendar_freebusy",
+        "status": "ok",
+        "account_slot": account_slot,
+        "time_min": time_min,
+        "time_max": time_max,
+        "calendar_ids": normalized_ids,
+        "calendars": busy_by_calendar,
+    }
+
+
 def handle_calendar_get_event(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
     event_id = payload.get("event_id")
     if not event_id:
@@ -1069,6 +1115,7 @@ ACTION_HANDLERS = {
     "gmail_accounts_list": handle_gmail_accounts_list,
     "calendar_list_events": handle_calendar_list_events,
     "calendar_list_calendars": handle_calendar_list_calendars,
+    "calendar_freebusy": handle_calendar_freebusy,
     "calendar_get_event": handle_calendar_get_event,
     "calendar_create_event": handle_calendar_create_event,
     "calendar_update_event": handle_calendar_update_event,
