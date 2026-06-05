@@ -232,6 +232,56 @@ def test_mail_search_uses_query_and_forwards_to_gmail_search(monkeypatch):
     assert captured["payload"]["page_token"] == "cursor-456"
 
 
+def test_mail_search_accepts_plain_text_alias(monkeypatch):
+    captured = {}
+
+    def fake_bridge_action(action, _user_id, payload):
+        captured["action"] = action
+        captured["payload"] = payload
+        return {"messages": [], "next_page_token": None, "result_size_estimate": 0}
+
+    monkeypatch.setattr(handler, "_bridge_action", fake_bridge_action)
+
+    body, status = handler._handle_capability_exec(
+        "u1",
+        {
+            "capability": "mail.search",
+            "confirm": False,
+            "arguments": {
+                "account_slot": "secondary",
+                "text": "Lohnabrechnung dasteam",
+                "limit": 5,
+            },
+        },
+    )
+
+    assert status == 200
+    assert body["status"] == "success"
+    assert captured["action"] == "gmail_search"
+    assert captured["payload"]["account_slot"] == "secondary"
+    assert captured["payload"]["q"] == "Lohnabrechnung dasteam"
+
+
+def test_mail_search_error_mentions_plain_text_aliases(monkeypatch):
+    monkeypatch.setattr(handler, "_bridge_action", lambda *args, **kwargs: {})
+
+    body, status = handler._handle_capability_exec(
+        "u1",
+        {
+            "capability": "mail.search",
+            "confirm": False,
+            "arguments": {
+                "account_slot": "secondary",
+            },
+        },
+    )
+
+    assert status == 400
+    assert body["status"] == "error"
+    assert "arguments.text" in body["error"]["message"]
+    assert "arguments.keywords" in body["error"]["message"]
+
+
 def test_mail_authorize_forwards_identity_hints(monkeypatch):
     captured = {}
 

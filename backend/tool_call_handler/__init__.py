@@ -5262,9 +5262,20 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
         if capability == "mail.search":
             max_results = int(arguments.get("max_results", arguments.get("limit", 20)) or 20)
             account_slot = _resolve_account_slot()
-            query = str(arguments.get("query") or arguments.get("q") or "").strip()
+            query = str(
+                arguments.get("query")
+                or arguments.get("q")
+                or arguments.get("text")
+                or arguments.get("keywords")
+                or arguments.get("terms")
+                or ""
+            ).strip()
             if not query:
-                return _capability_response("error", capability, error={"code": "INVALID_REQUEST", "message": "arguments.query is required"}), 400
+                return _capability_response(
+                    "error",
+                    capability,
+                    error={"code": "INVALID_REQUEST", "message": "Provide one of arguments.query, arguments.q, arguments.text, or arguments.keywords."},
+                ), 400
             payload = {
                 "max_results": max(1, min(50, max_results)),
                 "q": query,
