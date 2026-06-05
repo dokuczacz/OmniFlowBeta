@@ -232,6 +232,70 @@ def test_mail_search_uses_query_and_forwards_to_gmail_search(monkeypatch):
     assert captured["payload"]["page_token"] == "cursor-456"
 
 
+def test_mail_authorize_forwards_identity_hints(monkeypatch):
+    captured = {}
+
+    def fake_bridge_action(action, _user_id, payload):
+        captured["action"] = action
+        captured["payload"] = payload
+        return {"authorized": False, "requires_reauth": True}
+
+    monkeypatch.setattr(handler, "_bridge_action", fake_bridge_action)
+
+    body, status = handler._handle_capability_exec(
+        "u1",
+        {
+            "capability": "mail.authorize",
+            "confirm": False,
+            "arguments": {
+                "account_slot": "secondary",
+                "login_hint": "horodecki.mariusz@gmail.com",
+                "display_name": "MarioBros",
+                "force": True,
+            },
+        },
+    )
+
+    assert status == 200
+    assert body["status"] == "success"
+    assert captured["action"] == "ensure_authorized"
+    assert captured["payload"]["account_slot"] == "secondary"
+    assert captured["payload"]["login_hint"] == "horodecki.mariusz@gmail.com"
+    assert captured["payload"]["display_name"] == "MarioBros"
+    assert captured["payload"]["force"] is True
+
+
+def test_mail_status_forwards_identity_hints(monkeypatch):
+    captured = {}
+
+    def fake_bridge_action(action, _user_id, payload):
+        captured["action"] = action
+        captured["payload"] = payload
+        return {"authorized": False, "requires_reauth": True}
+
+    monkeypatch.setattr(handler, "_bridge_action", fake_bridge_action)
+
+    body, status = handler._handle_capability_exec(
+        "u1",
+        {
+            "capability": "mail.status",
+            "confirm": False,
+            "arguments": {
+                "account_slot": "secondary",
+                "login_hint": "horodecki.mariusz@gmail.com",
+                "profile_name": "MarioBros",
+            },
+        },
+    )
+
+    assert status == 200
+    assert body["status"] == "success"
+    assert captured["action"] == "oauth_status"
+    assert captured["payload"]["account_slot"] == "secondary"
+    assert captured["payload"]["login_hint"] == "horodecki.mariusz@gmail.com"
+    assert captured["payload"]["display_name"] == "MarioBros"
+
+
 def test_mail_find_builds_query_and_selects_latest(monkeypatch):
     def fake_bridge_action(action, _user_id, payload):
         if action == "gmail_search":

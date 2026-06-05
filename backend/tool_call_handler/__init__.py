@@ -5194,16 +5194,29 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
 
         if capability == "mail.status":
             account_slot = _resolve_account_slot()
-            result = _bridge_action("oauth_status", str(effective_user_id), {"account_slot": account_slot})
+            result = _bridge_action(
+                "oauth_status",
+                str(effective_user_id),
+                {
+                    "account_slot": account_slot,
+                    "login_hint": arguments.get("login_hint"),
+                    "display_name": arguments.get("display_name") or arguments.get("profile_name"),
+                },
+            )
             return _capability_response("success", capability, result=result), 200
 
         if capability == "mail.authorize":
             account_slot = _resolve_account_slot()
-            result = _bridge_action("ensure_authorized", str(effective_user_id), {
-                "login_hint": arguments.get("login_hint"),
-                "account_slot": account_slot,
-                "force": bool(arguments.get("force", False)),
-            })
+            result = _bridge_action(
+                "ensure_authorized",
+                str(effective_user_id),
+                {
+                    "login_hint": arguments.get("login_hint"),
+                    "display_name": arguments.get("display_name") or arguments.get("profile_name"),
+                    "account_slot": account_slot,
+                    "force": bool(arguments.get("force", False)),
+                },
+            )
             return _capability_response("success", capability, result=result), 200
 
         if capability == "mail.inbox.list":
