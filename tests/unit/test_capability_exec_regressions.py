@@ -232,6 +232,135 @@ def test_mail_search_uses_query_and_forwards_to_gmail_search(monkeypatch):
     assert captured["payload"]["page_token"] == "cursor-456"
 
 
+def test_mail_find_builds_query_and_selects_latest(monkeypatch):
+    def fake_bridge_action(action, _user_id, payload):
+        if action == "gmail_search":
+            assert payload["q"] == 'from:(dasteam) subject:(Lohnabrechnung) newer_than:60d'
+            return {
+                "messages": [
+                    {"id": "msg-new", "threadId": "thr-new"},
+                    {"id": "msg-old", "threadId": "thr-old"},
+                ]
+            }
+        if action == "gmail_get":
+            message_id = payload["message_id"]
+            if message_id == "msg-new":
+                return {
+                    "message": {
+                        "snippet": "Latest payroll message",
+                        "labelIds": ["INBOX"],
+                        "payload": {
+                            "headers": [
+                                {"name": "From", "value": "dasteam payroll"},
+                                {"name": "Subject", "value": "Lohnabrechnung Mai"},
+                                {"name": "Date", "value": "Fri, 08 May 2026 12:00:00 +0000"},
+                            ]
+                        },
+                    }
+                }
+            return {
+                "message": {
+                    "snippet": "Older payroll message",
+                    "labelIds": ["INBOX"],
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "dasteam payroll"},
+                            {"name": "Subject", "value": "Lohnabrechnung April"},
+                            {"name": "Date", "value": "Fri, 01 May 2026 12:00:00 +0000"},
+                        ]
+                    },
+                }
+            }
+        raise AssertionError(f"Unexpected action: {action}")
+
+    monkeypatch.setattr(handler, "_bridge_action", fake_bridge_action)
+
+    body, status = handler._handle_capability_exec(
+        "u1",
+        {
+            "capability": "mail.find",
+            "confirm": False,
+            "arguments": {
+                "account_slot": "primary",
+                "sender": "dasteam",
+                "subject": "Lohnabrechnung",
+                "newer_than_days": 60,
+                "latest": True,
+                "limit": 5,
+            },
+        },
+    )
+
+    assert status == 200
+    assert body["status"] == "success"
+    result = body["result"]
+    assert result["resolution"] == "single_match"
+    assert result["selected_message_id"] == "msg-new"
+    assert result["selected"]["subject"] == "Lohnabrechnung Mai"
+    assert result["selection_reason"] == "latest"
+    assert result["candidate_count"] == 2
+
+
+def test_mail_find_returns_multiple_matches_without_latest(monkeypatch):
+    def fake_bridge_action(action, _user_id, payload):
+        if action == "gmail_search":
+            return {"messages": [{"id": "m1", "threadId": "t1"}, {"id": "m2", "threadId": "t2"}]}
+        if action == "gmail_get":
+            return {
+                "message": {
+                    "snippet": "candidate",
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "jobs@example.com"},
+                            {"name": "Subject", "value": "Lohnabrechnung"},
+                        ]
+                    },
+                }
+            }
+        raise AssertionError(f"Unexpected action: {action}")
+
+    monkeypatch.setattr(handler, "_bridge_action", fake_bridge_action)
+
+    body, status = handler._handle_capability_exec(
+        "u1",
+        {
+            "capability": "mail.find",
+            "confirm": False,
+            "arguments": {"query": 'subject:"Lohnabrechnung"', "limit": 5},
+        },
+    )
+
+    assert status == 200
+    assert body["result"]["resolution"] == "multiple_matches"
+    assert body["result"]["candidate_count"] == 2
+    assert "selected_message_id" not in body["result"]
+
+
+def test_calendar_calendars_list_forwards_account_slot(monkeypatch):
+    captured = {}
+
+    def fake_bridge_action(action, _user_id, payload):
+        captured["action"] = action
+        captured["payload"] = payload
+        return {"calendars": [], "count": 0, "account_slot": payload["account_slot"]}
+
+    monkeypatch.setattr(handler, "_bridge_action", fake_bridge_action)
+
+    body, status = handler._handle_capability_exec(
+        "u1",
+        {
+            "capability": "calendar.calendars.list",
+            "confirm": False,
+            "arguments": {"account_slot": "secondary", "min_access_role": "reader"},
+        },
+    )
+
+    assert status == 200
+    assert body["status"] == "success"
+    assert captured["action"] == "calendar_list_calendars"
+    assert captured["payload"]["account_slot"] == "secondary"
+
+
 def test_mail_inbox_list_forwards_category(monkeypatch):
     captured = {}
 

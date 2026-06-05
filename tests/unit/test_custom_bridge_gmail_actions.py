@@ -331,6 +331,21 @@ def test_handle_calendar_list_events_aggregates_all_calendars():
     assert result["events"][2]["summary"] == "Team Sync"
 
 
+def test_handle_calendar_list_calendars_returns_accessible_calendar_metadata():
+    result = bridge.handle_calendar_list_calendars(
+        "user-1",
+        {"account_slot": "primary", "min_access_role": "reader"},
+        "token-7",
+    )
+
+    assert result["action"] == "calendar_list_calendars"
+    assert result["status"] == "ok"
+    assert result["account_slot"] == "primary"
+    assert result["count"] == 3
+    assert result["calendars"][0]["id"] == "primary"
+    assert result["calendars"][1]["id"] == "secondary-birthdays"
+
+
 def test_handle_oauth_status_reports_reauth_when_slot_missing(monkeypatch):
     monkeypatch.setattr(bridge.GmailTokenStore, "load_tokens", lambda user_id, slot=None: None)
     saved_states = []

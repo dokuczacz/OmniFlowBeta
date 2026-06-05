@@ -866,6 +866,38 @@ def handle_calendar_list_events(user_id: str, payload: Dict[str, Any], access_to
     }
 
 
+def handle_calendar_list_calendars(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
+    account_slot = str(payload.get("account_slot") or "primary").strip() or "primary"
+    gmail = GmailClient(user_id, access_token=access_token, account_slot=account_slot)
+    params: Dict[str, Any] = {"showHidden": True}
+    if payload.get("min_access_role"):
+        params["minAccessRole"] = str(payload.get("min_access_role")).strip()
+    resp = gmail.calendar_request("get", "users/me/calendarList", params=params)
+    items = resp.json().get("items", [])
+    calendars: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        calendars.append(
+            {
+                "id": str(item.get("id") or "").strip(),
+                "summary": str(item.get("summary") or "").strip(),
+                "primary": bool(item.get("primary", False)),
+                "selected": bool(item.get("selected", False)),
+                "accessRole": str(item.get("accessRole") or "").strip(),
+                "timeZone": str(item.get("timeZone") or "").strip(),
+                "backgroundColor": str(item.get("backgroundColor") or "").strip(),
+            }
+        )
+    return {
+        "action": "calendar_list_calendars",
+        "status": "ok",
+        "account_slot": account_slot,
+        "calendars": calendars,
+        "count": len(calendars),
+    }
+
+
 def handle_calendar_get_event(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
     event_id = payload.get("event_id")
     if not event_id:
@@ -933,6 +965,7 @@ ACTION_HANDLERS = {
     "gmail_attachment": handle_gmail_attachment,
     "gmail_accounts_list": handle_gmail_accounts_list,
     "calendar_list_events": handle_calendar_list_events,
+    "calendar_list_calendars": handle_calendar_list_calendars,
     "calendar_get_event": handle_calendar_get_event,
     "calendar_create_event": handle_calendar_create_event,
     "calendar_update_event": handle_calendar_update_event,

@@ -5046,6 +5046,61 @@ def _mail_normalize_list(value: Any) -> list[str]:
     return out
 
 
+def _mail_query_token(prefix: str, value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    sanitized = text.replace('"', " ").strip()
+    if not sanitized:
+        return ""
+    if " " in sanitized:
+        return f'{prefix}:"{sanitized}"'
+    return f"{prefix}:({sanitized})"
+
+
+def _mail_build_query(arguments: Dict[str, Any]) -> str:
+    explicit = str(arguments.get("query") or arguments.get("q") or "").strip()
+    parts: list[str] = [explicit] if explicit else []
+    sender = arguments.get("sender") or arguments.get("from") or arguments.get("sender_contains")
+    subject = arguments.get("subject") or arguments.get("subject_contains")
+    text = arguments.get("text") or arguments.get("keywords")
+    if sender:
+        parts.append(_mail_query_token("from", sender))
+    if subject:
+        parts.append(_mail_query_token("subject", subject))
+    if text:
+        text_value = str(text).strip().replace('"', " ")
+        if text_value:
+            parts.append(f'"{text_value}"' if " " in text_value else text_value)
+    newer_than_days = arguments.get("newer_than_days")
+    if newer_than_days not in (None, ""):
+        try:
+            days = int(newer_than_days)
+            if days > 0:
+                parts.append(f"newer_than:{days}d")
+        except (TypeError, ValueError):
+            pass
+    older_than_days = arguments.get("older_than_days")
+    if older_than_days not in (None, ""):
+        try:
+            days = int(older_than_days)
+            if days > 0:
+                parts.append(f"older_than:{days}d")
+        except (TypeError, ValueError):
+            pass
+    after_value = str(arguments.get("after") or "").strip()
+    if after_value:
+        parts.append(f"after:{after_value}")
+    before_value = str(arguments.get("before") or "").strip()
+    if before_value:
+        parts.append(f"before:{before_value}")
+    if arguments.get("unread") is True:
+        parts.append("is:unread")
+    elif arguments.get("unread") is False:
+        parts.append("-is:unread")
+    return " ".join(part for part in parts if part).strip()
+
+
 def _bridge_action(action: str, user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     # Keep Gmail behavior aligned with custom_bridge implementation.
     from custom_bridge.__init__ import ACTION_HANDLERS as BRIDGE_HANDLERS
@@ -5235,6 +5290,80 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             result["query"] = query
             return _capability_response("success", capability, result=result), 200
 
+        if capability == "mail.find":
+            max_results = int(arguments.get("max_results", arguments.get("limit", 10)) or 10)
+            account_slot = _resolve_account_slot()
+            query = _mail_build_query(arguments)
+            if not query:
+                return _capability_response(
+                    "error",
+                    capability,
+                    error={
+                        "code": "INVALID_REQUEST",
+                        "message": "Provide arguments.query or structured filters like sender/subject/text.",
+                    },
+                ), 400
+            payload = {
+                "max_results": max(1, min(25, max_results)),
+                "q": query,
+                "category": arguments.get("category"),
+                "label_ids": _mail_normalize_list(arguments.get("label_ids") or arguments.get("labelIds")),
+                "exclude_label_ids": _mail_normalize_list(arguments.get("exclude_label_ids") or arguments.get("excludeLabelIds")),
+                "include_spam_trash": bool(arguments.get("include_spam_trash", arguments.get("includeSpamTrash", False))),
+                "page_token": arguments.get("page_token") or arguments.get("pageToken"),
+                "account_slot": account_slot,
+            }
+            search_result = _bridge_action("gmail_search", str(effective_user_id), payload)
+            messages = list(search_result.get("messages") or []) if isinstance(search_result, dict) else []
+            metadata_limit = int(arguments.get("metadata_limit", 10) or 10)
+            metadata_limit = max(1, min(10, metadata_limit))
+            candidates: list[dict] = []
+            for idx, raw_item in enumerate(messages):
+                if not isinstance(raw_item, dict):
+                    continue
+                mid = str(raw_item.get("id") or "").strip()
+                if not mid:
+                    continue
+                message_obj: Dict[str, Any] = {}
+                if idx < metadata_limit:
+                    try:
+                        got = _bridge_action(
+                            "gmail_get",
+                            str(effective_user_id),
+                            {"message_id": mid, "format": "metadata", "account_slot": account_slot},
+                        )
+                        message_obj = dict(got.get("message") or {}) if isinstance(got, dict) else {}
+                    except Exception:
+                        message_obj = {}
+                candidates.append(_mail_enriched_row(raw_item, message_obj))
+            resolution = "no_match"
+            selected: Dict[str, Any] | None = None
+            pick_latest = bool(arguments.get("latest", False)) or str(arguments.get("pick") or "").strip().lower() in {"latest", "newest", "first"}
+            if len(candidates) == 1:
+                resolution = "single_match"
+                selected = candidates[0]
+            elif len(candidates) > 1 and pick_latest:
+                resolution = "single_match"
+                selected = candidates[0]
+            elif len(candidates) > 1:
+                resolution = "multiple_matches"
+            result = {
+                "action": "mail_find",
+                "status": "ok",
+                "account_slot": account_slot,
+                "query": query,
+                "resolution": resolution,
+                "candidate_count": len(candidates),
+                "candidates": candidates[:10],
+            }
+            if selected:
+                result["selected"] = selected
+                result["selected_message_id"] = selected.get("id")
+                result["selected_thread_id"] = selected.get("threadId")
+                if len(candidates) > 1 and pick_latest:
+                    result["selection_reason"] = "latest"
+            return _capability_response("success", capability, result=result), 200
+
         if capability == "mail.read":
             message_id = str(arguments.get("message_id") or "").strip()
             if not message_id:
@@ -5347,6 +5476,11 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
 
         if capability == "mail.accounts.list":
             result = _bridge_action("gmail_accounts_list", str(effective_user_id), {})
+            return _capability_response("success", capability, result=result), 200
+
+        if capability == "calendar.calendars.list":
+            account_slot = _resolve_account_slot()
+            result = _bridge_action("calendar_list_calendars", str(effective_user_id), {"account_slot": account_slot})
             return _capability_response("success", capability, result=result), 200
 
         if capability == "calendar.events.list":
