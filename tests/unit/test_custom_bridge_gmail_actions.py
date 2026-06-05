@@ -59,10 +59,36 @@ class _FakeGmailClient:
                     }
                 }
             )
+        if path.startswith("threads/") and method == "get":
+            return _FakeResponse(
+                {
+                    "id": "thr-42",
+                    "messages": [
+                        {
+                            "id": "msg-1",
+                            "threadId": "thr-42",
+                            "labelIds": ["INBOX"],
+                            "snippet": "First message",
+                            "payload": {"headers": list(_FakeGmailClient.message_headers)},
+                        },
+                        {
+                            "id": "msg-2",
+                            "threadId": "thr-42",
+                            "labelIds": ["INBOX", "UNREAD"],
+                            "snippet": "Second message",
+                            "payload": {"headers": list(_FakeGmailClient.message_headers)},
+                        },
+                    ],
+                }
+            )
         if path == "profile" and method == "get":
             return _FakeResponse(dict(_FakeGmailClient.profile_response))
         if path == "messages/send":
             return _FakeResponse({"id": "msg-sent", "threadId": "thr-42"})
+        if path.endswith("/modify") and method == "post":
+            message_id = path.split("/")[1]
+            label_ids = list(json.get("addLabelIds") or []) if isinstance(json, dict) else []
+            return _FakeResponse({"id": message_id, "threadId": "thr-42", "labelIds": label_ids})
         if path.endswith("/trash"):
             return _FakeResponse({"id": "msg-1", "threadId": "thr-1"})
         return _FakeResponse({})
@@ -240,6 +266,47 @@ def test_handle_gmail_reply_falls_back_to_to_header_when_sender_headers_missing(
     send_call = _FakeGmailClient.calls[1]
     raw_bytes = bridge.base64.urlsafe_b64decode(send_call["json"]["raw"] + "===")
     assert b"To: target@example.com" in raw_bytes
+
+
+def test_handle_gmail_thread_get_returns_message_summaries():
+    result = bridge.handle_gmail_thread_get(
+        "user-1",
+        {"thread_id": "thr-42", "account_slot": "primary", "format": "metadata"},
+        "token-34",
+    )
+
+    assert result["action"] == "gmail_thread_get"
+    assert result["status"] == "ok"
+    assert result["thread_id"] == "thr-42"
+    assert result["message_count"] == 2
+    assert result["messages"][0]["id"] == "msg-1"
+    assert result["messages"][1]["labelIds"] == ["INBOX", "UNREAD"]
+
+
+def test_handle_gmail_modify_translates_state_flags_to_label_changes():
+    result = bridge.handle_gmail_modify(
+        "user-1",
+        {
+            "message_id": "msg-7",
+            "account_slot": "primary",
+            "mark_read": True,
+            "archive": True,
+            "star": True,
+            "add_label_ids": ["IMPORTANT"],
+            "remove_label_ids": ["CATEGORY_UPDATES"],
+        },
+        "token-35",
+    )
+
+    assert result["action"] == "gmail_modify"
+    assert result["status"] == "ok"
+    assert result["message_id"] == "msg-7"
+    assert result["applied_add_label_ids"] == ["IMPORTANT", "STARRED"]
+    assert result["applied_remove_label_ids"] == ["CATEGORY_UPDATES", "INBOX", "UNREAD"]
+    modify_call = _FakeGmailClient.calls[0]
+    assert modify_call["path"] == "messages/msg-7/modify"
+    assert modify_call["json"]["addLabelIds"] == ["IMPORTANT", "STARRED"]
+    assert modify_call["json"]["removeLabelIds"] == ["CATEGORY_UPDATES", "INBOX", "UNREAD"]
 
 
 def test_handle_calendar_create_event_normalizes_nested_start_end():

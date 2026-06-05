@@ -758,6 +758,107 @@ def handle_gmail_get(user_id: str, payload: Dict[str, Any], access_token: str | 
     }
 
 
+def handle_gmail_thread_get(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
+    thread_id = payload.get("thread_id")
+    if not thread_id:
+        raise ValueError("thread_id is required for gmail_thread_get")
+    format_type = payload.get("format") or "full"
+    if format_type not in {"minimal", "full", "metadata"}:
+        raise ValueError("format must be one of minimal|full|metadata")
+    account_slot = str(payload.get("account_slot") or "primary").strip() or "primary"
+    gmail = GmailClient(user_id, access_token=access_token, account_slot=account_slot)
+    response = gmail.request("get", f"threads/{thread_id}", params={"format": format_type})
+    thread_payload = response.json()
+    messages = []
+    for item in thread_payload.get("messages", []) or []:
+        if not isinstance(item, dict):
+            continue
+        messages.append(
+            {
+                "id": str(item.get("id") or "").strip(),
+                "threadId": str(item.get("threadId") or thread_id).strip(),
+                "from": _mail_extract_header(item, "From"),
+                "to": _mail_extract_header(item, "To"),
+                "subject": _mail_extract_header(item, "Subject"),
+                "date": _mail_extract_header(item, "Date") or str(item.get("internalDate") or "").strip(),
+                "snippet": str(item.get("snippet") or "").strip(),
+                "labelIds": list(item.get("labelIds") or []) if isinstance(item.get("labelIds"), list) else [],
+            }
+        )
+    return {
+        "action": "gmail_thread_get",
+        "status": "ok",
+        "user_id": user_id,
+        "account_slot": account_slot,
+        "thread_id": str(thread_payload.get("id") or thread_id).strip(),
+        "messages": messages,
+        "message_count": len(messages),
+        "thread": thread_payload,
+    }
+
+
+def handle_gmail_modify(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
+    message_id = payload.get("message_id")
+    if not message_id:
+        raise ValueError("message_id is required for gmail_modify")
+    account_slot = str(payload.get("account_slot") or "primary").strip() or "primary"
+    gmail = GmailClient(user_id, access_token=access_token, account_slot=account_slot)
+
+    add_labels = payload.get("add_label_ids") or payload.get("addLabelIds") or []
+    remove_labels = payload.get("remove_label_ids") or payload.get("removeLabelIds") or []
+    if isinstance(add_labels, str):
+        add_labels = [item.strip() for item in add_labels.split(",")]
+    if isinstance(remove_labels, str):
+        remove_labels = [item.strip() for item in remove_labels.split(",")]
+    add_set = {str(item).strip() for item in add_labels if str(item).strip()}
+    remove_set = {str(item).strip() for item in remove_labels if str(item).strip()}
+
+    def _add(label_id: str) -> None:
+        if label_id in remove_set:
+            remove_set.discard(label_id)
+        add_set.add(label_id)
+
+    def _remove(label_id: str) -> None:
+        if label_id in add_set:
+            add_set.discard(label_id)
+        remove_set.add(label_id)
+
+    if payload.get("mark_read") is True:
+        _remove("UNREAD")
+    if payload.get("mark_unread") is True:
+        _add("UNREAD")
+    if payload.get("archive") is True:
+        _remove("INBOX")
+    if payload.get("unarchive") is True:
+        _add("INBOX")
+    if payload.get("star") is True:
+        _add("STARRED")
+    if payload.get("unstar") is True:
+        _remove("STARRED")
+    if payload.get("important") is True:
+        _add("IMPORTANT")
+    if payload.get("unimportant") is True:
+        _remove("IMPORTANT")
+
+    body = {
+        "addLabelIds": sorted(add_set),
+        "removeLabelIds": sorted(remove_set),
+    }
+    response = gmail.request("post", f"messages/{message_id}/modify", json=body)
+    result = response.json()
+    return {
+        "action": "gmail_modify",
+        "status": "ok",
+        "user_id": user_id,
+        "account_slot": account_slot,
+        "message_id": str(result.get("id") or message_id).strip(),
+        "thread_id": str(result.get("threadId") or "").strip(),
+        "labelIds": list(result.get("labelIds") or []) if isinstance(result.get("labelIds"), list) else [],
+        "applied_add_label_ids": sorted(add_set),
+        "applied_remove_label_ids": sorted(remove_set),
+    }
+
+
 def handle_gmail_trash(user_id: str, payload: Dict[str, Any], access_token: str | None = None) -> Dict[str, Any]:
     message_id = payload.get("message_id")
     if not message_id:
@@ -960,6 +1061,8 @@ ACTION_HANDLERS = {
     "gmail_list": handle_gmail_list,
     "gmail_search": handle_gmail_search,
     "gmail_get": handle_gmail_get,
+    "gmail_thread_get": handle_gmail_thread_get,
+    "gmail_modify": handle_gmail_modify,
     "gmail_trash": handle_gmail_trash,
     "gmail_delete": handle_gmail_delete,
     "gmail_attachment": handle_gmail_attachment,

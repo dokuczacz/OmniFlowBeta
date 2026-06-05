@@ -5373,6 +5373,15 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             result = _bridge_action("gmail_get", str(effective_user_id), payload)
             return _capability_response("success", capability, result=result), 200
 
+        if capability == "mail.thread.get":
+            thread_id = str(arguments.get("thread_id") or arguments.get("threadId") or "").strip()
+            if not thread_id:
+                return _capability_response("error", capability, error={"code": "INVALID_REQUEST", "message": "arguments.thread_id is required"}), 400
+            account_slot = _resolve_account_slot()
+            payload = {"thread_id": thread_id, "format": str(arguments.get("format") or "full"), "account_slot": account_slot}
+            result = _bridge_action("gmail_thread_get", str(effective_user_id), payload)
+            return _capability_response("success", capability, result=result), 200
+
         if capability == "mail.summarize":
             max_results = int(arguments.get("max_results", 10) or 10)
             account_slot = _resolve_account_slot()
@@ -5472,6 +5481,34 @@ def _handle_capability_exec(user_id: str, params: Dict[str, Any]) -> Tuple[Dict[
             account_slot = _resolve_account_slot()
             action = "gmail_trash" if capability == "mail.trash" else "gmail_delete"
             result = _bridge_action(action, str(effective_user_id), {"message_id": message_id, "account_slot": account_slot})
+            return _capability_response("success", capability, result=result), 200
+
+        if capability == "mail.modify":
+            if not confirm:
+                return _capability_response(
+                    "error",
+                    capability,
+                    error={"code": "CONFIRMATION_REQUIRED", "message": "Set params.confirm=true to modify email state."},
+                ), 409
+            message_id = str(arguments.get("message_id") or "").strip()
+            if not message_id:
+                return _capability_response("error", capability, error={"code": "INVALID_REQUEST", "message": "arguments.message_id is required"}), 400
+            account_slot = _resolve_account_slot()
+            payload = {
+                "message_id": message_id,
+                "account_slot": account_slot,
+                "add_label_ids": _mail_normalize_list(arguments.get("add_label_ids") or arguments.get("addLabelIds")),
+                "remove_label_ids": _mail_normalize_list(arguments.get("remove_label_ids") or arguments.get("removeLabelIds")),
+                "mark_read": bool(arguments.get("mark_read", False)),
+                "mark_unread": bool(arguments.get("mark_unread", False)),
+                "archive": bool(arguments.get("archive", False)),
+                "unarchive": bool(arguments.get("unarchive", False)),
+                "star": bool(arguments.get("star", False)),
+                "unstar": bool(arguments.get("unstar", False)),
+                "important": bool(arguments.get("important", False)),
+                "unimportant": bool(arguments.get("unimportant", False)),
+            }
+            result = _bridge_action("gmail_modify", str(effective_user_id), payload)
             return _capability_response("success", capability, result=result), 200
 
         if capability == "mail.accounts.list":

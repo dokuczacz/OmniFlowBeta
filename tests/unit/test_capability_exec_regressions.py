@@ -361,6 +361,84 @@ def test_calendar_calendars_list_forwards_account_slot(monkeypatch):
     assert captured["payload"]["account_slot"] == "secondary"
 
 
+def test_mail_thread_get_forwards_thread_id(monkeypatch):
+    captured = {}
+
+    def fake_bridge_action(action, _user_id, payload):
+        captured["action"] = action
+        captured["payload"] = payload
+        return {"thread_id": payload["thread_id"], "messages": [], "message_count": 0}
+
+    monkeypatch.setattr(handler, "_bridge_action", fake_bridge_action)
+
+    body, status = handler._handle_capability_exec(
+        "u1",
+        {
+            "capability": "mail.thread.get",
+            "confirm": False,
+            "arguments": {"thread_id": "thr-42", "account_slot": "secondary"},
+        },
+    )
+
+    assert status == 200
+    assert body["status"] == "success"
+    assert captured["action"] == "gmail_thread_get"
+    assert captured["payload"]["thread_id"] == "thr-42"
+    assert captured["payload"]["account_slot"] == "secondary"
+
+
+def test_mail_modify_requires_confirm(monkeypatch):
+    body, status = handler._handle_capability_exec(
+        "u1",
+        {
+            "capability": "mail.modify",
+            "confirm": False,
+            "arguments": {"message_id": "msg-1", "mark_read": True},
+        },
+    )
+
+    assert status == 409
+    assert body["error"]["code"] == "CONFIRMATION_REQUIRED"
+
+
+def test_mail_modify_forwards_state_flags_and_labels(monkeypatch):
+    captured = {}
+
+    def fake_bridge_action(action, _user_id, payload):
+        captured["action"] = action
+        captured["payload"] = payload
+        return {"message_id": payload["message_id"], "labelIds": []}
+
+    monkeypatch.setattr(handler, "_bridge_action", fake_bridge_action)
+
+    body, status = handler._handle_capability_exec(
+        "u1",
+        {
+            "capability": "mail.modify",
+            "confirm": True,
+            "arguments": {
+                "account_slot": "primary",
+                "message_id": "msg-99",
+                "mark_read": True,
+                "archive": True,
+                "star": True,
+                "add_label_ids": ["IMPORTANT"],
+                "remove_label_ids": ["CATEGORY_UPDATES"],
+            },
+        },
+    )
+
+    assert status == 200
+    assert body["status"] == "success"
+    assert captured["action"] == "gmail_modify"
+    assert captured["payload"]["message_id"] == "msg-99"
+    assert captured["payload"]["mark_read"] is True
+    assert captured["payload"]["archive"] is True
+    assert captured["payload"]["star"] is True
+    assert captured["payload"]["add_label_ids"] == ["IMPORTANT"]
+    assert captured["payload"]["remove_label_ids"] == ["CATEGORY_UPDATES"]
+
+
 def test_mail_inbox_list_forwards_category(monkeypatch):
     captured = {}
 
